@@ -40,13 +40,9 @@ pub mod post_sync;
 
 // Existing sub-modules
 pub mod phases;
-pub mod progress;
-pub mod recovery;
-pub mod request_control;
 pub mod transitions;
 
 // Re-exports
 pub use manager::SequentialSyncManager;
 pub use phases::{PhaseTransition, SyncPhase};
-pub use request_control::RequestController;
 pub use transitions::TransitionManager;
