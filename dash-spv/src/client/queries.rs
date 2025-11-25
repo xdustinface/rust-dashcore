@@ -134,34 +134,6 @@ impl<
         }
     }
 
-    // ============ Balance Queries ============
-
-    /// Get balance for a specific address.
-    ///
-    /// This method is deprecated - use the wallet's balance query methods instead.
-    pub async fn get_address_balance(
-        &self,
-        _address: &dashcore::Address,
-    ) -> Result<AddressBalance> {
-        // This method requires wallet-specific functionality not in WalletInterface
-        // The wallet should expose balance info through its own interface
-        Err(SpvError::Config(
-            "Address balance queries should be made directly to the wallet implementation"
-                .to_string(),
-        ))
-    }
-
-    /// Get balances for all watched addresses.
-    ///
-    /// This method is deprecated - use the wallet's balance query methods instead.
-    pub async fn get_all_balances(
-        &self,
-    ) -> Result<std::collections::HashMap<dashcore::Address, AddressBalance>> {
-        // TODO: Get balances from wallet instead of tracking separately
-        // Will be implemented when wallet integration is complete
-        Ok(std::collections::HashMap::new())
-    }
-
     // ============ Filter Queries ============
 
     /// Check if filter sync is available (any peer supports compact filters).
