@@ -247,21 +247,21 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     pub async fn store_filter_headers(
         &mut self,
-        cfheaders: dashcore::network::message_filter::CFHeaders,
+        filter_headers: dashcore::network::message_filter::CFHeaders,
         storage: &mut S,
     ) -> SyncResult<()> {
-        if cfheaders.filter_hashes.is_empty() {
+        if filter_headers.filter_hashes.is_empty() {
             tracing::debug!("No filter headers to store");
             return Ok(());
         }
 
         // Get the height range for this batch
         let (start_height, stop_height, _header_tip_height) =
-            self.get_batch_height_range(&cfheaders, storage).await?;
+            self.get_batch_height_range(&filter_headers, storage).await?;
 
         tracing::info!(
             "Received {} filter headers from height {} to {}",
-            cfheaders.filter_hashes.len(),
+            filter_headers.filter_hashes.len(),
             start_height,
             stop_height
         );
@@ -309,7 +309,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             // Use the handle_overlapping_headers method which properly handles the chain continuity
             let expected_start = current_filter_tip + 1;
 
-            match self.handle_overlapping_headers(&cfheaders, expected_start, storage).await {
+            match self.handle_overlapping_headers(&filter_headers, expected_start, storage).await {
                 Ok((stored_count, _)) => {
                     if stored_count > 0 {
                         tracing::info!("✅ Successfully handled overlapping filter headers");
@@ -329,12 +329,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             }
         } else {
             // Process the filter headers to convert them to the proper format
-            match self.process_filter_headers(&cfheaders, start_height, storage).await {
+            match self.process_filter_headers(&filter_headers, start_height, storage).await {
                 Ok(new_filter_headers) => {
                     if !new_filter_headers.is_empty() {
                         // If this is the first batch (starting at height 1), store the genesis filter header first
                         if start_height == 1 && current_filter_tip < 1 {
-                            let genesis_header = vec![cfheaders.previous_filter_header];
+                            let genesis_header = vec![filter_headers.previous_filter_header];
                             storage.store_filter_headers(&genesis_header).await.map_err(|e| {
                                 SyncError::Storage(format!(
                                     "Failed to store genesis filter header: {}",
@@ -343,7 +343,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                             })?;
                             tracing::debug!(
                                 "Stored genesis filter header at height 0: {:?}",
-                                cfheaders.previous_filter_header
+                                filter_headers.previous_filter_header
                             );
                         }
 
@@ -353,7 +353,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                             && current_filter_tip < self.sync_base_height
                         {
                             // Store the previous_filter_header as the filter header for the checkpoint block
-                            let checkpoint_header = vec![cfheaders.previous_filter_header];
+                            let checkpoint_header = vec![filter_headers.previous_filter_header];
                             storage.store_filter_headers(&checkpoint_header).await.map_err(
                                 |e| {
                                     SyncError::Storage(format!(
@@ -365,7 +365,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                             tracing::info!(
                                 "Stored checkpoint filter header at height {}: {:?}",
                                 self.sync_base_height,
-                                cfheaders.previous_filter_header
+                                filter_headers.previous_filter_header
                             );
                         }
 

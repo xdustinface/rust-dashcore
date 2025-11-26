@@ -80,7 +80,7 @@ pub struct ActiveCFHeaderRequest {
 /// Represents a received CFHeaders batch waiting for sequential processing.
 #[derive(Debug)]
 pub struct ReceivedCFHeaderBatch {
-    pub cfheaders: CFHeaders,
+    pub filter_headers: CFHeaders,
     #[allow(dead_code)]
     pub received_at: Instant,
 }

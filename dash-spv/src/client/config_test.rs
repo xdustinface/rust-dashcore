@@ -199,11 +199,11 @@ mod tests {
 
         assert!(config.max_concurrent_headers_requests.is_none());
         assert!(config.max_concurrent_mnlist_requests.is_none());
-        assert!(config.max_concurrent_cfheaders_requests.is_none());
+        assert!(config.max_concurrent_filter_headers_requests.is_none());
         assert!(config.max_concurrent_block_requests.is_none());
         assert!(config.headers_request_rate_limit.is_none());
         assert!(config.mnlist_request_rate_limit.is_none());
-        assert!(config.cfheaders_request_rate_limit.is_none());
+        assert!(config.filter_headers_request_rate_limit.is_none());
         assert!(config.filters_request_rate_limit.is_none());
         assert!(config.blocks_request_rate_limit.is_none());
     }

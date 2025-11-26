@@ -141,7 +141,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         Ok((start_height, stop_height, header_tip_height))
     }
 
-    pub async fn handle_cfheaders_message(
+    pub async fn handle_filter_headers_message(
         &mut self,
         cf_headers: CFHeaders,
         storage: &mut S,
@@ -623,7 +623,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             );
 
             let batch = ReceivedCFHeaderBatch {
-                cfheaders: cf_headers,
+                filter_headers: cf_headers,
                 received_at: std::time::Instant::now(),
             };
 
@@ -651,7 +651,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         Ok(true)
     }
 
-    /// Process a single CFHeaders batch (extracted from original handle_cfheaders logic).
+    /// Process a single CFHeaders batch (extracted from original handle_filter_headers logic).
     async fn process_cfheader_batch(
         &mut self,
         cf_headers: CFHeaders,
@@ -716,7 +716,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 self.next_cfheader_height_to_process
             );
 
-            self.process_cfheader_batch(batch.cfheaders, storage, network).await?;
+            self.process_cfheader_batch(batch.filter_headers, storage, network).await?;
         }
 
         Ok(())

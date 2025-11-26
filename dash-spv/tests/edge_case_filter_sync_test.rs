@@ -158,7 +158,7 @@ async fn test_filter_sync_at_tip_edge_case() {
 
 #[ignore = "mock implementation incomplete"]
 #[tokio::test]
-async fn test_no_invalid_getcfheaders_at_tip() {
+async fn test_no_invalid_getfilter_headers_at_tip() {
     let config = ClientConfig::new(Network::Dash);
     let received_heights = Arc::new(Mutex::new(HashSet::new()));
     let mut filter_sync: FilterSyncManager<MemoryStorageManager, MockNetworkManager> =

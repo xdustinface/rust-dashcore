@@ -231,9 +231,9 @@ pub enum NetworkMessage {
     GetCFilters(message_filter::GetCFilters),
     /// BIP157 cfilter
     CFilter(message_filter::CFilter),
-    /// BIP157 getcfheaders
+    /// BIP157 getfilter_headers
     GetCFHeaders(message_filter::GetCFHeaders),
-    /// BIP157 cfheaders
+    /// BIP157 filter_headers
     CFHeaders(message_filter::CFHeaders),
     /// BIP157 getcfcheckpt
     GetCFCheckpt(message_filter::GetCFCheckpt),
@@ -315,8 +315,8 @@ impl NetworkMessage {
             NetworkMessage::FilterClear => "filterclear",
             NetworkMessage::GetCFilters(_) => "getcfilters",
             NetworkMessage::CFilter(_) => "cfilter",
-            NetworkMessage::GetCFHeaders(_) => "getcfheaders",
-            NetworkMessage::CFHeaders(_) => "cfheaders",
+            NetworkMessage::GetCFHeaders(_) => "getfilter_headers",
+            NetworkMessage::CFHeaders(_) => "filter_headers",
             NetworkMessage::GetCFCheckpt(_) => "getcfcheckpt",
             NetworkMessage::CFCheckpt(_) => "cfcheckpt",
             NetworkMessage::SendCmpct(_) => "sendcmpct",
@@ -589,10 +589,10 @@ impl Decodable for RawNetworkMessage {
             "cfilter" => {
                 NetworkMessage::CFilter(Decodable::consensus_decode_from_finite_reader(&mut mem_d)?)
             }
-            "getcfheaders" => NetworkMessage::GetCFHeaders(
+            "getfilter_headers" => NetworkMessage::GetCFHeaders(
                 Decodable::consensus_decode_from_finite_reader(&mut mem_d)?,
             ),
-            "cfheaders" => NetworkMessage::CFHeaders(
+            "filter_headers" => NetworkMessage::CFHeaders(
                 Decodable::consensus_decode_from_finite_reader(&mut mem_d)?,
             ),
             "getcfcheckpt" => NetworkMessage::GetCFCheckpt(
