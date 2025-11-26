@@ -105,15 +105,15 @@ impl TransitionManager {
                     SyncPhase::DownloadingFilters {
                         ..
                     } => {
-                        // Normal case: download filters after cfheaders
+                        // Normal case: download filters after filter_headers
                         // CFHeaders must be complete
-                        Ok(self.are_cfheaders_complete(current_phase, storage).await?)
+                        Ok(self.are_filter_headers_complete(current_phase, storage).await?)
                     }
                     SyncPhase::FullySynced {
                         ..
                     } => {
                         // Allow skipping to FullySynced if no peers support filters
-                        // Don't require cfheaders to be complete in this case
+                        // Don't require filter_headers to be complete in this case
                         Ok(true)
                     }
                     _ => Ok(false),
@@ -223,7 +223,7 @@ impl TransitionManager {
                         requests_completed: 0,
                     }))
                 } else if self.config.enable_filters {
-                    self.create_cfheaders_phase(storage).await
+                    self.create_filter_headers_phase(storage).await
                 } else {
                     self.create_fully_synced_phase(storage).await
                 }
@@ -233,7 +233,7 @@ impl TransitionManager {
                 ..
             } => {
                 if self.config.enable_filters {
-                    self.create_cfheaders_phase(storage).await
+                    self.create_filter_headers_phase(storage).await
                 } else {
                     self.create_fully_synced_phase(storage).await
                 }
@@ -364,7 +364,7 @@ impl TransitionManager {
         }
     }
 
-    async fn are_cfheaders_complete(
+    async fn are_filter_headers_complete(
         &self,
         phase: &SyncPhase,
         _storage: &dyn StorageManager,
@@ -413,7 +413,7 @@ impl TransitionManager {
         false
     }
 
-    async fn create_cfheaders_phase(
+    async fn create_filter_headers_phase(
         &self,
         storage: &dyn StorageManager,
     ) -> SyncResult<Option<SyncPhase>> {
@@ -435,8 +435,8 @@ impl TransitionManager {
             current_height: filter_tip,
             target_height: header_tip,
             last_progress: Instant::now(),
-            cfheaders_downloaded: 0,
-            cfheaders_per_second: 0.0,
+            filter_headers_downloaded: 0,
+            filter_headers_per_second: 0.0,
         }))
     }
 

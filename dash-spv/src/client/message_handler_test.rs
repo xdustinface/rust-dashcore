@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_cfheaders_message() {
+    async fn test_handle_filter_headers_message() {
         let (
             mut network,
             mut storage,
@@ -202,13 +202,13 @@ mod tests {
         );
 
         // Create a CFHeaders message
-        let cfheaders = dashcore::network::message_filter::CFHeaders {
+        let filter_headers = dashcore::network::message_filter::CFHeaders {
             filter_type: 0,
             stop_hash: BlockHash::from([0u8; 32]),
             previous_filter_header: dashcore::hash_types::FilterHeader::from([0u8; 32]),
             filter_hashes: vec![],
         };
-        let message = NetworkMessage::CFHeaders(cfheaders);
+        let message = NetworkMessage::CFHeaders(filter_headers);
 
         // Handle the message
         let result = handler.handle_network_message(message).await;

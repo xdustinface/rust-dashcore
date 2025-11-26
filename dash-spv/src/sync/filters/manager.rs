@@ -112,12 +112,13 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             pending_cfheader_requests: VecDeque::new(),
             active_cfheader_requests: HashMap::new(),
             cfheader_retry_counts: HashMap::new(),
-            max_cfheader_retries: config.max_cfheaders_retries,
+            max_cfheader_retries: config.max_filter_headers_retries,
             received_cfheader_batches: HashMap::new(),
             next_cfheader_height_to_process: 0,
-            max_concurrent_cfheader_requests: config.max_concurrent_cfheaders_requests_parallel,
+            max_concurrent_cfheader_requests: config
+                .max_concurrent_filter_headers_requests_parallel,
             cfheader_request_timeout: std::time::Duration::from_secs(
-                config.cfheaders_request_timeout_secs,
+                config.filter_headers_request_timeout_secs,
             ),
             _phantom_s: std::marker::PhantomData,
             _phantom_n: std::marker::PhantomData,

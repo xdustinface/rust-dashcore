@@ -99,9 +99,9 @@ impl<
                 SyncPhase::DownloadingCFHeaders {
                     ..
                 },
-                NetworkMessage::CFHeaders(cfheaders),
+                NetworkMessage::CFHeaders(filter_headers),
             ) => {
-                self.handle_cfheaders_message(cfheaders, network, storage).await?;
+                self.handle_filter_headers_message(filter_headers, network, storage).await?;
             }
 
             (
@@ -139,9 +139,9 @@ impl<
                 SyncPhase::FullySynced {
                     ..
                 },
-                NetworkMessage::CFHeaders(cfheaders),
+                NetworkMessage::CFHeaders(filter_headers),
             ) => {
-                self.handle_post_sync_cfheaders(cfheaders, network, storage).await?;
+                self.handle_post_sync_filter_headers(filter_headers, network, storage).await?;
             }
 
             // Handle filters when fully synced
@@ -507,9 +507,9 @@ impl<
         Ok(())
     }
 
-    pub(super) async fn handle_cfheaders_message(
+    pub(super) async fn handle_filter_headers_message(
         &mut self,
-        cfheaders: dashcore::network::message_filter::CFHeaders,
+        filter_headers: dashcore::network::message_filter::CFHeaders,
         network: &mut N,
         storage: &mut S,
     ) -> SyncResult<()> {
@@ -517,20 +517,22 @@ impl<
         if let Some(addr) = network.get_last_message_peer_addr().await {
             tracing::debug!(
                 "📨 Received CFHeaders ({} headers) from {} (stop_hash={})",
-                cfheaders.filter_hashes.len(),
+                filter_headers.filter_hashes.len(),
                 addr,
-                cfheaders.stop_hash
+                filter_headers.stop_hash
             );
         }
-        let continue_sync =
-            self.filter_sync.handle_cfheaders_message(cfheaders.clone(), storage, network).await?;
+        let continue_sync = self
+            .filter_sync
+            .handle_filter_headers_message(filter_headers.clone(), storage, network)
+            .await?;
 
         // Update phase state
         if let SyncPhase::DownloadingCFHeaders {
             current_height,
-            cfheaders_downloaded,
+            filter_headers_downloaded,
             start_time,
-            cfheaders_per_second,
+            filter_headers_per_second,
             ..
         } = &mut self.current_phase
         {
@@ -540,10 +542,10 @@ impl<
             }
 
             // Update progress
-            *cfheaders_downloaded += cfheaders.filter_hashes.len() as u32;
+            *filter_headers_downloaded += filter_headers.filter_hashes.len() as u32;
             let elapsed = start_time.elapsed().as_secs_f64();
             if elapsed > 0.0 {
-                *cfheaders_per_second = *cfheaders_downloaded as f64 / elapsed;
+                *filter_headers_per_second = *filter_headers_downloaded as f64 / elapsed;
             }
 
             self.current_phase.update_progress();

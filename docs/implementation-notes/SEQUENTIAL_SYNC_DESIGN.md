@@ -40,7 +40,7 @@ pub enum SyncPhase {
         current_height: u32,
         target_height: u32,
         last_progress: Instant,
-        cfheaders_per_second: f64,
+        filter_headers_per_second: f64,
     },
     
     /// Phase 4: Downloading compact filters
@@ -127,7 +127,7 @@ impl SequentialSyncManager {
             
             SyncPhase::DownloadingFilters { .. } => {
                 // CFHeaders must be 100% complete
-                self.are_cfheaders_complete()
+                self.are_filter_headers_complete()
             }
             
             SyncPhase::DownloadingBlocks { .. } => {
@@ -291,8 +291,8 @@ impl SequentialSyncManager {
             (SyncPhase::DownloadingHeaders { .. }, NetworkMessage::Headers(headers)) => {
                 self.handle_headers_in_phase(headers, network, storage).await
             }
-            (SyncPhase::DownloadingCFHeaders { .. }, NetworkMessage::CFHeaders(cfheaders)) => {
-                self.handle_cfheaders_in_phase(cfheaders, network, storage).await
+            (SyncPhase::DownloadingCFHeaders { .. }, NetworkMessage::CFHeaders(filter_headers)) => {
+                self.handle_filter_headers_in_phase(filter_headers, network, storage).await
             }
             // ... etc
             _ => Ok(()), // Ignore messages for other phases
@@ -354,7 +354,7 @@ impl SequentialSyncManager {
             
             SyncPhase::DownloadingCFHeaders { current_height, .. } => {
                 // Retry from current_height (already validated)
-                self.restart_cfheaders_from(*current_height).await
+                self.restart_filter_headers_from(*current_height).await
             }
             
             // ... etc
@@ -410,7 +410,7 @@ src/sync/
 ### Phase Boundary Tests
 ```rust
 #[test]
-async fn test_headers_must_complete_before_cfheaders() {
+async fn test_headers_must_complete_before_filter_headers() {
     // Setup
     let mut sync = create_test_sync_manager();
     
@@ -418,14 +418,14 @@ async fn test_headers_must_complete_before_cfheaders() {
     sync.start_sync().await.unwrap();
     assert_eq!(sync.current_phase(), SyncPhase::DownloadingHeaders { .. });
     
-    // Try to request cfheaders - should fail
+    // Try to request filter_headers - should fail
     let result = sync.request(RequestType::GetCFHeaders(..), network).await;
     assert!(matches!(result, Err(SyncError::InvalidPhase)));
     
     // Complete headers
     complete_headers_phase(&mut sync).await;
     
-    // Now cfheaders should be allowed
+    // Now filter_headers should be allowed
     let result = sync.request(RequestType::GetCFHeaders(..), network).await;
     assert!(result.is_ok());
 }

@@ -135,7 +135,7 @@ fn create_test_headers_range(start_height: u32, count: u32) -> Vec<BlockHeader> 
 }
 
 /// Create test filter headers with proper chain linkage
-fn create_test_cfheaders_message(
+fn create_test_filter_headers_message(
     start_height: u32,
     count: u32,
     previous_filter_header: FilterHeader,
@@ -223,7 +223,7 @@ async fn test_filter_header_verification_failure_reproduction() {
     initial_prev_bytes[2] = 0x4e;
     let initial_prev_filter_header = FilterHeader::from_byte_array(initial_prev_bytes);
 
-    let first_cfheaders = create_test_cfheaders_message(
+    let first_filter_headers = create_test_filter_headers_message(
         first_batch_start,
         first_batch_count,
         initial_prev_filter_header,
@@ -232,7 +232,7 @@ async fn test_filter_header_verification_failure_reproduction() {
 
     // Process first batch - this should succeed
     let result = filter_sync
-        .handle_cfheaders_message(first_cfheaders.clone(), &mut storage, &mut network)
+        .handle_filter_headers_message(first_filter_headers.clone(), &mut storage, &mut network)
         .await;
 
     match result {
@@ -258,7 +258,7 @@ async fn test_filter_header_verification_failure_reproduction() {
 
     // Step 3: Calculate what the filter header should be for the last height
     // This simulates what we actually calculated and stored
-    let last_filter_hash = first_cfheaders.filter_hashes.last().unwrap();
+    let last_filter_hash = first_filter_headers.filter_hashes.last().unwrap();
     let second_to_last_height = first_batch_end - 1;
     let second_to_last_stored = storage
         .get_filter_header(second_to_last_height)
@@ -300,7 +300,7 @@ async fn test_filter_header_verification_failure_reproduction() {
     println!("Peer's claimed previous filter header: {:?}", wrong_prev_filter_header);
     println!("These don't match - this should cause verification failure!");
 
-    let second_cfheaders = create_test_cfheaders_message(
+    let second_filter_headers = create_test_filter_headers_message(
         second_batch_start,
         second_batch_count,
         wrong_prev_filter_header, // This is the wrong value!
@@ -310,8 +310,9 @@ async fn test_filter_header_verification_failure_reproduction() {
     // Step 5: Process second batch - this should fail
     println!("\nStep 5: Processing second batch (should fail)...");
 
-    let result =
-        filter_sync.handle_cfheaders_message(second_cfheaders, &mut storage, &mut network).await;
+    let result = filter_sync
+        .handle_filter_headers_message(second_filter_headers, &mut storage, &mut network)
+        .await;
 
     match result {
         Ok(_) => panic!("Second batch should have failed verification!"),
@@ -381,7 +382,7 @@ async fn test_overlapping_batches_from_different_peers() {
 
     let genesis_prev_filter_header = FilterHeader::from_byte_array([0x00u8; 32]); // Genesis
 
-    let initial_cfheaders = create_test_cfheaders_message(
+    let initial_filter_headers = create_test_filter_headers_message(
         initial_batch_start,
         initial_batch_count,
         genesis_prev_filter_header,
@@ -389,7 +390,7 @@ async fn test_overlapping_batches_from_different_peers() {
     );
 
     filter_sync
-        .handle_cfheaders_message(initial_cfheaders, &mut storage, &mut network)
+        .handle_filter_headers_message(initial_filter_headers, &mut storage, &mut network)
         .await
         .expect("Initial batch should succeed");
 
@@ -413,7 +414,7 @@ async fn test_overlapping_batches_from_different_peers() {
         .unwrap()
         .expect("Should have filter header at height 999");
 
-    let peer_a_cfheaders = create_test_cfheaders_message(
+    let peer_a_filter_headers = create_test_filter_headers_message(
         peer_a_start,
         peer_a_count,
         peer_a_prev_filter_header,
@@ -421,8 +422,9 @@ async fn test_overlapping_batches_from_different_peers() {
     );
 
     // Process Peer A's batch
-    let result_a =
-        filter_sync.handle_cfheaders_message(peer_a_cfheaders, &mut storage, &mut network).await;
+    let result_a = filter_sync
+        .handle_filter_headers_message(peer_a_filter_headers, &mut storage, &mut network)
+        .await;
 
     match result_a {
         Ok(_) => println!("  ✅ Peer A's batch processed successfully"),
@@ -469,7 +471,7 @@ async fn test_overlapping_batches_from_different_peers() {
     println!("  Peer B's claimed header at 1499: {:?}", peer_b_prev_filter_header);
     println!("  These are DIFFERENT - simulating different peer views!");
 
-    let peer_b_cfheaders = create_test_cfheaders_message(
+    let peer_b_filter_headers = create_test_filter_headers_message(
         peer_b_start,
         peer_b_count,
         peer_b_prev_filter_header, // Different from what we have stored!
@@ -479,8 +481,9 @@ async fn test_overlapping_batches_from_different_peers() {
     // Step 5: Process Peer B's overlapping batch - this should expose the issue
     println!("\nStep 5: Processing Peer B's batch (should fail due to inconsistent previous_filter_header)...");
 
-    let result_b =
-        filter_sync.handle_cfheaders_message(peer_b_cfheaders, &mut storage, &mut network).await;
+    let result_b = filter_sync
+        .handle_filter_headers_message(peer_b_filter_headers, &mut storage, &mut network)
+        .await;
 
     match result_b {
         Ok(_) => {
@@ -545,7 +548,7 @@ async fn test_filter_header_verification_overlapping_batches() {
 
     let prev_filter_header = FilterHeader::from_byte_array([0x01u8; 32]);
 
-    let batch1_cfheaders = create_test_cfheaders_message(
+    let batch1_filter_headers = create_test_filter_headers_message(
         batch1_start,
         batch1_count,
         prev_filter_header,
@@ -554,7 +557,7 @@ async fn test_filter_header_verification_overlapping_batches() {
 
     // Process first batch
     filter_sync
-        .handle_cfheaders_message(batch1_cfheaders, &mut storage, &mut network)
+        .handle_filter_headers_message(batch1_filter_headers, &mut storage, &mut network)
         .await
         .expect("First batch should succeed");
 
@@ -581,7 +584,7 @@ async fn test_filter_header_verification_overlapping_batches() {
         .unwrap()
         .expect("Previous filter header should exist");
 
-    let batch2_cfheaders = create_test_cfheaders_message(
+    let batch2_filter_headers = create_test_filter_headers_message(
         batch2_start,
         batch2_count,
         correct_prev_filter_header,
@@ -589,8 +592,9 @@ async fn test_filter_header_verification_overlapping_batches() {
     );
 
     // Process overlapping batch - this should handle overlap gracefully
-    let result =
-        filter_sync.handle_cfheaders_message(batch2_cfheaders, &mut storage, &mut network).await;
+    let result = filter_sync
+        .handle_filter_headers_message(batch2_filter_headers, &mut storage, &mut network)
+        .await;
 
     match result {
         Ok(_) => println!("✅ Overlapping batch handled successfully"),
@@ -652,14 +656,14 @@ async fn test_filter_header_verification_race_condition_simulation() {
     let prev_filter_header = FilterHeader::from_byte_array([0x02u8; 32]);
 
     // Create both batches with the same previous filter header
-    let batch_a = create_test_cfheaders_message(
+    let batch_a = create_test_filter_headers_message(
         base_start,
         batch_a_count,
         prev_filter_header,
         &batch_a_block_hashes,
     );
 
-    let batch_b = create_test_cfheaders_message(
+    let batch_b = create_test_filter_headers_message(
         base_start,
         batch_b_count,
         prev_filter_header,
@@ -669,7 +673,7 @@ async fn test_filter_header_verification_race_condition_simulation() {
     // Process batch A first
     println!("Processing batch A (1000 headers)...");
     filter_sync
-        .handle_cfheaders_message(batch_a, &mut storage, &mut network)
+        .handle_filter_headers_message(batch_a, &mut storage, &mut network)
         .await
         .expect("Batch A should succeed");
 
@@ -678,7 +682,8 @@ async fn test_filter_header_verification_race_condition_simulation() {
 
     // Now process batch B (overlapping)
     println!("Processing batch B (2000 headers, overlapping)...");
-    let result = filter_sync.handle_cfheaders_message(batch_b, &mut storage, &mut network).await;
+    let result =
+        filter_sync.handle_filter_headers_message(batch_b, &mut storage, &mut network).await;
 
     match result {
         Ok(_) => {
