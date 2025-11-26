@@ -674,35 +674,6 @@ impl<
         Ok(())
     }
 
-    /// Sync filters and check for wallet matches (legacy method).
-    pub async fn sync_and_check_filters_with_monitoring(
-        &mut self,
-        num_blocks: Option<u32>,
-    ) -> Result<Vec<crate::types::FilterMatch>> {
-        self.sync_and_check_filters(num_blocks).await
-    }
-
-    /// Sync filters and check for wallet matches.
-    pub async fn sync_and_check_filters(
-        &mut self,
-        _num_blocks: Option<u32>,
-    ) -> Result<Vec<crate::types::FilterMatch>> {
-        // Sequential sync handles filter sync internally
-        tracing::info!("Sequential sync mode: filter sync handled internally");
-        Ok(Vec::new())
-    }
-
-    /// Sync filters for a specific height range.
-    pub async fn sync_filters_range(
-        &mut self,
-        _start_height: Option<u32>,
-        _count: Option<u32>,
-    ) -> Result<()> {
-        // Sequential sync handles filter range sync internally
-        tracing::info!("Sequential sync mode: filter range sync handled internally");
-        Ok(())
-    }
-
     // ============ Sync State Persistence and Restoration ============
 
     /// Restore sync state from persistent storage.
