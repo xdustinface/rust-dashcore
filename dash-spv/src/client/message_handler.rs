@@ -338,17 +338,6 @@ impl<
             }
             NetworkMessage::CFilter(cfilter) => {
                 tracing::debug!("Received CFilter for block {}", cfilter.block_hash);
-
-                // Record the height of this received filter for gap tracking
-                crate::sync::filters::FilterSyncManager::<S, N>::record_filter_received_at_height(
-                    self.stats,
-                    &*self.storage,
-                    &cfilter.block_hash,
-                )
-                .await;
-
-                // Sequential sync manager handles the filter internally
-                // For sequential sync, filter checking is done within the sync manager
             }
             NetworkMessage::SendDsq(wants_dsq) => {
                 tracing::info!("Received SendDsq message - peer wants DSQ messages: {}", wants_dsq);
