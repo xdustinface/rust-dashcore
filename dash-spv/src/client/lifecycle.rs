@@ -419,11 +419,13 @@ impl<
         }
 
         // Get the genesis block hash for this network
-        let genesis_hash = self
-            .config
-            .network
-            .known_genesis_block_hash()
-            .ok_or_else(|| SpvError::Config("No known genesis hash for network".to_string()))?;
+        // Use ChainHash which has the correct genesis for all networks including regtest
+        use dashcore::constants::ChainHash;
+        let chain_hash = ChainHash::using_genesis_block(self.config.network);
+        // ChainHash::to_bytes() returns bytes in reverse order compared to BlockHash
+        let mut bytes = chain_hash.to_bytes();
+        bytes.reverse();
+        let genesis_hash = dashcore::BlockHash::from_byte_array(bytes);
 
         tracing::info!(
             "Initializing genesis block for network {:?}: {}",
