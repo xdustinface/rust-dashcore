@@ -198,10 +198,10 @@ async fn test_no_invalid_getfilter_headers_at_tip() {
     assert_eq!(sent_messages.len(), 1, "Should send exactly one message");
 
     match &sent_messages[0] {
-        NetworkMessage::GetCFHeaders(get_cf_headers) => {
+        NetworkMessage::GetCFHeaders(get_filter_headers) => {
             // The critical check: start_height must be <= height of stop_hash
             assert_eq!(
-                get_cf_headers.start_height,
+                get_filter_headers.start_height,
                 height - 1,
                 "Start height should be {}",
                 height - 1
@@ -209,7 +209,7 @@ async fn test_no_invalid_getfilter_headers_at_tip() {
             // We can't easily verify the stop_hash height here, but the request should be valid
             println!(
                 "GetCFHeaders request: start_height={}, stop_hash={}",
-                get_cf_headers.start_height, get_cf_headers.stop_hash
+                get_filter_headers.start_height, get_filter_headers.stop_hash
             );
         }
         _ => panic!("Expected GetCFHeaders message"),

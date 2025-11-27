@@ -70,8 +70,8 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         None
     }
     /// Calculate the start height of a CFHeaders batch.
-    fn calculate_batch_start_height(cf_headers: &CFHeaders, stop_height: u32) -> u32 {
-        let count = cf_headers.filter_hashes.len() as u32;
+    fn calculate_batch_start_height(filter_headers: &CFHeaders, stop_height: u32) -> u32 {
+        let count = filter_headers.filter_hashes.len() as u32;
         let offset = count.saturating_sub(1);
         stop_height.saturating_sub(offset)
     }
@@ -79,7 +79,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Get the height range for a CFHeaders batch.
     pub(super) async fn get_batch_height_range(
         &self,
-        cf_headers: &CFHeaders,
+        filter_headers: &CFHeaders,
         storage: &S,
     ) -> SyncResult<(u32, u32, u32)> {
         let header_tip_height = storage
@@ -91,16 +91,16 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             })?;
 
         let stop_height = self
-            .find_height_for_block_hash(&cf_headers.stop_hash, storage, 0, header_tip_height)
+            .find_height_for_block_hash(&filter_headers.stop_hash, storage, 0, header_tip_height)
             .await?
             .ok_or_else(|| {
                 SyncError::Validation(format!(
                     "Cannot find height for stop hash {} in CFHeaders",
-                    cf_headers.stop_hash
+                    filter_headers.stop_hash
                 ))
             })?;
 
-        let start_height = Self::calculate_batch_start_height(cf_headers, stop_height);
+        let start_height = Self::calculate_batch_start_height(filter_headers, stop_height);
 
         // Best-effort: resolve the start block hash for additional diagnostics from headers storage
         let start_hash_opt =
@@ -116,24 +116,24 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 tracing::debug!(
                     "CFHeaders batch analysis: batch_start_hash={}, msg_prev_filter_header={}, msg_prev_height={}, stop_hash={}, stop_height={}, start_height={}, count={}, header_tip_height={}",
                     h,
-                    cf_headers.previous_filter_header,
+                    filter_headers.previous_filter_header,
                     prev_height,
-                    cf_headers.stop_hash,
+                    filter_headers.stop_hash,
                     stop_height,
                     start_height,
-                    cf_headers.filter_hashes.len(),
+                    filter_headers.filter_hashes.len(),
                     header_tip_height
                 );
             }
             None => {
                 tracing::debug!(
                     "CFHeaders batch analysis: batch_start_hash=<not stored>, msg_prev_filter_header={}, msg_prev_height={}, stop_hash={}, stop_height={}, start_height={}, count={}, header_tip_height={}",
-                    cf_headers.previous_filter_header,
+                    filter_headers.previous_filter_header,
                     prev_height,
-                    cf_headers.stop_hash,
+                    filter_headers.stop_hash,
                     stop_height,
                     start_height,
-                    cf_headers.filter_hashes.len(),
+                    filter_headers.filter_hashes.len(),
                     header_tip_height
                 );
             }
@@ -143,7 +143,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     pub async fn handle_filter_headers_message(
         &mut self,
-        cf_headers: CFHeaders,
+        filter_headers: CFHeaders,
         storage: &mut S,
         network: &mut N,
     ) -> SyncResult<bool> {
@@ -151,7 +151,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             // Not currently syncing, ignore
             return Ok(true);
         }
-        self.handle_filter_headers(cf_headers, storage, network).await
+        self.handle_filter_headers(filter_headers, storage, network).await
     }
 
     pub async fn start_sync_headers(
@@ -356,14 +356,14 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             self.filter_abs_to_storage_index(start_height)
         );
 
-        let get_cf_headers = GetCFHeaders {
+        let get_filter_headers = GetCFHeaders {
             filter_type: 0, // Basic filter type
             start_height,
             stop_hash,
         };
 
         network
-            .send_message(NetworkMessage::GetCFHeaders(get_cf_headers))
+            .send_message(NetworkMessage::GetCFHeaders(get_filter_headers))
             .await
             .map_err(|e| SyncError::Network(format!("Failed to send GetCFHeaders: {}", e)))?;
 
@@ -580,12 +580,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Handle CFHeaders message (buffering and sequential processing).
     async fn handle_filter_headers(
         &mut self,
-        cf_headers: CFHeaders,
+        filter_headers: CFHeaders,
         storage: &mut S,
         network: &mut N,
     ) -> SyncResult<bool> {
         // Handle empty response - indicates end of sync
-        if cf_headers.filter_hashes.is_empty() {
+        if filter_headers.filter_hashes.is_empty() {
             tracing::info!("Received empty CFHeaders response - sync complete");
             self.syncing_filter_headers = false;
             self.clear_filter_header_sync_state();
@@ -594,13 +594,13 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
         // Get the height range for this batch
         let (batch_start_height, stop_height, _header_tip_height) =
-            self.get_batch_height_range(&cf_headers, storage).await?;
+            self.get_batch_height_range(&filter_headers, storage).await?;
 
         tracing::debug!(
             "Received CFHeaders batch: start={}, stop={}, count={}, next_expected={}",
             batch_start_height,
             stop_height,
-            cf_headers.filter_hashes.len(),
+            filter_headers.filter_hashes.len(),
             self.next_filter_header_height_to_process
         );
 
@@ -611,7 +611,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         if batch_start_height == self.next_filter_header_height_to_process {
             // Process this batch immediately
             tracing::debug!("Processing expected batch at height {}", batch_start_height);
-            self.process_filter_header_batch(cf_headers, storage, network).await?;
+            self.process_filter_header_batch(filter_headers, storage, network).await?;
 
             // Try to process any buffered batches that are now in sequence
             self.process_buffered_filter_header_batches(storage, network).await?;
@@ -624,7 +624,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             );
 
             let batch = ReceivedCFHeaderBatch {
-                filter_headers: cf_headers,
+                filter_headers,
                 received_at: std::time::Instant::now(),
             };
 
@@ -655,15 +655,15 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Process a single CFHeaders batch (extracted from original handle_filter_headers logic).
     async fn process_filter_header_batch(
         &mut self,
-        cf_headers: CFHeaders,
+        filter_headers: CFHeaders,
         storage: &mut S,
         _network: &mut N,
     ) -> SyncResult<()> {
         let (batch_start_height, stop_height, _header_tip_height) =
-            self.get_batch_height_range(&cf_headers, storage).await?;
+            self.get_batch_height_range(&filter_headers, storage).await?;
 
         // Verify and process the batch
-        match self.verify_filter_header_chain(&cf_headers, batch_start_height, storage).await {
+        match self.verify_filter_header_chain(&filter_headers, batch_start_height, storage).await {
             Ok(true) => {
                 tracing::debug!(
                     "✅ Filter header chain verification successful for batch {}-{}",
@@ -672,7 +672,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 );
 
                 // Store the verified filter headers
-                self.store_filter_headers(cf_headers.clone(), storage).await?;
+                self.store_filter_headers(filter_headers.clone(), storage).await?;
 
                 // Update next expected height
                 self.next_filter_header_height_to_process = stop_height + 1;
@@ -793,22 +793,22 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     pub(super) async fn handle_overlapping_headers(
         &self,
-        cf_headers: &CFHeaders,
+        filter_headers: &CFHeaders,
         expected_start_height: u32,
         storage: &mut S,
     ) -> SyncResult<(usize, u32)> {
         // Get the original height range for this CFHeaders batch
         let (original_start_height, _stop_height, _header_tip_height) =
-            self.get_batch_height_range(cf_headers, storage).await?;
+            self.get_batch_height_range(filter_headers, storage).await?;
 
         // Determine how many headers overlap with what we already have
         let headers_to_skip = expected_start_height.saturating_sub(original_start_height) as usize;
 
         // Complete overlap case - all headers already processed
-        if headers_to_skip >= cf_headers.filter_hashes.len() {
+        if headers_to_skip >= filter_headers.filter_hashes.len() {
             tracing::info!(
                 "✅ All {} headers in batch already processed, skipping",
-                cf_headers.filter_hashes.len()
+                filter_headers.filter_hashes.len()
             );
             return Ok((0, expected_start_height));
         }
@@ -816,9 +816,9 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // This lets us compare continuity precisely at the overlap boundary rather than the
         // batch's original start (which may precede our local tip).
         let mut computed_headers: Vec<FilterHeader> =
-            Vec::with_capacity(cf_headers.filter_hashes.len());
-        let mut prev_header = cf_headers.previous_filter_header;
-        for filter_hash in &cf_headers.filter_hashes {
+            Vec::with_capacity(filter_headers.filter_hashes.len());
+        let mut prev_header = filter_headers.previous_filter_header;
+        for filter_hash in &filter_headers.filter_hashes {
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(filter_hash.as_byte_array());
             data[32..].copy_from_slice(prev_header.as_byte_array());
@@ -839,7 +839,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // Determine the computed header at expected_prev_height using the batch data
         let steps_to_expected_prev = expected_start_height.saturating_sub(original_start_height);
         let computed_prev_at_expected = if steps_to_expected_prev == 0 {
-            cf_headers.previous_filter_header
+            filter_headers.previous_filter_header
         } else {
             // steps_to_expected_prev >= 1 implies index exists
             computed_headers[(steps_to_expected_prev - 1) as usize]
@@ -905,11 +905,11 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// with overlap detection handled by the dedicated overlap resolution system.
     pub(super) async fn verify_filter_header_chain(
         &self,
-        cf_headers: &CFHeaders,
+        filter_headers: &CFHeaders,
         start_height: u32,
         storage: &S,
     ) -> SyncResult<bool> {
-        if cf_headers.filter_hashes.is_empty() {
+        if filter_headers.filter_hashes.is_empty() {
             return Ok(true);
         }
 
@@ -965,10 +965,10 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             })?;
 
         // Simple chain continuity check - the received headers should connect to our expected previous header
-        if cf_headers.previous_filter_header != expected_prev_header {
+        if filter_headers.previous_filter_header != expected_prev_header {
             tracing::error!(
                 "Filter header chain verification failed: received previous_filter_header {:?} doesn't match expected header {:?} at height {}",
-                cf_headers.previous_filter_header,
+                filter_headers.previous_filter_header,
                 expected_prev_header,
                 prev_height
             );
@@ -977,7 +977,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
         tracing::trace!(
             "Filter header chain verification passed for {} headers",
-            cf_headers.filter_hashes.len()
+            filter_headers.filter_hashes.len()
         );
         Ok(true)
     }

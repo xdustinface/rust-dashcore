@@ -167,30 +167,30 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Handle a CFHeaders message during filter header synchronization.
     pub async fn process_filter_headers(
         &self,
-        cf_headers: &CFHeaders,
+        filter_headers: &CFHeaders,
         start_height: u32,
         storage: &S,
     ) -> SyncResult<Vec<FilterHeader>> {
-        if cf_headers.filter_hashes.is_empty() {
+        if filter_headers.filter_hashes.is_empty() {
             return Ok(Vec::new());
         }
 
         tracing::debug!(
             "Processing {} filter headers starting from height {}",
-            cf_headers.filter_hashes.len(),
+            filter_headers.filter_hashes.len(),
             start_height
         );
 
         // Verify filter header chain
-        if !self.verify_filter_header_chain(cf_headers, start_height, storage).await? {
+        if !self.verify_filter_header_chain(filter_headers, start_height, storage).await? {
             return Err(SyncError::Validation(
                 "Filter header chain verification failed".to_string(),
             ));
         }
 
         // Convert filter hashes to filter headers
-        let mut new_filter_headers = Vec::with_capacity(cf_headers.filter_hashes.len());
-        let mut prev_header = cf_headers.previous_filter_header;
+        let mut new_filter_headers = Vec::with_capacity(filter_headers.filter_hashes.len());
+        let mut prev_header = filter_headers.previous_filter_header;
 
         // For the first batch starting at height 1, we need to store the genesis filter header (height 0)
         if start_height == 1 {
@@ -200,7 +200,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             // Note: We'll handle this in the calling function since we need mutable storage access
         }
 
-        for (i, filter_hash) in cf_headers.filter_hashes.iter().enumerate() {
+        for (i, filter_hash) in filter_headers.filter_hashes.iter().enumerate() {
             // According to BIP157: filter_header = double_sha256(filter_hash || prev_filter_header)
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(filter_hash.as_byte_array());
@@ -209,7 +209,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             let filter_header =
                 FilterHeader::from_byte_array(sha256d::Hash::hash(&data).to_byte_array());
 
-            if i < 1 || i >= cf_headers.filter_hashes.len() - 1 {
+            if i < 1 || i >= filter_headers.filter_hashes.len() - 1 {
                 tracing::trace!(
                     "Filter header {}: filter_hash={:?}, prev_header={:?}, result={:?}",
                     start_height + i as u32,
