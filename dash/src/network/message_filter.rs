@@ -30,7 +30,7 @@ pub struct CFilter {
 }
 impl_consensus_encoding!(CFilter, filter_type, block_hash, filter);
 
-/// getfilter_headers message
+/// getcfheaders message
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct GetCFHeaders {
     /// Byte identifying the type of filter being returned
@@ -42,7 +42,7 @@ pub struct GetCFHeaders {
 }
 impl_consensus_encoding!(GetCFHeaders, filter_type, start_height, stop_hash);
 
-/// filter_headers message
+/// cfheaders message
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct CFHeaders {
     /// Filter type for which headers are requested
