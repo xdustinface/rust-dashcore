@@ -83,8 +83,9 @@ fn dash_genesis_tx() -> Transaction {
 
     // Inputs
     // Using raw script bytes to avoid push_slice issues
+    // Message: "Wired 09/Jan/2014 The Grand Experiment Goes Live: Overstock.com Is Now Accepting Bitcoins"
     let in_script = script::ScriptBuf::from(hex!(
-        "04ffff001d01044c5957697265642030392f4a616e2f32303134205468652047726e64204578706572696d656e7420476f6573204c6976653a204f76657273746f636b2e636f6d204973204e6f7720416363657074696e6720426974636f696e73"
+        "04ffff001d01044c5957697265642030392f4a616e2f3230313420546865204772616e64204578706572696d656e7420476f6573204c6976653a204f76657273746f636b2e636f6d204973204e6f7720416363657074696e6720426974636f696e73"
     ).to_vec());
     ret.input.push(TxIn {
         previous_output: OutPoint::null(),
@@ -157,9 +158,9 @@ pub fn genesis_block(network: Network) -> Block {
                     version: block::Version::ONE,
                     prev_blockhash: Hash::all_zeros(),
                     merkle_root,
-                    time: 1598918400,
+                    time: 1417713337, // Matches official Dash Core devnet genesis
                     bits: CompactTarget::from_consensus(0x1e0377ae),
-                    nonce: 52613770,
+                    nonce: 1096447, // Matches official Dash Core devnet genesis
                 },
                 txdata,
             }
@@ -172,9 +173,9 @@ pub fn genesis_block(network: Network) -> Block {
                     version: block::Version::ONE,
                     prev_blockhash: Hash::all_zeros(),
                     merkle_root,
-                    time: 1296688602,
+                    time: 1417713337, // Matches official Dash Core regtest genesis
                     bits: CompactTarget::from_consensus(0x207fffff),
-                    nonce: 2,
+                    nonce: 1096447, // Matches official Dash Core regtest genesis
                 },
                 txdata,
             }
@@ -211,10 +212,11 @@ impl ChainHash {
         0x16, 0x7b,
     ]);
     /// `ChainHash` for regtest dash.
+    /// Genesis hash: 000008ca1832a4baf228eb1553c03d3a2c8e02399550dd6ea8d65cec3ef23d2e
     pub const REGTEST: Self = Self([
-        0x53, 0xb3, 0xed, 0x30, 0x30, 0x78, 0x1a, 0xc1, 0x9e, 0x48, 0x52, 0xd9, 0xc5, 0x8f, 0x28,
-        0x04, 0x57, 0x4f, 0x98, 0x66, 0xf3, 0xf7, 0xf6, 0x91, 0x31, 0xee, 0xb1, 0x3f, 0x44, 0x9f,
-        0x80, 0x07,
+        0x00, 0x00, 0x08, 0xca, 0x18, 0x32, 0xa4, 0xba, 0xf2, 0x28, 0xeb, 0x15, 0x53, 0xc0, 0x3d,
+        0x3a, 0x2c, 0x8e, 0x02, 0x39, 0x95, 0x50, 0xdd, 0x6e, 0xa8, 0xd6, 0x5c, 0xec, 0x3e, 0xf2,
+        0x3d, 0x2e,
     ]);
 
     /// Returns the hash of the `network` genesis block for use as a chain hash.
