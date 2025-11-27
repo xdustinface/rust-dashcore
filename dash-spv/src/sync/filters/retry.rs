@@ -157,7 +157,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Check for timed out CFHeader requests and retry them.
     ///
     /// Called periodically to detect and recover from requests that never received responses.
-    pub async fn check_cfheader_request_timeouts(
+    pub async fn check_filter_header_request_timeouts(
         &mut self,
         network: &mut N,
         storage: &S,
@@ -170,37 +170,38 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         let mut timed_out_requests = Vec::new();
 
         // Check for timed out active requests
-        for (start_height, active_req) in &self.active_cfheader_requests {
-            if now.duration_since(active_req.sent_time) > self.cfheader_request_timeout {
+        for (start_height, active_req) in &self.active_filter_header_requests {
+            if now.duration_since(active_req.sent_time) > self.filter_header_request_timeout {
                 timed_out_requests.push((*start_height, active_req.stop_hash));
             }
         }
 
         // Handle timeouts: remove from active, retry or give up based on retry count
         for (start_height, stop_hash) in timed_out_requests {
-            self.handle_cfheader_request_timeout(start_height, stop_hash, network, storage).await?;
+            self.handle_filter_header_request_timeout(start_height, stop_hash, network, storage)
+                .await?;
         }
 
         // Check queue status and send next batch if needed
-        self.process_next_queued_cfheader_requests(network).await?;
+        self.process_next_queued_filter_header_requests(network).await?;
 
         Ok(())
     }
 
     /// Handle a specific CFHeaders request timeout.
-    async fn handle_cfheader_request_timeout(
+    async fn handle_filter_header_request_timeout(
         &mut self,
         start_height: u32,
         stop_hash: BlockHash,
         _network: &mut N,
         _storage: &S,
     ) -> SyncResult<()> {
-        let retry_count = self.cfheader_retry_counts.get(&start_height).copied().unwrap_or(0);
+        let retry_count = self.filter_header_retry_counts.get(&start_height).copied().unwrap_or(0);
 
         // Remove from active requests
-        self.active_cfheader_requests.remove(&start_height);
+        self.active_filter_header_requests.remove(&start_height);
 
-        if retry_count >= self.max_cfheader_retries {
+        if retry_count >= self.max_filter_header_retries {
             tracing::error!(
                 "❌ CFHeaders request for height {} failed after {} retries, giving up",
                 start_height,
@@ -213,7 +214,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             "🔄 Retrying timed out CFHeaders request for height {} (attempt {}/{})",
             start_height,
             retry_count + 1,
-            self.max_cfheader_retries
+            self.max_filter_header_retries
         );
 
         // Create new request and add back to queue for retry
@@ -224,10 +225,10 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         };
 
         // Update retry count
-        self.cfheader_retry_counts.insert(start_height, retry_count + 1);
+        self.filter_header_retry_counts.insert(start_height, retry_count + 1);
 
         // Add to front of queue for priority retry
-        self.pending_cfheader_requests.push_front(retry_request);
+        self.pending_filter_header_requests.push_front(retry_request);
 
         Ok(())
     }

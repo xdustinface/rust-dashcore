@@ -313,7 +313,7 @@ impl<
             SyncPhase::DownloadingCFHeaders {
                 ..
             } => {
-                self.filter_sync.check_cfheader_request_timeouts(network, storage).await?;
+                self.filter_sync.check_filter_header_request_timeouts(network, storage).await?;
             }
             SyncPhase::DownloadingMnList {
                 ..
@@ -465,7 +465,7 @@ impl<
             SyncPhase::DownloadingCFHeaders {
                 ..
             } => {
-                self.filter_sync.check_cfheader_request_timeouts(network, storage).await?;
+                self.filter_sync.check_filter_header_request_timeouts(network, storage).await?;
             }
             _ => {
                 // For other phases, we'll need phase-specific recovery

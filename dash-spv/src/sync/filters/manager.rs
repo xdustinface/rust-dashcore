@@ -69,21 +69,21 @@ pub struct FilterSyncManager<S: StorageManager, N: NetworkManager> {
     /// Currently active filter requests (limited by MAX_CONCURRENT_FILTER_REQUESTS)
     pub(super) active_filter_requests: HashMap<(u32, u32), ActiveRequest>,
     /// Queue of pending CFHeaders requests
-    pub(super) pending_cfheader_requests: VecDeque<CFHeaderRequest>,
+    pub(super) pending_filter_header_requests: VecDeque<CFHeaderRequest>,
     /// Currently active CFHeaders requests: (start_height, stop_height) -> ActiveCFHeaderRequest
-    pub(super) active_cfheader_requests: HashMap<u32, ActiveCFHeaderRequest>,
+    pub(super) active_filter_header_requests: HashMap<u32, ActiveCFHeaderRequest>,
     /// Retry counts per CFHeaders range: start_height -> retry_count
-    pub(super) cfheader_retry_counts: HashMap<u32, u32>,
+    pub(super) filter_header_retry_counts: HashMap<u32, u32>,
     /// Maximum retries for CFHeaders
-    pub(super) max_cfheader_retries: u32,
+    pub(super) max_filter_header_retries: u32,
     /// Received CFHeaders batches waiting for sequential processing: start_height -> batch
-    pub(super) received_cfheader_batches: HashMap<u32, ReceivedCFHeaderBatch>,
+    pub(super) received_filter_header_batches: HashMap<u32, ReceivedCFHeaderBatch>,
     /// Next expected height for sequential processing
-    pub(super) next_cfheader_height_to_process: u32,
+    pub(super) next_filter_header_height_to_process: u32,
     /// Maximum concurrent CFHeaders requests
-    pub(super) max_concurrent_cfheader_requests: usize,
+    pub(super) max_concurrent_filter_header_requests: usize,
     /// Timeout for CFHeaders requests
-    pub(super) cfheader_request_timeout: std::time::Duration,
+    pub(super) filter_header_request_timeout: std::time::Duration,
 }
 
 impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync + 'static>
@@ -109,15 +109,15 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             pending_filter_requests: VecDeque::new(),
             active_filter_requests: HashMap::new(),
             // CFHeaders fields
-            pending_cfheader_requests: VecDeque::new(),
-            active_cfheader_requests: HashMap::new(),
-            cfheader_retry_counts: HashMap::new(),
-            max_cfheader_retries: config.max_filter_headers_retries,
-            received_cfheader_batches: HashMap::new(),
-            next_cfheader_height_to_process: 0,
-            max_concurrent_cfheader_requests: config
+            pending_filter_header_requests: VecDeque::new(),
+            active_filter_header_requests: HashMap::new(),
+            filter_header_retry_counts: HashMap::new(),
+            max_filter_header_retries: config.max_filter_headers_retries,
+            received_filter_header_batches: HashMap::new(),
+            next_filter_header_height_to_process: 0,
+            max_concurrent_filter_header_requests: config
                 .max_concurrent_filter_headers_requests_parallel,
-            cfheader_request_timeout: std::time::Duration::from_secs(
+            filter_header_request_timeout: std::time::Duration::from_secs(
                 config.filter_headers_request_timeout_secs,
             ),
             _phantom_s: std::marker::PhantomData,
