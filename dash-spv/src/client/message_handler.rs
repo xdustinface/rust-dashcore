@@ -106,21 +106,21 @@ impl<
                         SpvError::Sync(e)
                     });
             }
-            NetworkMessage::CFHeaders(ref cf_headers) => {
+            NetworkMessage::CFHeaders(ref filter_headers) => {
                 // Try to include the peer address for better diagnostics
                 let peer_addr = self.network.get_last_message_peer_addr().await;
                 match peer_addr {
                     Some(addr) => {
                         tracing::info!(
                             "📨 Client received CFHeaders message with {} filter headers from {}",
-                            cf_headers.filter_hashes.len(),
+                            filter_headers.filter_hashes.len(),
                             addr
                         );
                     }
                     None => {
                         tracing::info!(
                             "📨 Client received CFHeaders message with {} filter headers (peer unknown)",
-                            cf_headers.filter_hashes.len()
+                            filter_headers.filter_hashes.len()
                         );
                     }
                 }
