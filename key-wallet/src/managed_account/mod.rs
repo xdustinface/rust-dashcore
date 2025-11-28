@@ -56,6 +56,11 @@ pub struct ManagedAccount {
     pub transactions: BTreeMap<Txid, TransactionRecord>,
     /// UTXO set for this account
     pub utxos: BTreeMap<OutPoint, Utxo>,
+    /// Pending spends: OutPoints that were spent by a transaction but the UTXO wasn't found.
+    /// This handles out-of-order block processing where a spending transaction is processed
+    /// before the creating transaction. When a UTXO is later added, we check this set and
+    /// remove the UTXO immediately since it was already spent.
+    pub pending_spends: alloc::collections::BTreeSet<OutPoint>,
 }
 
 impl ManagedAccount {
@@ -69,6 +74,7 @@ impl ManagedAccount {
             balance: WalletBalance::default(),
             transactions: BTreeMap::new(),
             utxos: BTreeMap::new(),
+            pending_spends: alloc::collections::BTreeSet::new(),
         }
     }
 
@@ -864,6 +870,15 @@ impl ManagedAccountTrait for ManagedAccount {
                         txid,
                         vout: vout as u32,
                     };
+                    // Check if this UTXO was already processed as spent
+                    if self.pending_spends.remove(&outpoint) {
+                        tracing::debug!(
+                            "Matured UTXO {}:{} was already spent, not adding",
+                            txid,
+                            vout
+                        );
+                        continue;
+                    }
                     let txout = dashcore::TxOut {
                         value: output.value,
                         script_pubkey: output.script_pubkey.clone(),

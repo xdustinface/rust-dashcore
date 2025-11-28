@@ -217,7 +217,12 @@ impl WalletTransactionChecker for ManagedWalletInfo {
                                     // Remove any UTXOs that are being spent by this transaction
                                     for input in &tx.input {
                                         // If this input spends one of our UTXOs, remove it
-                                        account.utxos.remove(&input.previous_output);
+                                        if account.utxos.remove(&input.previous_output).is_none() {
+                                            // UTXO doesn't exist yet. Track this as a pending spend
+                                            // so we don't add it later when actually processing it.
+                                            account.pending_spends.insert(input.previous_output);
+                                            tracing::debug!("UTXO {}:{} not found, adding to pending_spends", input.previous_output.txid, input.previous_output.vout);
+                                        }
                                     }
 
                                     // Recalculate account balance from UTXOs
