@@ -166,16 +166,6 @@ pub trait StorageManager: Send + Sync {
         hash: &dashcore::BlockHash,
     ) -> StorageResult<Option<u32>>;
 
-    /// Get multiple headers in a single batch operation using blockchain heights.
-    /// Returns headers with their heights. More efficient than calling get_header multiple times.
-    async fn get_headers_batch(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> StorageResult<Vec<(u32, BlockHeader)>>;
-
-    // UTXO methods removed - handled by external wallet
-
     /// Store persistent sync state.
     async fn store_sync_state(&mut self, state: &PersistentSyncState) -> StorageResult<()>;
 
@@ -208,13 +198,6 @@ pub trait StorageManager: Send + Sync {
 
     /// Load a chain lock by height.
     async fn load_chain_lock(&self, height: u32) -> StorageResult<Option<dashcore::ChainLock>>;
-
-    /// Get chain locks in a height range.
-    async fn get_chain_locks(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> StorageResult<Vec<(u32, dashcore::ChainLock)>>;
 
     // Mempool storage methods
     /// Store an unconfirmed transaction.

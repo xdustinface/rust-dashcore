@@ -644,14 +644,6 @@ impl StorageManager for MockStorageManager {
         Ok(None)
     }
 
-    async fn get_headers_batch(
-        &self,
-        _start_height: u32,
-        _end_height: u32,
-    ) -> dash_spv::error::StorageResult<Vec<(u32, BlockHeader)>> {
-        Ok(vec![])
-    }
-
     async fn store_masternode_state(
         &mut self,
         _state: &dash_spv::storage::MasternodeState,
@@ -712,16 +704,6 @@ impl StorageManager for MockStorageManager {
     ) -> dash_spv::error::StorageResult<Option<dashcore::ChainLock>> {
         Ok(None)
     }
-
-    async fn get_chain_locks(
-        &self,
-        _start_height: u32,
-        _end_height: u32,
-    ) -> dash_spv::error::StorageResult<Vec<(u32, dashcore::ChainLock)>> {
-        Ok(vec![])
-    }
-
-    // InstantLock storage methods removed from trait; no-op here
 
     async fn store_mempool_transaction(
         &mut self,

@@ -292,46 +292,6 @@ impl DiskStorageManager {
         Ok(Some(chain_lock))
     }
 
-    /// Get ChainLocks in a height range.
-    pub async fn get_chain_locks(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> StorageResult<Vec<(u32, dashcore::ChainLock)>> {
-        let chainlocks_dir = self.base_path.join("chainlocks");
-
-        if !chainlocks_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut chain_locks = Vec::new();
-        let mut entries = tokio::fs::read_dir(&chainlocks_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
-
-            // Parse height from filename
-            if let Some(height_str) =
-                file_name_str.strip_prefix("chainlock_").and_then(|s| s.strip_suffix(".bin"))
-            {
-                if let Ok(height) = height_str.parse::<u32>() {
-                    if height >= start_height && height <= end_height {
-                        let path = entry.path();
-                        let data = tokio::fs::read(&path).await?;
-                        if let Ok(chain_lock) = bincode::deserialize(&data) {
-                            chain_locks.push((height, chain_lock));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by height
-        chain_locks.sort_by_key(|(h, _)| *h);
-        Ok(chain_locks)
-    }
-
     /// Store metadata.
     pub async fn store_metadata(&mut self, key: &str, value: &[u8]) -> StorageResult<()> {
         let path = self.base_path.join(format!("state/{}.dat", key));
@@ -601,14 +561,6 @@ impl StorageManager for DiskStorageManager {
         Self::get_header_height_by_hash(self, hash).await
     }
 
-    async fn get_headers_batch(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> StorageResult<Vec<(u32, BlockHeader)>> {
-        Self::get_headers_batch(self, start_height, end_height).await
-    }
-
     async fn store_sync_state(
         &mut self,
         state: &crate::storage::PersistentSyncState,
@@ -650,14 +602,6 @@ impl StorageManager for DiskStorageManager {
 
     async fn load_chain_lock(&self, height: u32) -> StorageResult<Option<dashcore::ChainLock>> {
         Self::load_chain_lock(self, height).await
-    }
-
-    async fn get_chain_locks(
-        &self,
-        start_height: u32,
-        end_height: u32,
-    ) -> StorageResult<Vec<(u32, dashcore::ChainLock)>> {
-        Self::get_chain_locks(self, start_height, end_height).await
     }
 
     async fn store_mempool_transaction(
