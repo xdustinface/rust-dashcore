@@ -234,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Create the wallet manager
     let mut wallet_manager = WalletManager::<ManagedWalletInfo>::new();
     let wallet_id = wallet_manager.create_wallet_from_mnemonic(
-        "enemy check owner stumble unaware debris suffer peanut good fabric bleak outside",
+        "job flower agree lyrics industry note boost finger buddy dog exact fat",
         "",
         &[network],
         None,

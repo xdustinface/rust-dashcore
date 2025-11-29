@@ -205,7 +205,7 @@ impl PersistentSyncState {
         let tip_height = chain_state.tip_height();
 
         // Create checkpoints at strategic intervals
-        let checkpoint_intervals = [1000, 10000, 50000, 100000];
+        let checkpoint_intervals = [1000];
 
         for &interval in &checkpoint_intervals {
             let mut height = interval;

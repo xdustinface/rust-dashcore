@@ -179,8 +179,8 @@ impl<
     }
 
     /// Check if currently in the downloading blocks phase
-    pub fn is_in_downloading_blocks_phase(&self) -> bool {
-        matches!(self.current_phase, SyncPhase::DownloadingBlocks { .. })
+    pub fn is_in_downloading_transactions_phase(&self) -> bool {
+        matches!(self.current_phase, SyncPhase::DownloadingFilters { .. } | SyncPhase::DownloadingBlocks { .. })
     }
 
     /// Get current phase

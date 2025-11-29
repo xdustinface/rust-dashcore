@@ -1,0 +1,35 @@
+[
+  [
+    "45.77.244.227:9999",
+    {
+      "score": -5,
+      "ban_count": 0,
+      "positive_actions": 1,
+      "negative_actions": 0,
+      "connection_attempts": 1,
+      "successful_connections": 1
+    }
+  ],
+  [
+    "5.230.119.181:9999",
+    {
+      "score": -5,
+      "ban_count": 0,
+      "positive_actions": 1,
+      "negative_actions": 0,
+      "connection_attempts": 1,
+      "successful_connections": 1
+    }
+  ],
+  [
+    "46.4.162.100:9999",
+    {
+      "score": -5,
+      "ban_count": 0,
+      "positive_actions": 1,
+      "negative_actions": 0,
+      "connection_attempts": 1,
+      "successful_connections": 1
+    }
+  ]
+]

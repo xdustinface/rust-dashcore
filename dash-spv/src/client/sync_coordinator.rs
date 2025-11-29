@@ -158,7 +158,7 @@ impl<
             // Check if it's time to update the status display
             if last_status_update.elapsed() >= status_update_interval {
                 self.update_status_display().await;
-
+                tracing::info!("Status update, current phase: {}", self.sync_manager.current_phase().name());
                 // Sequential sync handles filter gaps internally
 
                 // Filter sync progress is handled by sequential sync manager internally

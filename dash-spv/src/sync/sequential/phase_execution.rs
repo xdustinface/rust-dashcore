@@ -180,9 +180,9 @@ impl<
                 ..
             } => {
                 tracing::info!("📥 Starting block download phase");
-                // Block download will be initiated based on filter matches
-                // For now, we'll complete the sync
-                self.transition_to_next_phase(storage, network, "No blocks to download").await?;
+                if self.no_more_pending_blocks() {
+                    self.transition_to_next_phase(storage, network, "No pending downloads").await?;
+                }
             }
 
             _ => {
@@ -505,8 +505,6 @@ impl<
     }
 
     pub(super) fn no_more_pending_blocks(&self) -> bool {
-        // This would check if there are more blocks to download
-        // For now, return true
-        true
+        !self.filter_sync.has_pending_downloads()
     }
 }

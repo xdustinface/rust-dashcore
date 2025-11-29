@@ -12,7 +12,7 @@ use crate::network::NetworkManager;
 use crate::storage::StorageManager;
 use crate::types::PeerId;
 use key_wallet_manager::wallet_interface::WalletInterface;
-
+use crate::FilterMatch;
 use super::manager::SequentialSyncManager;
 use super::phases::SyncPhase;
 
@@ -39,8 +39,13 @@ impl<
                 self.current_phase.name()
             );
 
-            // If we're in the DownloadingBlocks phase, handle it there
-            return if matches!(self.current_phase, SyncPhase::DownloadingBlocks { .. }) {
+            // Handle blocks in phases where wallet processing is needed
+            return if matches!(
+                self.current_phase,
+                SyncPhase::DownloadingBlocks { .. }
+                    | SyncPhase::DownloadingFilters { .. }
+            ) {
+                // Process blocks during these phases to capture new addresses from gap limit maintenance
                 self.handle_block_message(block, network, storage).await
             } else if matches!(self.current_phase, SyncPhase::DownloadingMnList { .. }) {
                 // During masternode sync, blocks are not processed
@@ -634,11 +639,12 @@ impl<
 
             tracing::info!("🎯 Filter match found! Requesting block {}", cfilter.block_hash);
             // Request the full block
-            let inv = Inventory::Block(cfilter.block_hash);
-            network
-                .send_message(NetworkMessage::GetData(vec![inv]))
-                .await
-                .map_err(|e| SyncError::Network(format!("Failed to request block: {}", e)))?;
+            let filter_match = FilterMatch {
+                block_hash: cfilter.block_hash,
+                height,
+                block_requested: true,
+            };
+            self.filter_sync.request_block_download(filter_match, network).await?;
         }
 
         // Handle filter message tracking
@@ -702,12 +708,12 @@ impl<
                 // We need to check:
                 // 1. All expected filters have been received (completed_heights matches total_filters)
                 // 2. No more active or pending requests
-                let has_pending = self.filter_sync.pending_download_count() > 0
-                    || self.filter_sync.active_request_count() > 0;
+                let has_pending = self.filter_sync.has_pending_filter_requests()
+                    || self.filter_sync.has_pending_filter_requests();
 
                 let all_received =
                     *total_filters > 0 && completed_heights.len() >= *total_filters as usize;
-
+                //tracing::info!("pending: {}, active_requests {}, all_received: {}", self.filter_sync.pending_download_count(), self.filter_sync.active_request_count(), all_received);
                 // Only transition when we've received all filters AND no requests are pending
                 if all_received && !has_pending {
                     tracing::info!(
@@ -762,6 +768,8 @@ impl<
 
         // Update chain height to process any matured coinbase transactions
         wallet.update_chain_height(self.config.network, block_height).await;
+
+        self.filter_sync.handle_downloaded_block(&block).await?;
 
         drop(wallet);
 

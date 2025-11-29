@@ -165,7 +165,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     pub async fn request_block_download(
         &mut self,
-        filter_match: crate::types::FilterMatch,
+        mut filter_match: crate::types::FilterMatch,
         network: &mut N,
     ) -> SyncResult<()> {
         // Check if already downloading or queued
@@ -218,7 +218,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
         // Check if this block was requested by the sync manager
         if let Some(height) = self.downloading_blocks.remove(&block_hash) {
-            tracing::info!("📦 Received expected block {} at height {}", block_hash, height);
+            tracing::info!("📦 Received expected block {} at height {}, downloading {}, pending {}", block_hash, height, self.downloading_blocks.len(), self.pending_block_downloads.len());
 
             // Find and remove from pending queue
             if let Some(pos) =

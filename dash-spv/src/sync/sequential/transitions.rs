@@ -410,7 +410,7 @@ impl TransitionManager {
     fn has_blocks_to_download(&self, _phase: &SyncPhase) -> bool {
         // This will be determined by filter matches
         // For now, return false (no blocks to download)
-        false
+        true
     }
 
     async fn create_filter_headers_phase(
