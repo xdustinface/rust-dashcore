@@ -93,6 +93,9 @@ pub enum StorageError {
     #[error("Data not found: {0}")]
     NotFound(String),
 
+    #[error("Not initialized: {0}")]
+    NotInitialized(String),
+
     #[error("Write failed: {0}")]
     WriteFailed(String),
 
