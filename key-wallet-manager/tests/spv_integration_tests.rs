@@ -116,7 +116,7 @@ async fn test_block_processing() {
     let result = manager.process_block(&block, 100, Network::Testnet).await;
 
     // Since we're not watching specific addresses, no transactions should be relevant
-    assert_eq!(result.len(), 0);
+    assert_eq!(result.relevant_txids.len(), 0);
 }
 
 #[tokio::test]

@@ -48,6 +48,15 @@ pub struct AddressGenerationResult {
     pub account_type_used: Option<AccountTypeUsed>,
 }
 
+/// Result of checking a transaction against all wallets
+#[derive(Debug, Clone, Default)]
+pub struct CheckTransactionsResult {
+    /// Wallets that found the transaction relevant
+    pub affected_wallets: Vec<WalletId>,
+    /// New addresses generated during gap limit maintenance
+    pub new_addresses: Vec<Address>,
+}
+
 /// Network-specific state for the wallet manager
 #[derive(Debug)]
 pub struct NetworkState {
@@ -501,15 +510,16 @@ impl<T: WalletInfoInterface> WalletManager<T> {
         Ok(wallet_id)
     }
 
-    /// Check a transaction against all wallets and update their states if relevant
+    /// Check a transaction against all wallets and update their states if relevant.
+    /// Returns affected wallets and any new addresses generated during gap limit maintenance.
     pub async fn check_transaction_in_all_wallets(
         &mut self,
         tx: &Transaction,
         network: Network,
         context: TransactionContext,
         update_state_if_found: bool,
-    ) -> Vec<WalletId> {
-        let mut relevant_wallets = Vec::new();
+    ) -> CheckTransactionsResult {
+        let mut result = CheckTransactionsResult::default();
 
         // We need to iterate carefully since we're mutating
         let wallet_ids: Vec<WalletId> = self.wallets.keys().cloned().collect();
@@ -521,21 +531,23 @@ impl<T: WalletInfoInterface> WalletManager<T> {
             let wallet_info_opt = self.wallet_infos.get_mut(&wallet_id);
 
             if let (Some(wallet), Some(wallet_info)) = (wallet_opt, wallet_info_opt) {
-                let result = wallet_info
+                let check_result = wallet_info
                     .check_transaction(tx, network, context, wallet, update_state_if_found)
                     .await;
 
                 // If the transaction is relevant
-                if result.is_relevant {
-                    relevant_wallets.push(wallet_id);
+                if check_result.is_relevant {
+                    result.affected_wallets.push(wallet_id);
                     // Note: balance update is already handled in check_transaction
                 }
+
+                result.new_addresses.extend(check_result.new_addresses);
             }
         }
 
         // If any wallet found the transaction relevant, and we're updating state,
         // add it to the network's transaction history
-        if !relevant_wallets.is_empty() && update_state_if_found {
+        if !result.affected_wallets.is_empty() && update_state_if_found {
             let txid = tx.txid();
 
             // Determine the height and confirmation status based on context
@@ -567,7 +579,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
             network_state.transactions.insert(txid, record);
         }
 
-        relevant_wallets
+        result
     }
 
     /// Create an account in a specific wallet

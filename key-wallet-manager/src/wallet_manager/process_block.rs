@@ -1,4 +1,4 @@
-use crate::wallet_interface::WalletInterface;
+use crate::wallet_interface::{BlockProcessingResult, WalletInterface};
 use crate::{Network, WalletManager};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -18,8 +18,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         block: &Block,
         height: CoreBlockHeight,
         network: Network,
-    ) -> Vec<Txid> {
-        let mut relevant_txids = Vec::new();
+    ) -> BlockProcessingResult {
+        let mut result = BlockProcessingResult::default();
         let block_hash = Some(block.block_hash());
         let timestamp = block.header.time;
 
@@ -31,15 +31,15 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 timestamp: Some(timestamp),
             };
 
-            let affected_wallets = self
-                .check_transaction_in_all_wallets(
-                    tx, network, context, true, // update state
-                )
+            let check_result = self
+                .check_transaction_in_all_wallets(tx, network, context, true)
                 .await;
 
-            if !affected_wallets.is_empty() {
-                relevant_txids.push(tx.txid());
+            if !check_result.affected_wallets.is_empty() {
+                result.relevant_txids.push(tx.txid());
             }
+
+            result.new_addresses.extend(check_result.new_addresses);
         }
 
         // Update network state height
@@ -47,7 +47,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             state.current_height = height;
         }
 
-        relevant_txids
+        result
     }
 
     async fn process_mempool_transaction(&mut self, tx: &Transaction, network: Network) {

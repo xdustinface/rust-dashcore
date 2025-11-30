@@ -77,7 +77,7 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             let relevant_types = TransactionRouter::get_relevant_account_types(&tx_type);
 
             // Check only relevant account types
-            let result = collection.check_transaction(tx, &relevant_types);
+            let mut result = collection.check_transaction(tx, &relevant_types);
 
             // Update state if requested and transaction is relevant
             if update_state && result.is_relevant {
@@ -261,7 +261,7 @@ impl WalletTransactionChecker for ManagedWalletInfo {
                                 network,
                             );
 
-                            // Maintain gap limit for the address pools
+                            // Maintain gap limit for the address pools and capture new addresses
                             if let Some(xpub) = xpub_opt {
                                 let key_source =
                                     crate::managed_account::address_pool::KeySource::Public(xpub);
@@ -273,13 +273,19 @@ impl WalletTransactionChecker for ManagedWalletInfo {
                                     ..
                                 } = &mut account.account_type {
                                     // Maintain gap limit for external addresses
-                                    let _ = external_addresses.maintain_gap_limit(&key_source);
+                                    if let Ok(new_addrs) = external_addresses.maintain_gap_limit(&key_source) {
+                                        result.new_addresses.extend(new_addrs);
+                                    }
                                     // Maintain gap limit for internal addresses
-                                    let _ = internal_addresses.maintain_gap_limit(&key_source);
+                                    if let Ok(new_addrs) = internal_addresses.maintain_gap_limit(&key_source) {
+                                        result.new_addresses.extend(new_addrs);
+                                    }
                                 } else {
                                     // For other account types, get the single address pool
                                     for pool in account.account_type.address_pools_mut() {
-                                        let _ = pool.maintain_gap_limit(&key_source);
+                                        if let Ok(new_addrs) = pool.maintain_gap_limit(&key_source) {
+                                            result.new_addresses.extend(new_addrs);
+                                        }
                                     }
                                 }
                             }
@@ -395,6 +401,7 @@ impl WalletTransactionChecker for ManagedWalletInfo {
                 total_received: 0,
                 total_sent: 0,
                 total_received_for_credit_conversion: 0,
+                new_addresses: Vec::new(),
             }
         }
     }

@@ -226,15 +226,15 @@ impl<W: WalletInterface + Send + Sync + 'static, S: StorageManager + Send + Sync
 
         // Process block with wallet
         let mut wallet = self.wallet.write().await;
-        let txids = wallet.process_block(&block, height, self.network).await;
+        let result = wallet.process_block(&block, height, self.network).await;
 
         // Update chain height to process any matured coinbase transactions
         wallet.update_chain_height(self.network, height).await;
 
-        if !txids.is_empty() {
+        if !result.relevant_txids.is_empty() {
             tracing::info!(
                 "🎯 Wallet found {} relevant transactions in block {} at height {}",
-                txids.len(),
+                result.relevant_txids.len(),
                 block_hash,
                 height
             );
@@ -246,7 +246,7 @@ impl<W: WalletInterface + Send + Sync + 'static, S: StorageManager + Send + Sync
             }
 
             // Emit TransactionDetected events for each relevant transaction
-            for txid in &txids {
+            for txid in &result.relevant_txids {
                 if let Some(tx) = block.txdata.iter().find(|t| &t.txid() == txid) {
                     // Ask the wallet for the precise effect of this transaction
                     let effect = wallet.transaction_effect(tx, self.network).await;
@@ -279,7 +279,7 @@ impl<W: WalletInterface + Send + Sync + 'static, S: StorageManager + Send + Sync
             height,
             hash: block_hash.to_string(),
             transactions_count: block.txdata.len(),
-            relevant_transactions: txids.len(),
+            relevant_transactions: result.relevant_txids.len(),
         });
 
         // Update chain state if needed
