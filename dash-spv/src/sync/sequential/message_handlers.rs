@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use dashcore::block::Block;
 use dashcore::network::message::NetworkMessage;
-use dashcore::network::message_blockdata::Inventory;
 
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
@@ -622,6 +621,15 @@ impl<
             return Ok(());
         }
 
+        // Store filter for potential re-scanning if new addresses are generated
+        if let SyncPhase::DownloadingTransactions {
+            stored_filters,
+            ..
+        } = &mut self.current_phase
+        {
+            stored_filters.insert(cfilter.block_hash, cfilter.filter.clone());
+        }
+
         let matches = self
             .filter_sync
             .check_filter_for_matches(
@@ -642,12 +650,25 @@ impl<
             }
 
             tracing::info!("🎯 Filter match found! Requesting block {}", cfilter.block_hash);
-            // Request the full block
-            let inv = Inventory::Block(cfilter.block_hash);
-            network
-                .send_message(NetworkMessage::GetData(vec![inv]))
-                .await
-                .map_err(|e| SyncError::Network(format!("Failed to request block: {}", e)))?;
+
+            // Track the block request in phase state
+            if let SyncPhase::DownloadingTransactions {
+                pending_blocks,
+                downloading_blocks,
+                ..
+            } = &mut self.current_phase
+            {
+                pending_blocks.push((cfilter.block_hash, height));
+                downloading_blocks.insert(cfilter.block_hash, Instant::now());
+            }
+
+            // Request the full block via FilterSync for consistent tracking
+            let filter_match = crate::types::FilterMatch {
+                block_hash: cfilter.block_hash,
+                height,
+                block_requested: false,
+            };
+            self.filter_sync.request_block_download(filter_match, network).await?;
         }
 
         // Handle filter message tracking
@@ -673,16 +694,16 @@ impl<
             tracing::trace!("No more pending filter requests in queue");
         }
 
-        // Update phase state and check for completion
-        let should_transition_complete;
-        let should_transition_empty;
+        // Update phase state and check for batch completion
+        // Note: We don't transition phases here - batch completion is handled in handle_block_message
+        // when all blocks are downloaded. If no blocks match, we check completion below.
 
         if let SyncPhase::DownloadingTransactions {
             completed_filter_heights,
             batches_processed,
             total_filters,
-            pending_blocks,
-            downloading_blocks,
+            current_batch,
+            total_batches,
             last_progress,
             ..
         } = &mut self.current_phase
@@ -696,7 +717,9 @@ impl<
                     || completed_filter_heights.len() == *total_filters as usize
                 {
                     tracing::info!(
-                        "📊 Transaction download progress: {}/{} filters received",
+                        "📊 Batch {}/{} progress: {}/{} filters received",
+                        *current_batch + 1,
+                        *total_batches,
                         completed_filter_heights.len(),
                         total_filters
                     );
@@ -705,42 +728,49 @@ impl<
 
             *batches_processed += 1;
             *last_progress = Instant::now();
+        }
 
-            // Check if all filters and blocks are downloaded
+        // Check if batch is complete (all filters received, no pending blocks)
+        // This handles the case where no filters matched (no blocks to download)
+        let batch_complete = if let SyncPhase::DownloadingTransactions {
+            completed_filter_heights,
+            total_filters,
+            pending_blocks,
+            downloading_blocks,
+            new_addresses,
+            batch_end,
+            tip_height,
+            ..
+        } = &self.current_phase
+        {
             let has_pending_requests = self.filter_sync.pending_download_count() > 0
                 || self.filter_sync.active_request_count() > 0;
-
             let all_filters_received =
                 *total_filters > 0 && completed_filter_heights.len() >= *total_filters as usize;
             let all_blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
 
-            should_transition_complete =
-                all_filters_received && all_blocks_complete && !has_pending_requests;
-            should_transition_empty =
-                *total_filters == 0 && all_blocks_complete && !has_pending_requests;
-
-            if !should_transition_complete && !should_transition_empty {
-                tracing::trace!(
-                    "Transaction sync progress: {}/{} filters, {} blocks pending, {} active requests",
-                    completed_filter_heights.len(),
-                    total_filters,
-                    pending_blocks.len(),
-                    self.filter_sync.active_request_count()
-                );
+            if all_filters_received && all_blocks_complete && !has_pending_requests {
+                Some((!new_addresses.is_empty(), *batch_end >= *tip_height))
+            } else {
+                None
             }
         } else {
-            should_transition_complete = false;
-            should_transition_empty = false;
-        }
+            None
+        };
 
-        // Handle transitions outside the borrow
-        if should_transition_complete {
-            tracing::info!("All filters received and processed");
-            self.transition_to_next_phase(storage, network, "All transactions downloaded")
-                .await?;
-        } else if should_transition_empty {
-            self.transition_to_next_phase(storage, network, "No transactions to download")
-                .await?;
+        // Handle batch completion outside the borrow
+        if let Some((needs_rescan, is_final_batch)) = batch_complete {
+            if needs_rescan {
+                tracing::info!("Batch complete with new addresses, re-scanning filters");
+                self.rescan_current_batch(network, storage).await?;
+            } else if is_final_batch {
+                tracing::info!("All batches complete");
+                self.transition_to_next_phase(storage, network, "All batches complete")
+                    .await?;
+            } else {
+                tracing::info!("Batch complete, advancing to next batch");
+                self.advance_to_next_batch(network, storage).await?;
+            }
         }
 
         Ok(())
@@ -783,17 +813,38 @@ impl<
             }
         }
 
-        // Handle block download and check if we need to transition
+        // Accumulate new addresses generated during gap limit maintenance
+        if !result.new_addresses.is_empty() {
+            tracing::info!(
+                "🔄 {} new addresses generated during block processing at height {}",
+                result.new_addresses.len(),
+                block_height,
+            );
+            if let SyncPhase::DownloadingTransactions {
+                new_addresses,
+                ..
+            } = &mut self.current_phase
+            {
+                new_addresses.extend(result.new_addresses.clone());
+            }
+        }
+
+        // Also notify filter_sync that the block was downloaded
+        // (this clears FilterSync's internal tracking which is checked for batch completion)
+        let _ = self.filter_sync.handle_downloaded_block(&block).await;
+
+        // Handle block download and check if batch is complete
         if let SyncPhase::DownloadingTransactions {
+            pending_blocks,
             downloading_blocks,
             completed_blocks,
-            completed_filter_heights,
-            total_filters,
-            pending_blocks,
             last_progress,
             ..
         } = &mut self.current_phase
         {
+            // Remove from pending_blocks
+            pending_blocks.retain(|(hash, _)| *hash != block_hash);
+
             // Remove from downloading
             downloading_blocks.remove(&block_hash);
 
@@ -802,18 +853,47 @@ impl<
 
             // Update progress time
             *last_progress = Instant::now();
+        }
 
-            // Check if all filters and blocks are downloaded
+        // Check if batch is complete (all filters and blocks done)
+        let batch_complete = if let SyncPhase::DownloadingTransactions {
+            completed_filter_heights,
+            total_filters,
+            pending_blocks,
+            downloading_blocks,
+            new_addresses,
+            batch_end,
+            tip_height,
+            ..
+        } = &self.current_phase
+        {
             let has_pending_requests = self.filter_sync.pending_download_count() > 0
                 || self.filter_sync.active_request_count() > 0;
-
             let all_filters_received =
                 *total_filters > 0 && completed_filter_heights.len() >= *total_filters as usize;
             let all_blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
 
             if all_filters_received && all_blocks_complete && !has_pending_requests {
-                self.transition_to_next_phase(storage, network, "All transactions downloaded")
+                Some((!new_addresses.is_empty(), *batch_end >= *tip_height))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Handle batch completion outside the borrow
+        if let Some((needs_rescan, is_final_batch)) = batch_complete {
+            if needs_rescan {
+                tracing::info!("Batch complete with new addresses, re-scanning filters");
+                self.rescan_current_batch(network, storage).await?;
+            } else if is_final_batch {
+                tracing::info!("All batches complete");
+                self.transition_to_next_phase(storage, network, "All batches complete")
                     .await?;
+            } else {
+                tracing::info!("Batch complete, advancing to next batch");
+                self.advance_to_next_batch(network, storage).await?;
             }
         }
 

@@ -91,6 +91,7 @@ mod tests {
         }
 
         async fn update_chain_height(&mut self, _network: Network, _height: u32) {}
+
     }
 
     fn create_test_block(network: Network) -> Block {
@@ -301,6 +302,7 @@ mod tests {
                 // Always return false - filter doesn't match
                 false
             }
+
 
             async fn describe(&self, _network: Network) -> String {
                 "NonMatchingWallet (test implementation)".to_string()

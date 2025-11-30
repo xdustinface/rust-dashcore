@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::bip158::BlockFilter;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Block, BlockHash, Transaction, Txid};
+use dashcore::{Block, BlockHash, Transaction};
 use key_wallet::transaction_checking::transaction_router::TransactionRouter;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
@@ -123,6 +123,33 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         self.filter_matches.entry(network).or_default().insert(*block_hash, hit);
 
         hit
+    }
+
+    async fn check_filter_against_addresses(
+        &self,
+        filter: &BlockFilter,
+        block_hash: &BlockHash,
+        addresses: &[dashcore::Address],
+        _network: Network,
+    ) -> bool {
+        if addresses.is_empty() {
+            return false;
+        }
+
+        // Convert addresses to scripts for matching
+        let mut script_bytes: Vec<Vec<u8>> = Vec::with_capacity(addresses.len());
+        for addr in addresses {
+            script_bytes.push(addr.script_pubkey().as_bytes().to_vec());
+        }
+
+        if script_bytes.is_empty() {
+            return false;
+        }
+
+        // Check if filter matches any of the addresses
+        filter
+            .match_any(block_hash, &mut script_bytes.iter().map(|s| s.as_slice()))
+            .unwrap_or(false)
     }
 
     async fn transaction_effect(

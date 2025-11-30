@@ -2,9 +2,12 @@
 
 use std::time::Instant;
 
+use dashcore::BlockHash;
+
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
+use crate::sync::filters::types::TRANSACTION_SYNC_BATCH_SIZE;
 use key_wallet_manager::wallet_interface::WalletInterface;
 
 use super::manager::SequentialSyncManager;
@@ -131,50 +134,54 @@ impl<
             }
 
             SyncPhase::DownloadingTransactions {
+                batch_start,
+                batch_end,
+                current_batch,
+                total_batches,
+                scan_pass,
                 ..
             } => {
-                tracing::info!("📥 Starting transaction download phase");
+                let batch_start = *batch_start;
+                let batch_end = *batch_end;
+                let current_batch = *current_batch;
+                let total_batches = *total_batches;
+                let scan_pass = *scan_pass;
 
-                // Get the range of filters to download
-                // Note: get_filter_tip_height() now returns absolute blockchain height
-                let filter_header_tip = storage
-                    .get_filter_tip_height()
-                    .await
-                    .map_err(|e| SyncError::Storage(format!("Failed to get filter tip: {}", e)))?
-                    .unwrap_or(0);
-
-                if filter_header_tip > 0 {
-                    // Download all filters for complete blockchain history
-                    // This ensures the wallet can find transactions from any point in history
-                    let start_height = self.header_sync.get_sync_base_height().max(1);
-                    let count = filter_header_tip - start_height + 1;
-
+                if scan_pass > 0 {
                     tracing::info!(
-                        "Starting filter download from height {} to {} ({} filters)",
-                        start_height,
-                        filter_header_tip,
-                        count
+                        "📥 Re-scanning batch {}/{} (pass {}): heights {} to {}",
+                        current_batch + 1,
+                        total_batches,
+                        scan_pass + 1,
+                        batch_start,
+                        batch_end
                     );
-
-                    // Update the phase to track the expected total
-                    if let SyncPhase::DownloadingTransactions {
-                        total_filters,
-                        ..
-                    } = &mut self.current_phase
-                    {
-                        *total_filters = count;
-                    }
-
-                    // Use the filter sync manager to download filters
-                    // Blocks will be requested automatically when filters match
-                    self.filter_sync
-                        .sync_filters(network, storage, Some(start_height), Some(count))
-                        .await?;
                 } else {
-                    // No filter headers available, skip to next phase
-                    self.transition_to_next_phase(storage, network, "No filter headers available")
-                        .await?;
+                    tracing::info!(
+                        "📥 Starting batch {}/{}: heights {} to {}",
+                        current_batch + 1,
+                        total_batches,
+                        batch_start,
+                        batch_end
+                    );
                 }
+
+                let count = batch_end - batch_start + 1;
+
+                // Update the phase to track the expected total for this batch
+                if let SyncPhase::DownloadingTransactions {
+                    total_filters,
+                    ..
+                } = &mut self.current_phase
+                {
+                    *total_filters = count;
+                }
+
+                // Use the filter sync manager to download filters for this batch only
+                // Blocks will be requested automatically when filters match
+                self.filter_sync
+                    .sync_filters(network, storage, Some(batch_start), Some(count))
+                    .await?;
             }
 
             _ => {
@@ -462,6 +469,193 @@ impl<
             }
         }
 
+        Ok(())
+    }
+
+    /// Re-scan the current batch after new addresses were generated
+    /// This checks ALL filters against only the newly generated addresses
+    pub(super) async fn rescan_current_batch(
+        &mut self,
+        network: &mut N,
+        storage: &mut S,
+    ) -> SyncResult<()> {
+        // Collect the stored filters and new addresses to avoid borrow issues
+        let (filters_to_check, addresses_to_check): (Vec<(BlockHash, Vec<u8>)>, Vec<dashcore::Address>) =
+            if let SyncPhase::DownloadingTransactions {
+                stored_filters,
+                new_addresses,
+                ..
+            } = &self.current_phase
+            {
+                (
+                    stored_filters.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    new_addresses.clone(),
+                )
+            } else {
+                return Ok(());
+            };
+
+        if addresses_to_check.is_empty() {
+            tracing::info!("🔄 Rescan: No new addresses to check, advancing to next batch");
+            self.advance_to_next_batch(network, storage).await?;
+            return Ok(());
+        }
+
+        // Update phase state - clear the new_addresses and increment scan_pass
+        if let SyncPhase::DownloadingTransactions {
+            new_addresses,
+            scan_pass,
+            last_progress,
+            ..
+        } = &mut self.current_phase
+        {
+            tracing::info!(
+                "🔄 Re-scanning batch (pass {}): checking {} filters against {} new addresses",
+                *scan_pass + 1,
+                filters_to_check.len(),
+                addresses_to_check.len()
+            );
+
+            new_addresses.clear();
+            *scan_pass += 1;
+            *last_progress = Instant::now();
+        }
+
+        // Check ALL filters against only the new addresses
+        let mut matches_to_request = Vec::new();
+        for (block_hash, filter_data) in filters_to_check {
+            // Get height for this block
+            let height = storage
+                .get_header_height_by_hash(&block_hash)
+                .await
+                .map_err(|e| SyncError::Storage(format!("Failed to get block height: {}", e)))?
+                .unwrap_or(0);
+
+            // Reconstruct the BlockFilter and check against new addresses only
+            let filter = dashcore::bip158::BlockFilter::new(&filter_data);
+
+            // Check if filter matches any of the new addresses
+            let wallet = self.wallet.read().await;
+            let matches = wallet
+                .check_filter_against_addresses(&filter, &block_hash, &addresses_to_check, self.config.network)
+                .await;
+            drop(wallet);
+
+            // Queue block if it matches the new addresses
+            if matches {
+                tracing::info!(
+                    "🔄 Rescan: New match at height {} (block {})",
+                    height,
+                    block_hash
+                );
+
+                if let SyncPhase::DownloadingTransactions {
+                    pending_blocks,
+                    downloading_blocks,
+                    last_progress,
+                    ..
+                } = &mut self.current_phase
+                {
+                    pending_blocks.push((block_hash, height));
+                    downloading_blocks.insert(block_hash, Instant::now());
+                    *last_progress = Instant::now();
+                }
+
+                matches_to_request.push(crate::types::FilterMatch {
+                    block_hash,
+                    height,
+                    block_requested: false,
+                });
+            }
+        }
+
+        // Request all newly matched blocks
+        if !matches_to_request.is_empty() {
+            tracing::info!(
+                "🔄 Rescan found {} new matches, requesting blocks",
+                matches_to_request.len()
+            );
+            self.filter_sync
+                .process_filter_matches_and_download(matches_to_request, network)
+                .await?;
+        } else {
+            tracing::info!("🔄 Rescan found no new matches, batch complete");
+            // No new matches - advance to next batch
+            self.advance_to_next_batch(network, storage).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Advance to the next batch after completing the current one
+    pub(super) async fn advance_to_next_batch(
+        &mut self,
+        network: &mut N,
+        storage: &mut S,
+    ) -> SyncResult<()> {
+        if let SyncPhase::DownloadingTransactions {
+            batch_start,
+            batch_end,
+            tip_height,
+            current_batch,
+            total_batches,
+            stored_filters,
+            completed_filter_heights,
+            pending_blocks,
+            downloading_blocks,
+            completed_blocks,
+            total_blocks,
+            new_addresses,
+            scan_pass,
+            last_progress,
+            ..
+        } = &mut self.current_phase
+        {
+            let old_batch_end = *batch_end;
+            let tip = *tip_height;
+
+            // Check if this was the final batch
+            if old_batch_end >= tip {
+                tracing::info!("All batches complete, transitioning to FullySynced");
+                self.transition_to_next_phase(storage, network, "All batches complete")
+                    .await?;
+                return Ok(());
+            }
+
+            // Clear stored filters to free memory
+            stored_filters.clear();
+
+            // Advance batch counters
+            *current_batch += 1;
+            let new_start = old_batch_end + 1;
+            let new_end = (new_start + TRANSACTION_SYNC_BATCH_SIZE - 1).min(tip);
+
+            *batch_start = new_start;
+            *batch_end = new_end;
+
+            // Reset batch state
+            completed_filter_heights.clear();
+            pending_blocks.clear();
+            downloading_blocks.clear();
+            completed_blocks.clear();
+            *total_blocks = 0;
+            new_addresses.clear();
+            *scan_pass = 0;
+            *last_progress = Instant::now();
+
+            tracing::info!(
+                "Starting batch {}/{}: heights {} to {}",
+                *current_batch + 1,
+                *total_batches,
+                new_start,
+                new_end
+            );
+
+            // Reset filter sync state and execute the new batch
+            self.filter_sync.reset();
+            self.filter_sync.set_syncing_filters(false);
+            self.execute_current_phase(network, storage).await?;
+        }
         Ok(())
     }
 

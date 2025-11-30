@@ -94,14 +94,24 @@ impl<
                 target: *target_height,
             },
             SyncPhase::DownloadingTransactions {
+                batch_start,
+                batch_end,
+                current_batch,
+                total_batches,
                 completed_filter_heights,
                 total_filters,
                 pending_blocks,
+                scan_pass,
                 ..
             } => SyncStage::DownloadingTransactions {
+                current_batch: *current_batch + 1, // 1-indexed for display
+                total_batches: *total_batches,
+                batch_start: *batch_start,
+                batch_end: *batch_end,
                 filters_completed: completed_filter_heights.len() as u32,
                 filters_total: *total_filters,
                 blocks_pending: pending_blocks.len(),
+                is_rescan: *scan_pass > 0,
             },
             SyncPhase::FullySynced {
                 ..

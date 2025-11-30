@@ -52,6 +52,17 @@ pub trait WalletInterface: Send + Sync {
         network: Network,
     ) -> bool;
 
+    /// Check if a compact filter matches any of the specified addresses.
+    /// Used during rescan to check filters against only newly generated addresses.
+    /// Returns true if the filter matches any of the provided addresses.
+    async fn check_filter_against_addresses(
+        &self,
+        filter: &BlockFilter,
+        block_hash: &dashcore::BlockHash,
+        addresses: &[Address],
+        network: Network,
+    ) -> bool;
+
     /// Return the wallet's per-transaction net change and involved addresses if known.
     /// Returns (net_amount, addresses) where net_amount is received - sent in satoshis.
     /// If the wallet has no record for the transaction, returns None.

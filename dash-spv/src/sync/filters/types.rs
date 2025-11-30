@@ -34,6 +34,11 @@ pub const FILTER_RETRY_DELAY_MS: u64 = 100;
 /// Timeout for individual filter requests (seconds).
 pub const REQUEST_TIMEOUT_SECONDS: u64 = 30;
 
+/// Size of each transaction sync batch for batched sync with address re-scanning.
+/// Filters are downloaded in batches, processed, and if new addresses are generated
+/// during block processing, the batch is re-scanned before advancing to the next.
+pub const TRANSACTION_SYNC_BATCH_SIZE: u32 = 5_000;
+
 // ============================================================================
 // Type Aliases
 // ============================================================================

@@ -70,27 +70,43 @@ pub enum SyncPhase {
     },
 
     /// Phase 4: Downloading transactions (filters and blocks)
+    /// Uses batched sync with address re-scanning for HD wallet gap limit maintenance
     DownloadingTransactions {
         /// When this phase started
         start_time: Instant,
-        /// Filter ranges that have been requested: (start, end) -> request time
-        requested_ranges: HashMap<(u32, u32), Instant>,
-        /// Heights for which filters have been downloaded
+        /// Batch tracking: start height of current batch
+        batch_start: u32,
+        /// Batch tracking: end height of current batch
+        batch_end: u32,
+        /// Tip height (target for all batches)
+        tip_height: u32,
+        /// Current batch number (0-indexed)
+        current_batch: u32,
+        /// Total number of batches
+        total_batches: u32,
+        /// Filter storage for re-scanning: block_hash -> filter data
+        stored_filters: HashMap<BlockHash, Vec<u8>>,
+        /// Heights for which filters have been downloaded in current batch
         completed_filter_heights: HashSet<u32>,
-        /// Total number of filters to download
+        /// Total number of filters in current batch
         total_filters: u32,
         /// Blocks pending download: (hash, height)
         pending_blocks: Vec<(BlockHash, u32)>,
         /// Currently downloading blocks: hash -> request time
         downloading_blocks: HashMap<BlockHash, Instant>,
-        /// Successfully downloaded blocks
+        /// Successfully downloaded blocks in current batch
         completed_blocks: Vec<BlockHash>,
-        /// Total blocks to download
+        /// Total blocks downloaded across all batches
         total_blocks: usize,
         /// Last time we made progress
         last_progress: Instant,
-        /// Number of filter batches processed
+        /// Number of filter batches processed (across all batches)
         batches_processed: u32,
+        /// New addresses generated during this batch's block processing
+        /// Used for re-scanning filters against only these addresses
+        new_addresses: Vec<dashcore::Address>,
+        /// Current scan pass within the batch (0 = first scan)
+        scan_pass: u32,
     },
 
     /// Fully synchronized with the network
@@ -329,40 +345,63 @@ impl SyncPhase {
                 completed_filter_heights,
                 total_filters,
                 completed_blocks,
-                total_blocks,
+                current_batch,
+                total_batches,
+                batch_start,
+                tip_height,
                 start_time,
+                scan_pass,
                 ..
             } => {
-                // Progress is primarily based on filters (the main work)
+                // Progress considers batches and filters within each batch
                 let filters_completed = completed_filter_heights.len() as u32;
                 let blocks_completed = completed_blocks.len() as u32;
 
-                // Total items = filters + blocks
-                let items_completed = filters_completed + blocks_completed;
-                let items_total = *total_filters + *total_blocks as u32;
-
-                let percentage = if items_total > 0 {
-                    (items_completed as f64 / items_total as f64) * 100.0
+                // Calculate overall progress across all batches
+                // Each batch represents equal work, so batch progress is key
+                let batch_progress = if *total_batches > 0 {
+                    let completed_batches = *current_batch as f64;
+                    let current_batch_progress = if *total_filters > 0 {
+                        filters_completed as f64 / *total_filters as f64
+                    } else {
+                        0.0
+                    };
+                    (completed_batches + current_batch_progress) / *total_batches as f64
                 } else {
                     0.0
                 };
 
+                let percentage = batch_progress * 100.0;
+
+                // Items completed in current batch
+                let items_completed = filters_completed + blocks_completed;
+                let items_total = *total_filters + blocks_completed; // blocks_completed as estimate
+
                 let elapsed = start_time.elapsed();
                 let rate = if elapsed.as_secs() > 0 {
-                    items_completed as f64 / elapsed.as_secs_f64()
+                    // Rate based on heights processed
+                    let heights_processed = batch_start.saturating_sub(1) + filters_completed;
+                    heights_processed as f64 / elapsed.as_secs_f64()
                 } else {
                     0.0
                 };
 
                 let eta = if rate > 0.0 {
-                    let remaining = items_total.saturating_sub(items_completed);
-                    Some(Duration::from_secs_f64(remaining as f64 / rate))
+                    let remaining_heights = tip_height.saturating_sub(*batch_start + filters_completed);
+                    Some(Duration::from_secs_f64(remaining_heights as f64 / rate))
                 } else {
                     None
                 };
 
+                // Include scan pass in phase name if re-scanning
+                let phase_name = if *scan_pass > 0 {
+                    "Downloading Transactions (rescan)"
+                } else {
+                    self.name()
+                };
+
                 PhaseProgress {
-                    phase_name: self.name(),
+                    phase_name,
                     items_completed,
                     items_total: Some(items_total),
                     percentage,

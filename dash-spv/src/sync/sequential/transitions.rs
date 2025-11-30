@@ -4,6 +4,7 @@ use crate::client::ClientConfig;
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
+use crate::sync::filters::types::TRANSACTION_SYNC_BATCH_SIZE;
 use dashcore::network::constants::ServiceFlags;
 
 use super::phases::{PhaseTransition, SyncPhase};
@@ -220,19 +221,8 @@ impl TransitionManager {
                     // Skip directly to fully synced since we can't download filters
                     self.create_fully_synced_phase(storage).await
                 } else {
-                    // After CFHeaders, start the combined transactions phase
-                    Ok(Some(SyncPhase::DownloadingTransactions {
-                        start_time: Instant::now(),
-                        requested_ranges: std::collections::HashMap::new(),
-                        completed_filter_heights: std::collections::HashSet::new(),
-                        total_filters: 0, // Will be determined based on watch items
-                        pending_blocks: Vec::new(),
-                        downloading_blocks: std::collections::HashMap::new(),
-                        completed_blocks: Vec::new(),
-                        total_blocks: 0,
-                        last_progress: Instant::now(),
-                        batches_processed: 0,
-                    }))
+                    // After CFHeaders, start the combined transactions phase with batching
+                    self.create_transactions_phase(storage).await
                 }
             }
 
@@ -335,13 +325,22 @@ impl TransitionManager {
             total_filters,
             pending_blocks,
             downloading_blocks,
+            batch_end,
+            tip_height,
+            new_addresses,
             ..
         } = phase
         {
-            // All filters downloaded and all blocks downloaded
+            // All filters in current batch downloaded
             let filters_complete = completed_filter_heights.len() as u32 >= *total_filters;
+            // All blocks downloaded
             let blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
-            filters_complete && blocks_complete
+            // No re-scan needed (no new addresses to check)
+            let no_rescan = new_addresses.is_empty();
+            // This is the final batch
+            let is_final_batch = *batch_end >= *tip_height;
+
+            filters_complete && blocks_complete && no_rescan && is_final_batch
         } else {
             false
         }
@@ -371,6 +370,63 @@ impl TransitionManager {
             last_progress: Instant::now(),
             filter_headers_downloaded: 0,
             filter_headers_per_second: 0.0,
+        }))
+    }
+
+    async fn create_transactions_phase(
+        &self,
+        storage: &dyn StorageManager,
+    ) -> SyncResult<Option<SyncPhase>> {
+        // Get the filter header tip which defines our sync range
+        let tip_height = storage
+            .get_filter_tip_height()
+            .await
+            .map_err(|e| SyncError::Storage(format!("Failed to get filter tip: {}", e)))?
+            .unwrap_or(0);
+
+        if tip_height == 0 {
+            // No filters to download, skip to fully synced
+            return self.create_fully_synced_phase(storage).await;
+        }
+
+        // Calculate batch parameters
+        // Start from height 1 (skip genesis block which has no transactions)
+        let batch_start = 1u32;
+        let batch_end = batch_start
+            .saturating_add(TRANSACTION_SYNC_BATCH_SIZE)
+            .saturating_sub(1)
+            .min(tip_height);
+        let total_batches = ((tip_height - batch_start + 1) as f64
+            / TRANSACTION_SYNC_BATCH_SIZE as f64)
+            .ceil() as u32;
+        let total_filters = batch_end - batch_start + 1;
+
+        tracing::info!(
+            "Starting batched transaction sync: {} batches, first batch heights {} to {} ({} filters)",
+            total_batches,
+            batch_start,
+            batch_end,
+            total_filters
+        );
+
+        Ok(Some(SyncPhase::DownloadingTransactions {
+            start_time: Instant::now(),
+            batch_start,
+            batch_end,
+            tip_height,
+            current_batch: 0,
+            total_batches,
+            stored_filters: std::collections::HashMap::new(),
+            completed_filter_heights: std::collections::HashSet::new(),
+            total_filters,
+            pending_blocks: Vec::new(),
+            downloading_blocks: std::collections::HashMap::new(),
+            completed_blocks: Vec::new(),
+            total_blocks: 0,
+            last_progress: Instant::now(),
+            batches_processed: 0,
+            new_addresses: Vec::new(),
+            scan_pass: 0,
         }))
     }
 

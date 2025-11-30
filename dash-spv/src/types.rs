@@ -200,9 +200,22 @@ pub enum SyncStage {
         target: u32,
     },
     DownloadingTransactions {
+        /// Current batch number (1-indexed for display)
+        current_batch: u32,
+        /// Total number of batches
+        total_batches: u32,
+        /// Start height of current batch
+        batch_start: u32,
+        /// End height of current batch
+        batch_end: u32,
+        /// Filters completed in current batch
         filters_completed: u32,
+        /// Total filters in current batch
         filters_total: u32,
+        /// Blocks pending download
         blocks_pending: usize,
+        /// Whether currently re-scanning the batch
+        is_rescan: bool,
     },
     Complete,
     Failed(String),
