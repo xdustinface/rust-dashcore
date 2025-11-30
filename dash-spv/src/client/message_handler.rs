@@ -106,21 +106,21 @@ impl<
                         SpvError::Sync(e)
                     });
             }
-            NetworkMessage::CFHeaders(ref cf_headers) => {
+            NetworkMessage::CFHeaders(ref filter_headers) => {
                 // Try to include the peer address for better diagnostics
                 let peer_addr = self.network.get_last_message_peer_addr().await;
                 match peer_addr {
                     Some(addr) => {
                         tracing::info!(
                             "📨 Client received CFHeaders message with {} filter headers from {}",
-                            cf_headers.filter_hashes.len(),
+                            filter_headers.filter_hashes.len(),
                             addr
                         );
                     }
                     None => {
                         tracing::info!(
                             "📨 Client received CFHeaders message with {} filter headers (peer unknown)",
-                            cf_headers.filter_hashes.len()
+                            filter_headers.filter_hashes.len()
                         );
                     }
                 }
@@ -495,21 +495,22 @@ impl<
     /// Process received filter headers.
     pub async fn process_filter_headers(
         &mut self,
-        cfheaders: dashcore::network::message_filter::CFHeaders,
+        filter_headers: dashcore::network::message_filter::CFHeaders,
     ) -> Result<()> {
-        tracing::debug!("Processing filter headers for block {}", cfheaders.stop_hash);
+        tracing::debug!("Processing filter headers for block {}", filter_headers.stop_hash);
 
         tracing::info!(
             "✅ Received filter headers for block {} (type: {}, count: {})",
-            cfheaders.stop_hash,
-            cfheaders.filter_type,
-            cfheaders.filter_hashes.len()
+            filter_headers.stop_hash,
+            filter_headers.filter_type,
+            filter_headers.filter_hashes.len()
         );
 
         // For sequential sync, route through the message handler
-        let cfheaders_msg = dashcore::network::message::NetworkMessage::CFHeaders(cfheaders);
+        let filter_headers_msg =
+            dashcore::network::message::NetworkMessage::CFHeaders(filter_headers);
         self.sync_manager
-            .handle_message(cfheaders_msg, &mut *self.network, &mut *self.storage)
+            .handle_message(filter_headers_msg, &mut *self.network, &mut *self.storage)
             .await
             .map_err(SpvError::Sync)?;
 

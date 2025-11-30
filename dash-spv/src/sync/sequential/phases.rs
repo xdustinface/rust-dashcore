@@ -64,9 +64,9 @@ pub enum SyncPhase {
         /// Last time we made progress
         last_progress: Instant,
         /// Filter headers downloaded in this phase
-        cfheaders_downloaded: u32,
+        filter_headers_downloaded: u32,
         /// Average filter headers per second
-        cfheaders_per_second: f64,
+        filter_headers_per_second: f64,
     },
 
     /// Phase 4: Downloading compact filters
@@ -314,7 +314,7 @@ impl SyncPhase {
                 start_height,
                 current_height,
                 target_height,
-                cfheaders_per_second,
+                filter_headers_per_second,
                 start_time,
                 ..
             } => {
@@ -326,9 +326,9 @@ impl SyncPhase {
                     100.0
                 };
 
-                let eta = if *cfheaders_per_second > 0.0 {
+                let eta = if *filter_headers_per_second > 0.0 {
                     let remaining = items_total.saturating_sub(items_completed);
-                    Some(Duration::from_secs_f64(remaining as f64 / cfheaders_per_second))
+                    Some(Duration::from_secs_f64(remaining as f64 / filter_headers_per_second))
                 } else {
                     None
                 };
@@ -338,7 +338,7 @@ impl SyncPhase {
                     items_completed,
                     items_total: Some(items_total),
                     percentage,
-                    rate: *cfheaders_per_second,
+                    rate: *filter_headers_per_second,
                     eta,
                     elapsed: start_time.elapsed(),
                 }

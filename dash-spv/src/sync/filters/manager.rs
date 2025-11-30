@@ -69,21 +69,21 @@ pub struct FilterSyncManager<S: StorageManager, N: NetworkManager> {
     /// Currently active filter requests (limited by MAX_CONCURRENT_FILTER_REQUESTS)
     pub(super) active_filter_requests: HashMap<(u32, u32), ActiveRequest>,
     /// Queue of pending CFHeaders requests
-    pub(super) pending_cfheader_requests: VecDeque<CFHeaderRequest>,
+    pub(super) pending_filter_header_requests: VecDeque<CFHeaderRequest>,
     /// Currently active CFHeaders requests: (start_height, stop_height) -> ActiveCFHeaderRequest
-    pub(super) active_cfheader_requests: HashMap<u32, ActiveCFHeaderRequest>,
+    pub(super) active_filter_header_requests: HashMap<u32, ActiveCFHeaderRequest>,
     /// Retry counts per CFHeaders range: start_height -> retry_count
-    pub(super) cfheader_retry_counts: HashMap<u32, u32>,
+    pub(super) filter_header_retry_counts: HashMap<u32, u32>,
     /// Maximum retries for CFHeaders
-    pub(super) max_cfheader_retries: u32,
+    pub(super) max_filter_header_retries: u32,
     /// Received CFHeaders batches waiting for sequential processing: start_height -> batch
-    pub(super) received_cfheader_batches: HashMap<u32, ReceivedCFHeaderBatch>,
+    pub(super) received_filter_header_batches: HashMap<u32, ReceivedCFHeaderBatch>,
     /// Next expected height for sequential processing
-    pub(super) next_cfheader_height_to_process: u32,
+    pub(super) next_filter_header_height_to_process: u32,
     /// Maximum concurrent CFHeaders requests
-    pub(super) max_concurrent_cfheader_requests: usize,
+    pub(super) max_concurrent_filter_header_requests: usize,
     /// Timeout for CFHeaders requests
-    pub(super) cfheader_request_timeout: std::time::Duration,
+    pub(super) filter_header_request_timeout: std::time::Duration,
 }
 
 impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync + 'static>
@@ -109,15 +109,16 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             pending_filter_requests: VecDeque::new(),
             active_filter_requests: HashMap::new(),
             // CFHeaders fields
-            pending_cfheader_requests: VecDeque::new(),
-            active_cfheader_requests: HashMap::new(),
-            cfheader_retry_counts: HashMap::new(),
-            max_cfheader_retries: config.max_cfheaders_retries,
-            received_cfheader_batches: HashMap::new(),
-            next_cfheader_height_to_process: 0,
-            max_concurrent_cfheader_requests: config.max_concurrent_cfheaders_requests_parallel,
-            cfheader_request_timeout: std::time::Duration::from_secs(
-                config.cfheaders_request_timeout_secs,
+            pending_filter_header_requests: VecDeque::new(),
+            active_filter_header_requests: HashMap::new(),
+            filter_header_retry_counts: HashMap::new(),
+            max_filter_header_retries: config.max_filter_headers_retries,
+            received_filter_header_batches: HashMap::new(),
+            next_filter_header_height_to_process: 0,
+            max_concurrent_filter_header_requests: config
+                .max_concurrent_filter_headers_requests_parallel,
+            filter_header_request_timeout: std::time::Duration::from_secs(
+                config.filter_headers_request_timeout_secs,
             ),
             _phantom_s: std::marker::PhantomData,
             _phantom_n: std::marker::PhantomData,
@@ -166,30 +167,30 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Handle a CFHeaders message during filter header synchronization.
     pub async fn process_filter_headers(
         &self,
-        cf_headers: &CFHeaders,
+        filter_headers: &CFHeaders,
         start_height: u32,
         storage: &S,
     ) -> SyncResult<Vec<FilterHeader>> {
-        if cf_headers.filter_hashes.is_empty() {
+        if filter_headers.filter_hashes.is_empty() {
             return Ok(Vec::new());
         }
 
         tracing::debug!(
             "Processing {} filter headers starting from height {}",
-            cf_headers.filter_hashes.len(),
+            filter_headers.filter_hashes.len(),
             start_height
         );
 
         // Verify filter header chain
-        if !self.verify_filter_header_chain(cf_headers, start_height, storage).await? {
+        if !self.verify_filter_header_chain(filter_headers, start_height, storage).await? {
             return Err(SyncError::Validation(
                 "Filter header chain verification failed".to_string(),
             ));
         }
 
         // Convert filter hashes to filter headers
-        let mut new_filter_headers = Vec::with_capacity(cf_headers.filter_hashes.len());
-        let mut prev_header = cf_headers.previous_filter_header;
+        let mut new_filter_headers = Vec::with_capacity(filter_headers.filter_hashes.len());
+        let mut prev_header = filter_headers.previous_filter_header;
 
         // For the first batch starting at height 1, we need to store the genesis filter header (height 0)
         if start_height == 1 {
@@ -199,7 +200,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             // Note: We'll handle this in the calling function since we need mutable storage access
         }
 
-        for (i, filter_hash) in cf_headers.filter_hashes.iter().enumerate() {
+        for (i, filter_hash) in filter_headers.filter_hashes.iter().enumerate() {
             // According to BIP157: filter_header = double_sha256(filter_hash || prev_filter_header)
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(filter_hash.as_byte_array());
@@ -208,7 +209,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             let filter_header =
                 FilterHeader::from_byte_array(sha256d::Hash::hash(&data).to_byte_array());
 
-            if i < 1 || i >= cf_headers.filter_hashes.len() - 1 {
+            if i < 1 || i >= filter_headers.filter_hashes.len() - 1 {
                 tracing::trace!(
                     "Filter header {}: filter_hash={:?}, prev_header={:?}, result={:?}",
                     start_height + i as u32,

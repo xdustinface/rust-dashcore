@@ -364,7 +364,7 @@ impl<
                         stop_hash
                     );
 
-                    let get_cfheaders = NetworkMessage::GetCFHeaders(
+                    let get_filter_headers = NetworkMessage::GetCFHeaders(
                         dashcore::network::message_filter::GetCFHeaders {
                             filter_type: 0, // Basic filter
                             start_height,
@@ -372,7 +372,7 @@ impl<
                         },
                     );
 
-                    network.send_message(get_cfheaders).await.map_err(|e| {
+                    network.send_message(get_filter_headers).await.map_err(|e| {
                         SyncError::Network(format!("Failed to request filter headers: {}", e))
                     })?;
 
@@ -385,17 +385,17 @@ impl<
     }
 
     /// Handle filter headers that arrive after initial sync
-    pub(super) async fn handle_post_sync_cfheaders(
+    pub(super) async fn handle_post_sync_filter_headers(
         &mut self,
-        cfheaders: dashcore::network::message_filter::CFHeaders,
+        filter_headers: dashcore::network::message_filter::CFHeaders,
         network: &mut N,
         storage: &mut S,
     ) -> SyncResult<()> {
         tracing::info!("📥 Processing filter headers for new block after sync");
 
         // Store the filter headers
-        let stop_hash = cfheaders.stop_hash;
-        self.filter_sync.store_filter_headers(cfheaders, storage).await?;
+        let stop_hash = filter_headers.stop_hash;
+        self.filter_sync.store_filter_headers(filter_headers, storage).await?;
 
         // Get the height of the stop_hash
         if let Some(height) = storage
