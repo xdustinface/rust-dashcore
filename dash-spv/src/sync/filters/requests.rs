@@ -176,6 +176,10 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
         self.active_filter_requests.insert(range, active_request);
 
+        if request.start_height == 17801 {
+            tracing::debug!("now");
+        }
+
         // Include peer info when available
         let peer_addr = network.get_last_message_peer_addr().await;
         match peer_addr {

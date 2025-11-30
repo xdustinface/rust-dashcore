@@ -27,7 +27,7 @@ use tracing::{info, warn};
 fn init_test_logging() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::TRACE)
         .try_init();
 }
 
