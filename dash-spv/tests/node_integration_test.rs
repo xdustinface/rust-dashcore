@@ -376,63 +376,63 @@ async fn test_full_sync() {
         )
         .expect("Failed to create wallet from mnemonic");
     info!("✅ Created wallet from mnemonic, ID: {:?}", wallet_id);
-
-    // PRE-GENERATE ADDRESSES for SPV sync
-    // For SPV to work correctly from genesis, we need to pre-generate enough addresses
-    // to cover ALL addresses that will ever be used throughout the blockchain history.
-    // Based on dashd showing 2063 transactions, we need thousands of addresses.
-    info!("Pre-generating addresses for SPV compact filter matching...");
-
-    use key_wallet::managed_account::address_pool::KeySource;
-    use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
-
-    // First, collect the accounts
-    let mut accounts_info = Vec::new();
-    if let Some(wallet) = wallet_manager.get_wallet(&wallet_id) {
-        if let Some(account_collection) = wallet.accounts.get(&wallet_network) {
-            for account in account_collection.all_accounts() {
-                accounts_info.push((account.account_type, account.account_xpub));
-            }
-        }
-    }
-
-    // Then, use them to pre-generate addresses
-    if let Some(wallet_info) = wallet_manager.get_wallet_info_mut(&wallet_id) {
-        if let Some(managed_collection) = wallet_info.accounts_mut(wallet_network) {
-            for managed_account in managed_collection.all_accounts_mut() {
-                let managed_account_type = managed_account.account_type.to_account_type();
-
-                // Find matching account xpub
-                if let Some((_, account_xpub)) = accounts_info
-                    .iter()
-                    .find(|(account_type, _)| *account_type == managed_account_type)
-                {
-                    let key_source = KeySource::Public(*account_xpub);
-
-                    // Pre-generate 10,000 addresses for each pool (external + internal)
-                    let pools = managed_account.account_type.address_pools_mut();
-                    for pool in pools {
-                        let count_before = pool.addresses.len();
-                        // Generate addresses from 0 to 9999 (10,000 total)
-                        if let Ok(_) = pool.address_range(0, 1000, &key_source) {
-                            let count_after = pool.addresses.len();
-                            info!(
-                                "  Generated {} addresses for {} pool (total: {})",
-                                count_after - count_before,
-                                if pool.is_external() {
-                                    "external"
-                                } else {
-                                    "internal"
-                                },
-                                count_after
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-    info!("✅ Address pre-generation complete");
+    //
+    // // PRE-GENERATE ADDRESSES for SPV sync
+    // // For SPV to work correctly from genesis, we need to pre-generate enough addresses
+    // // to cover ALL addresses that will ever be used throughout the blockchain history.
+    // // Based on dashd showing 2063 transactions, we need thousands of addresses.
+    // info!("Pre-generating addresses for SPV compact filter matching...");
+    //
+    // use key_wallet::managed_account::address_pool::KeySource;
+    // use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+    //
+    // // First, collect the accounts
+    // let mut accounts_info = Vec::new();
+    // if let Some(wallet) = wallet_manager.get_wallet(&wallet_id) {
+    //     if let Some(account_collection) = wallet.accounts.get(&wallet_network) {
+    //         for account in account_collection.all_accounts() {
+    //             accounts_info.push((account.account_type, account.account_xpub));
+    //         }
+    //     }
+    // }
+    //
+    // // Then, use them to pre-generate addresses
+    // if let Some(wallet_info) = wallet_manager.get_wallet_info_mut(&wallet_id) {
+    //     if let Some(managed_collection) = wallet_info.accounts_mut(wallet_network) {
+    //         for managed_account in managed_collection.all_accounts_mut() {
+    //             let managed_account_type = managed_account.account_type.to_account_type();
+    //
+    //             // Find matching account xpub
+    //             if let Some((_, account_xpub)) = accounts_info
+    //                 .iter()
+    //                 .find(|(account_type, _)| *account_type == managed_account_type)
+    //             {
+    //                 let key_source = KeySource::Public(*account_xpub);
+    //
+    //                 // Pre-generate 10,000 addresses for each pool (external + internal)
+    //                 let pools = managed_account.account_type.address_pools_mut();
+    //                 for pool in pools {
+    //                     let count_before = pool.addresses.len();
+    //                     // Generate addresses from 0 to 9999 (10,000 total)
+    //                     if let Ok(_) = pool.address_range(0, 1000, &key_source) {
+    //                         let count_after = pool.addresses.len();
+    //                         info!(
+    //                             "  Generated {} addresses for {} pool (total: {})",
+    //                             count_after - count_before,
+    //                             if pool.is_external() {
+    //                                 "external"
+    //                             } else {
+    //                                 "internal"
+    //                             },
+    //                             count_after
+    //                         );
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    // info!("✅ Address pre-generation complete");
 
     let wallet = Arc::new(RwLock::new(wallet_manager));
 
@@ -461,13 +461,14 @@ async fn test_full_sync() {
     // Wait for sync to complete
     info!("Waiting for sync to complete (expected height: {})...", expected_height);
     let start_time = tokio::time::Instant::now();
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_secs(600);
     let mut last_progress = None;
 
     let final_progress = loop {
         assert!(
             start_time.elapsed() <= timeout,
-            "SPV client sync timeout after 120 seconds at height {:?}",
+            "SPV client sync timeout after {} seconds at height {:?}",
+            timeout.as_secs(),
             last_progress
                 .as_ref()
                 .map(|p: &dash_spv::types::DetailedSyncProgress| p.sync_progress.header_height)
@@ -734,7 +735,7 @@ fn find_test_data_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>
 
     let possible_paths = vec![
         //workspace_root.join("../test-blockchain/data/regtest-10000"),
-        workspace_root.join("../test-blockchain/data/regtest-1000"),
+        workspace_root.join("../test-blockchain/data/regtest-20000"),
     ];
 
     // New structure: regtest-N/ contains regtest/ subdirectory (not datadir/)
