@@ -897,8 +897,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // before deciding to use checkpoints
 
         // No headers in storage, use checkpoint based on wallet creation time
-        // TODO: Pass wallet creation time from client config
-        if let Some(checkpoint) = self.checkpoint_manager.get_sync_checkpoint(None) {
+        if let Some(checkpoint) = self.checkpoint_manager.get_sync_checkpoint(self.config.wallet_creation_time) {
             // Return checkpoint as starting point
             // Note: We'll need to prepopulate headers from checkpoints for this to work properly
             return Some((checkpoint.height, checkpoint.block_hash));
