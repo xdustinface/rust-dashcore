@@ -188,8 +188,8 @@ impl<
             NetworkMessage::Block(_) => {
                 // Blocks can be large - avoid cloning unless necessary
                 // Check if sync manager actually needs to process this block
-                if self.sync_manager.is_in_downloading_blocks_phase() {
-                    // Only clone if we're in the downloading blocks phase
+                if self.sync_manager.is_in_downloading_transactions_phase() {
+                    // Only clone if we're in the downloading transactions phase
                     if let Err(e) = self
                         .sync_manager
                         .handle_message(message.clone(), &mut *self.network, &mut *self.storage)

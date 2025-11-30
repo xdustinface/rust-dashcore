@@ -102,10 +102,10 @@ impl TransitionManager {
                 next_phase,
             ) => {
                 match next_phase {
-                    SyncPhase::DownloadingFilters {
+                    SyncPhase::DownloadingTransactions {
                         ..
                     } => {
-                        // Normal case: download filters after filter_headers
+                        // Normal case: download transactions after filter_headers
                         // CFHeaders must be complete
                         Ok(self.are_filter_headers_complete(current_phase, storage).await?)
                     }
@@ -113,53 +113,23 @@ impl TransitionManager {
                         ..
                     } => {
                         // Allow skipping to FullySynced if no peers support filters
-                        // Don't require filter_headers to be complete in this case
                         Ok(true)
                     }
                     _ => Ok(false),
                 }
             }
 
-            // From DownloadingFilters
+            // From DownloadingTransactions
             (
-                SyncPhase::DownloadingFilters {
-                    ..
-                },
-                next_phase,
-            ) => {
-                // Filters must be complete or no blocks needed
-                if !self.are_filters_complete(current_phase) {
-                    return Ok(false);
-                }
-
-                match next_phase {
-                    SyncPhase::DownloadingBlocks {
-                        ..
-                    } => {
-                        // Check if we have blocks to download
-                        Ok(self.has_blocks_to_download(current_phase))
-                    }
-                    SyncPhase::FullySynced {
-                        ..
-                    } => {
-                        // Can go to synced if no blocks to download
-                        Ok(!self.has_blocks_to_download(current_phase))
-                    }
-                    _ => Ok(false),
-                }
-            }
-
-            // From DownloadingBlocks
-            (
-                SyncPhase::DownloadingBlocks {
+                SyncPhase::DownloadingTransactions {
                     ..
                 },
                 SyncPhase::FullySynced {
                     ..
                 },
             ) => {
-                // All blocks must be downloaded
-                Ok(self.are_blocks_complete(current_phase))
+                // All filters and blocks must be complete
+                Ok(self.are_transactions_complete(current_phase))
             }
 
             // All other transitions are invalid
@@ -245,50 +215,28 @@ impl TransitionManager {
                 // Check if any peer supports compact filters
                 if !network.has_peer_with_service(ServiceFlags::COMPACT_FILTERS).await {
                     tracing::info!(
-                        "No peers support compact filters, skipping filter download phase"
+                        "No peers support compact filters, skipping transaction download phase"
                     );
                     // Skip directly to fully synced since we can't download filters
                     self.create_fully_synced_phase(storage).await
                 } else {
-                    // After CFHeaders, we need to determine what filters to download
-                    // For now, we'll create a filters phase that will be populated later
-                    Ok(Some(SyncPhase::DownloadingFilters {
+                    // After CFHeaders, start the combined transactions phase
+                    Ok(Some(SyncPhase::DownloadingTransactions {
                         start_time: Instant::now(),
                         requested_ranges: std::collections::HashMap::new(),
-                        completed_heights: std::collections::HashSet::new(),
+                        completed_filter_heights: std::collections::HashSet::new(),
                         total_filters: 0, // Will be determined based on watch items
+                        pending_blocks: Vec::new(),
+                        downloading_blocks: std::collections::HashMap::new(),
+                        completed_blocks: Vec::new(),
+                        total_blocks: 0,
                         last_progress: Instant::now(),
                         batches_processed: 0,
                     }))
                 }
             }
 
-            SyncPhase::DownloadingFilters {
-                ..
-            } => {
-                // Check if we have blocks to download
-                if self.has_blocks_to_download(current_phase) {
-                    if let SyncPhase::DownloadingFilters {
-                        ..
-                    } = current_phase
-                    {
-                        Ok(Some(SyncPhase::DownloadingBlocks {
-                            start_time: Instant::now(),
-                            pending_blocks: Vec::new(), // Will be populated from filter matches
-                            downloading: std::collections::HashMap::new(),
-                            completed: Vec::new(),
-                            last_progress: Instant::now(),
-                            total_blocks: 0, // Will be set when we populate pending_blocks
-                        }))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    self.create_fully_synced_phase(storage).await
-                }
-            }
-
-            SyncPhase::DownloadingBlocks {
+            SyncPhase::DownloadingTransactions {
                 ..
             } => self.create_fully_synced_phase(storage).await,
 
@@ -381,36 +329,22 @@ impl TransitionManager {
         }
     }
 
-    fn are_filters_complete(&self, phase: &SyncPhase) -> bool {
-        if let SyncPhase::DownloadingFilters {
-            completed_heights,
+    fn are_transactions_complete(&self, phase: &SyncPhase) -> bool {
+        if let SyncPhase::DownloadingTransactions {
+            completed_filter_heights,
             total_filters,
-            ..
-        } = phase
-        {
-            completed_heights.len() as u32 >= *total_filters
-        } else {
-            false
-        }
-    }
-
-    fn are_blocks_complete(&self, phase: &SyncPhase) -> bool {
-        if let SyncPhase::DownloadingBlocks {
             pending_blocks,
-            downloading,
+            downloading_blocks,
             ..
         } = phase
         {
-            pending_blocks.is_empty() && downloading.is_empty()
+            // All filters downloaded and all blocks downloaded
+            let filters_complete = completed_filter_heights.len() as u32 >= *total_filters;
+            let blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
+            filters_complete && blocks_complete
         } else {
             false
         }
-    }
-
-    fn has_blocks_to_download(&self, _phase: &SyncPhase) -> bool {
-        // This will be determined by filter matches
-        // For now, return false (no blocks to download)
-        false
     }
 
     async fn create_filter_headers_phase(

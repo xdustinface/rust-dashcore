@@ -168,19 +168,19 @@ impl<
                 // Check if filter sync hasn't started yet (no progress time)
                 self.current_phase.last_progress_time().is_none()
             }
-            SyncPhase::DownloadingFilters {
+            SyncPhase::DownloadingTransactions {
                 ..
             } => {
-                // Check if filter download hasn't started yet
+                // Check if transaction download hasn't started yet
                 self.current_phase.last_progress_time().is_none()
             }
             _ => false, // Other phases are started by messages or initial sync
         }
     }
 
-    /// Check if currently in the downloading blocks phase
-    pub fn is_in_downloading_blocks_phase(&self) -> bool {
-        matches!(self.current_phase, SyncPhase::DownloadingBlocks { .. })
+    /// Check if currently in the downloading transactions phase
+    pub fn is_in_downloading_transactions_phase(&self) -> bool {
+        matches!(self.current_phase, SyncPhase::DownloadingTransactions { .. })
     }
 
     /// Get current phase

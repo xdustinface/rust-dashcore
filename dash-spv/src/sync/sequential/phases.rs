@@ -69,36 +69,28 @@ pub enum SyncPhase {
         filter_headers_per_second: f64,
     },
 
-    /// Phase 4: Downloading compact filters
-    DownloadingFilters {
+    /// Phase 4: Downloading transactions (filters and blocks)
+    DownloadingTransactions {
         /// When this phase started
         start_time: Instant,
         /// Filter ranges that have been requested: (start, end) -> request time
         requested_ranges: HashMap<(u32, u32), Instant>,
         /// Heights for which filters have been downloaded
-        completed_heights: HashSet<u32>,
+        completed_filter_heights: HashSet<u32>,
         /// Total number of filters to download
         total_filters: u32,
+        /// Blocks pending download: (hash, height)
+        pending_blocks: Vec<(BlockHash, u32)>,
+        /// Currently downloading blocks: hash -> request time
+        downloading_blocks: HashMap<BlockHash, Instant>,
+        /// Successfully downloaded blocks
+        completed_blocks: Vec<BlockHash>,
+        /// Total blocks to download
+        total_blocks: usize,
         /// Last time we made progress
         last_progress: Instant,
         /// Number of filter batches processed
         batches_processed: u32,
-    },
-
-    /// Phase 5: Downloading full blocks
-    DownloadingBlocks {
-        /// When this phase started
-        start_time: Instant,
-        /// Blocks pending download: (hash, height)
-        pending_blocks: Vec<(BlockHash, u32)>,
-        /// Currently downloading blocks: hash -> request time
-        downloading: HashMap<BlockHash, Instant>,
-        /// Successfully downloaded blocks
-        completed: Vec<BlockHash>,
-        /// Last time we made progress
-        last_progress: Instant,
-        /// Total blocks to download
-        total_blocks: usize,
     },
 
     /// Fully synchronized with the network
@@ -130,12 +122,9 @@ impl SyncPhase {
             SyncPhase::DownloadingCFHeaders {
                 ..
             } => "Downloading Filter Headers",
-            SyncPhase::DownloadingFilters {
+            SyncPhase::DownloadingTransactions {
                 ..
-            } => "Downloading Filters",
-            SyncPhase::DownloadingBlocks {
-                ..
-            } => "Downloading Blocks",
+            } => "Downloading Transactions",
             SyncPhase::FullySynced {
                 ..
             } => "Fully Synced",
@@ -162,11 +151,7 @@ impl SyncPhase {
                 last_progress,
                 ..
             } => Some(*last_progress),
-            SyncPhase::DownloadingFilters {
-                last_progress,
-                ..
-            } => Some(*last_progress),
-            SyncPhase::DownloadingBlocks {
+            SyncPhase::DownloadingTransactions {
                 last_progress,
                 ..
             } => Some(*last_progress),
@@ -190,11 +175,7 @@ impl SyncPhase {
                 last_progress,
                 ..
             } => *last_progress = now,
-            SyncPhase::DownloadingFilters {
-                last_progress,
-                ..
-            } => *last_progress = now,
-            SyncPhase::DownloadingBlocks {
+            SyncPhase::DownloadingTransactions {
                 last_progress,
                 ..
             } => *last_progress = now,
@@ -344,56 +325,26 @@ impl SyncPhase {
                 }
             }
 
-            SyncPhase::DownloadingFilters {
-                completed_heights,
+            SyncPhase::DownloadingTransactions {
+                completed_filter_heights,
                 total_filters,
-                start_time,
-                ..
-            } => {
-                let items_completed = completed_heights.len() as u32;
-                let percentage = if *total_filters > 0 {
-                    (items_completed as f64 / *total_filters as f64) * 100.0
-                } else {
-                    0.0
-                };
-
-                let elapsed = start_time.elapsed();
-                let rate = if elapsed.as_secs() > 0 {
-                    items_completed as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-
-                let eta = if rate > 0.0 {
-                    let remaining = total_filters.saturating_sub(items_completed);
-                    Some(Duration::from_secs_f64(remaining as f64 / rate))
-                } else {
-                    None
-                };
-
-                PhaseProgress {
-                    phase_name: self.name(),
-                    items_completed,
-                    items_total: Some(*total_filters),
-                    percentage,
-                    rate,
-                    eta,
-                    elapsed,
-                }
-            }
-
-            SyncPhase::DownloadingBlocks {
-                completed,
+                completed_blocks,
                 total_blocks,
                 start_time,
                 ..
             } => {
-                let items_completed = completed.len() as u32;
-                let items_total = *total_blocks as u32;
+                // Progress is primarily based on filters (the main work)
+                let filters_completed = completed_filter_heights.len() as u32;
+                let blocks_completed = completed_blocks.len() as u32;
+
+                // Total items = filters + blocks
+                let items_completed = filters_completed + blocks_completed;
+                let items_total = *total_filters + *total_blocks as u32;
+
                 let percentage = if items_total > 0 {
                     (items_completed as f64 / items_total as f64) * 100.0
                 } else {
-                    100.0
+                    0.0
                 };
 
                 let elapsed = start_time.elapsed();

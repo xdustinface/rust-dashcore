@@ -39,8 +39,8 @@ impl<
                 self.current_phase.name()
             );
 
-            // If we're in the DownloadingBlocks phase, handle it there
-            return if matches!(self.current_phase, SyncPhase::DownloadingBlocks { .. }) {
+            // If we're in the DownloadingTransactions phase, handle it there
+            return if matches!(self.current_phase, SyncPhase::DownloadingTransactions { .. }) {
                 self.handle_block_message(block, network, storage).await
             } else if matches!(self.current_phase, SyncPhase::DownloadingMnList { .. }) {
                 // During masternode sync, blocks are not processed
@@ -49,7 +49,7 @@ impl<
             } else {
                 // Otherwise, just track that we received it but don't process for phase transitions
                 // The block will be processed by the client's block processor
-                tracing::debug!("Block received outside of DownloadingBlocks phase - will be processed by block processor");
+                tracing::debug!("Block received outside of DownloadingTransactions phase - will be processed by block processor");
                 Ok(())
             };
         }
@@ -105,12 +105,21 @@ impl<
             }
 
             (
-                SyncPhase::DownloadingFilters {
+                SyncPhase::DownloadingTransactions {
                     ..
                 },
                 NetworkMessage::CFilter(cfilter),
             ) => {
                 self.handle_cfilter_message(cfilter, network, storage).await?;
+            }
+
+            (
+                SyncPhase::DownloadingTransactions {
+                    ..
+                },
+                NetworkMessage::Block(block),
+            ) => {
+                self.handle_block_message(block, network, storage).await?;
             }
 
             // Handle headers when fully synced (from new block announcements)
@@ -232,13 +241,13 @@ impl<
                 NetworkMessage::CFHeaders(_),
             ) => true,
             (
-                SyncPhase::DownloadingFilters {
+                SyncPhase::DownloadingTransactions {
                     ..
                 },
                 NetworkMessage::CFilter(_),
             ) => true,
             (
-                SyncPhase::DownloadingBlocks {
+                SyncPhase::DownloadingTransactions {
                     ..
                 },
                 NetworkMessage::Block(_),
@@ -664,77 +673,74 @@ impl<
             tracing::trace!("No more pending filter requests in queue");
         }
 
-        // Update phase state
-        if let SyncPhase::DownloadingFilters {
-            completed_heights,
+        // Update phase state and check for completion
+        let should_transition_complete;
+        let should_transition_empty;
+
+        if let SyncPhase::DownloadingTransactions {
+            completed_filter_heights,
             batches_processed,
             total_filters,
+            pending_blocks,
+            downloading_blocks,
+            last_progress,
             ..
         } = &mut self.current_phase
         {
             // Mark this height as completed
             if let Ok(Some(height)) = storage.get_header_height_by_hash(&cfilter.block_hash).await {
-                completed_heights.insert(height);
+                completed_filter_heights.insert(height);
 
                 // Log progress periodically
-                if completed_heights.len() % 100 == 0
-                    || completed_heights.len() == *total_filters as usize
+                if completed_filter_heights.len() % 100 == 0
+                    || completed_filter_heights.len() == *total_filters as usize
                 {
                     tracing::info!(
-                        "📊 Filter download progress: {}/{} filters received",
-                        completed_heights.len(),
+                        "📊 Transaction download progress: {}/{} filters received",
+                        completed_filter_heights.len(),
                         total_filters
                     );
                 }
             }
 
             *batches_processed += 1;
-            self.current_phase.update_progress();
+            *last_progress = Instant::now();
 
-            // Check if all filters are downloaded
-            // We need to track actual completion, not just request status
-            if let SyncPhase::DownloadingFilters {
-                total_filters,
-                completed_heights,
-                ..
-            } = &self.current_phase
-            {
-                // We need to check:
-                // 1. All expected filters have been received (completed_heights matches total_filters)
-                // 2. No more active or pending requests
-                let has_pending = self.filter_sync.pending_download_count() > 0
-                    || self.filter_sync.active_request_count() > 0;
+            // Check if all filters and blocks are downloaded
+            let has_pending_requests = self.filter_sync.pending_download_count() > 0
+                || self.filter_sync.active_request_count() > 0;
 
-                let all_received =
-                    *total_filters > 0 && completed_heights.len() >= *total_filters as usize;
+            let all_filters_received =
+                *total_filters > 0 && completed_filter_heights.len() >= *total_filters as usize;
+            let all_blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
 
-                // Only transition when we've received all filters AND no requests are pending
-                if all_received && !has_pending {
-                    tracing::info!(
-                        "All {} filters received and processed",
-                        completed_heights.len()
-                    );
-                    self.transition_to_next_phase(storage, network, "All filters downloaded")
-                        .await?;
+            should_transition_complete =
+                all_filters_received && all_blocks_complete && !has_pending_requests;
+            should_transition_empty =
+                *total_filters == 0 && all_blocks_complete && !has_pending_requests;
 
-                    // Execute the next phase
-                    self.execute_current_phase(network, storage).await?;
-                } else if *total_filters == 0 && !has_pending {
-                    // Edge case: no filters to download
-                    self.transition_to_next_phase(storage, network, "No filters to download")
-                        .await?;
-
-                    // Execute the next phase
-                    self.execute_current_phase(network, storage).await?;
-                } else {
-                    tracing::trace!(
-                        "Filter sync progress: {}/{} received, {} active requests",
-                        completed_heights.len(),
-                        total_filters,
-                        self.filter_sync.active_request_count()
-                    );
-                }
+            if !should_transition_complete && !should_transition_empty {
+                tracing::trace!(
+                    "Transaction sync progress: {}/{} filters, {} blocks pending, {} active requests",
+                    completed_filter_heights.len(),
+                    total_filters,
+                    pending_blocks.len(),
+                    self.filter_sync.active_request_count()
+                );
             }
+        } else {
+            should_transition_complete = false;
+            should_transition_empty = false;
+        }
+
+        // Handle transitions outside the borrow
+        if should_transition_complete {
+            tracing::info!("All filters received and processed");
+            self.transition_to_next_phase(storage, network, "All transactions downloaded")
+                .await?;
+        } else if should_transition_empty {
+            self.transition_to_next_phase(storage, network, "No transactions to download")
+                .await?;
         }
 
         Ok(())
@@ -778,33 +784,37 @@ impl<
         }
 
         // Handle block download and check if we need to transition
-        let should_transition = if let SyncPhase::DownloadingBlocks {
-            downloading,
-            completed,
+        if let SyncPhase::DownloadingTransactions {
+            downloading_blocks,
+            completed_blocks,
+            completed_filter_heights,
+            total_filters,
+            pending_blocks,
             last_progress,
             ..
         } = &mut self.current_phase
         {
             // Remove from downloading
-            downloading.remove(&block_hash);
+            downloading_blocks.remove(&block_hash);
 
             // Add to completed
-            completed.push(block_hash);
+            completed_blocks.push(block_hash);
 
             // Update progress time
             *last_progress = Instant::now();
 
-            // Check if all blocks are downloaded
-            downloading.is_empty() && self.no_more_pending_blocks()
-        } else {
-            false
-        };
+            // Check if all filters and blocks are downloaded
+            let has_pending_requests = self.filter_sync.pending_download_count() > 0
+                || self.filter_sync.active_request_count() > 0;
 
-        if should_transition {
-            self.transition_to_next_phase(storage, network, "All blocks downloaded").await?;
+            let all_filters_received =
+                *total_filters > 0 && completed_filter_heights.len() >= *total_filters as usize;
+            let all_blocks_complete = pending_blocks.is_empty() && downloading_blocks.is_empty();
 
-            // Execute the next phase (if any)
-            self.execute_current_phase(network, storage).await?;
+            if all_filters_received && all_blocks_complete && !has_pending_requests {
+                self.transition_to_next_phase(storage, network, "All transactions downloaded")
+                    .await?;
+            }
         }
 
         Ok(())

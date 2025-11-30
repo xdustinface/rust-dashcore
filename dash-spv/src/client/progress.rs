@@ -93,19 +93,15 @@ impl<
                 current: *current_height,
                 target: *target_height,
             },
-            SyncPhase::DownloadingFilters {
-                completed_heights,
+            SyncPhase::DownloadingTransactions {
+                completed_filter_heights,
                 total_filters,
-                ..
-            } => SyncStage::DownloadingFilters {
-                completed: completed_heights.len() as u32,
-                total: *total_filters,
-            },
-            SyncPhase::DownloadingBlocks {
                 pending_blocks,
                 ..
-            } => SyncStage::DownloadingBlocks {
-                pending: pending_blocks.len(),
+            } => SyncStage::DownloadingTransactions {
+                filters_completed: completed_filter_heights.len() as u32,
+                filters_total: *total_filters,
+                blocks_pending: pending_blocks.len(),
             },
             SyncPhase::FullySynced {
                 ..

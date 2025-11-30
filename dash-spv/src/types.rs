@@ -199,12 +199,10 @@ pub enum SyncStage {
         current: u32,
         target: u32,
     },
-    DownloadingFilters {
-        completed: u32,
-        total: u32,
-    },
-    DownloadingBlocks {
-        pending: usize,
+    DownloadingTransactions {
+        filters_completed: u32,
+        filters_total: u32,
+        blocks_pending: usize,
     },
     Complete,
     Failed(String),

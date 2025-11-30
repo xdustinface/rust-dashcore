@@ -130,10 +130,10 @@ impl<
                 }
             }
 
-            SyncPhase::DownloadingFilters {
+            SyncPhase::DownloadingTransactions {
                 ..
             } => {
-                tracing::info!("📥 Starting filter download phase");
+                tracing::info!("📥 Starting transaction download phase");
 
                 // Get the range of filters to download
                 // Note: get_filter_tip_height() now returns absolute blockchain height
@@ -157,7 +157,7 @@ impl<
                     );
 
                     // Update the phase to track the expected total
-                    if let SyncPhase::DownloadingFilters {
+                    if let SyncPhase::DownloadingTransactions {
                         total_filters,
                         ..
                     } = &mut self.current_phase
@@ -166,6 +166,7 @@ impl<
                     }
 
                     // Use the filter sync manager to download filters
+                    // Blocks will be requested automatically when filters match
                     self.filter_sync
                         .sync_filters(network, storage, Some(start_height), Some(count))
                         .await?;
@@ -174,15 +175,6 @@ impl<
                     self.transition_to_next_phase(storage, network, "No filter headers available")
                         .await?;
                 }
-            }
-
-            SyncPhase::DownloadingBlocks {
-                ..
-            } => {
-                tracing::info!("📥 Starting block download phase");
-                // Block download will be initiated based on filter matches
-                // For now, we'll complete the sync
-                self.transition_to_next_phase(storage, network, "No blocks to download").await?;
             }
 
             _ => {
@@ -328,18 +320,17 @@ impl<
                     self.execute_current_phase(network, storage).await?;
                 }
             }
-            SyncPhase::DownloadingFilters {
+            SyncPhase::DownloadingTransactions {
                 ..
             } => {
                 // Always check for timed out filter requests, not just during phase timeout
                 self.filter_sync.check_filter_request_timeouts(network, storage).await?;
 
-                // For filter downloads, we need custom timeout handling
-                // since the filter sync manager's timeout is for filter headers
+                // For transaction downloads, we need custom timeout handling
                 if let Some(last_progress) = self.current_phase.last_progress_time() {
                     if last_progress.elapsed() > self.phase_timeout {
                         tracing::warn!(
-                            "⏰ Filter download phase timed out after {:?}",
+                            "⏰ Transaction download phase timed out after {:?}",
                             self.phase_timeout
                         );
 
@@ -348,7 +339,7 @@ impl<
                         let pending_count = self.filter_sync.pending_download_count();
 
                         tracing::warn!(
-                            "Filter sync status: {} active requests, {} pending",
+                            "Transaction sync status: {} active requests, {} pending",
                             active_count,
                             pending_count
                         );
@@ -366,27 +357,27 @@ impl<
                         {
                             // No active requests and no pending - we're stuck
                             tracing::error!(
-                                "Filter sync stalled with no active or pending requests"
+                                "Transaction sync stalled with no active or pending requests"
                             );
 
                             // Check if we received some filters but not all
                             let received_count = self.filter_sync.get_received_filter_count();
-                            if let SyncPhase::DownloadingFilters {
+                            if let SyncPhase::DownloadingTransactions {
                                 total_filters,
                                 ..
                             } = &self.current_phase
                             {
                                 if received_count > 0 && received_count < *total_filters {
                                     tracing::warn!(
-                                        "Filter sync stalled at {}/{} filters - attempting recovery",
+                                        "Transaction sync stalled at {}/{} filters - attempting recovery",
                                         received_count, total_filters
                                     );
 
-                                    // Retry the entire filter sync phase
+                                    // Retry the entire transaction sync phase
                                     self.current_phase_retries += 1;
                                     if self.current_phase_retries <= self.max_phase_retries {
                                         tracing::info!(
-                                            "🔄 Retrying filter sync (attempt {}/{})",
+                                            "🔄 Retrying transaction sync (attempt {}/{})",
                                             self.current_phase_retries,
                                             self.max_phase_retries
                                         );
@@ -403,7 +394,7 @@ impl<
                                         return Ok(());
                                     } else {
                                         tracing::error!(
-                                            "Filter sync failed after {} retries, forcing completion",
+                                            "Transaction sync failed after {} retries, forcing completion",
                                             self.max_phase_retries
                                         );
                                     }
@@ -414,10 +405,9 @@ impl<
                             self.transition_to_next_phase(
                                 storage,
                                 network,
-                                "Filter sync timeout - forcing completion",
+                                "Transaction sync timeout - forcing completion",
                             )
                             .await?;
-                            self.execute_current_phase(network, storage).await?;
                         }
                     }
                 }
@@ -489,24 +479,20 @@ impl<
     pub(super) fn calculate_total_filters_synced(&self) -> u32 {
         self.phase_history
             .iter()
-            .find(|t| t.from_phase == "Downloading Filters")
+            .find(|t| t.from_phase == "Downloading Transactions")
             .and_then(|t| t.final_progress.as_ref())
             .map(|p| p.items_completed)
             .unwrap_or(0)
     }
 
     pub(super) fn calculate_total_blocks_downloaded(&self) -> u32 {
+        // Blocks are now part of the combined transactions phase
+        // The items_completed includes both filters and blocks
         self.phase_history
             .iter()
-            .find(|t| t.from_phase == "Downloading Blocks")
+            .find(|t| t.from_phase == "Downloading Transactions")
             .and_then(|t| t.final_progress.as_ref())
-            .map(|p| p.items_completed)
+            .map(|_p| 0) // Individual block count not tracked separately
             .unwrap_or(0)
-    }
-
-    pub(super) fn no_more_pending_blocks(&self) -> bool {
-        // This would check if there are more blocks to download
-        // For now, return true
-        true
     }
 }
