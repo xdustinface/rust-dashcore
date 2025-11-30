@@ -59,25 +59,12 @@ impl Checkpoint {
     }
 }
 
-/// Checkpoint override settings
-#[derive(Debug, Clone, Default)]
-pub struct CheckpointOverride {
-    /// Override checkpoint height for sync chain
-    pub sync_override_height: Option<u32>,
-    /// Override checkpoint height for terminal chain
-    pub terminal_override_height: Option<u32>,
-    /// Whether to sync from genesis
-    pub sync_from_genesis: bool,
-}
-
 /// Manages checkpoints for a specific network
 pub struct CheckpointManager {
     /// Checkpoints indexed by height
     checkpoints: HashMap<u32, Checkpoint>,
     /// Sorted list of checkpoint heights for efficient searching
     sorted_heights: Vec<u32>,
-    /// Checkpoint override settings (not persisted)
-    override_settings: CheckpointOverride,
 }
 
 impl CheckpointManager {
@@ -96,7 +83,6 @@ impl CheckpointManager {
         Self {
             checkpoints: checkpoint_map,
             sorted_heights: heights,
-            override_settings: CheckpointOverride::default(),
         }
     }
 
@@ -147,21 +133,6 @@ impl CheckpointManager {
 
         for checkpoint in self.checkpoints.values() {
             if checkpoint.timestamp <= timestamp && checkpoint.height >= best_height {
-                best_height = checkpoint.height;
-                best_checkpoint = Some(checkpoint);
-            }
-        }
-
-        best_checkpoint
-    }
-
-    /// Find the best checkpoint at or before a given height
-    pub fn best_checkpoint_at_or_before_height(&self, height: u32) -> Option<&Checkpoint> {
-        let mut best_checkpoint = None;
-        let mut best_height = 0;
-
-        for checkpoint in self.checkpoints.values() {
-            if checkpoint.height <= height && checkpoint.height >= best_height {
                 best_height = checkpoint.height;
                 best_checkpoint = Some(checkpoint);
             }
