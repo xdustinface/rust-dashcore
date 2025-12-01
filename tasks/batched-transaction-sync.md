@@ -36,7 +36,7 @@ Commit `ce7f1de3` already added `BlockProcessingResult` with `new_addresses: Vec
 All batched transaction sync functionality has been implemented. The key changes:
 
 **dash-spv/src/sync/sequential/phases.rs:**
-- Added batch tracking fields: `batch_start`, `batch_end`, `tip_height`, `current_batch`, `total_batches`
+- Added batch tracking fields: `batch_start`, `batch_end`, `tip_height`, `current_batch`, `batches_total`
 - Added filter storage: `stored_filters: HashMap<BlockHash, Vec<u8>>`
 - Added re-scan tracking: `new_addresses_found`, `scan_pass`
 - Updated `progress()` method to show batch progress
@@ -110,7 +110,7 @@ DownloadingTransactions {
     scan_pass: u32,
     // Progress
     last_progress: Instant,
-    total_batches: u32,
+    batches_total: u32,
     current_batch: u32,
 }
 ```
@@ -238,7 +238,7 @@ async fn advance_to_next_batch(&mut self, network: &mut N, storage: &mut S) -> S
         tip_height,
         stored_filters,
         current_batch,
-        total_batches,
+        batches_total,
         ..
     } = &mut self.current_phase {
         // Clear stored filters (free memory)
@@ -257,7 +257,7 @@ async fn advance_to_next_batch(&mut self, network: &mut N, storage: &mut S) -> S
             *batch_end = new_end;
 
             tracing::info!("📦 Starting batch {}/{}: heights {} to {}",
-                *current_batch + 1, *total_batches, new_start, new_end);
+                *current_batch + 1, *batches_total, new_start, new_end);
 
             // Execute filter download for new batch
             self.execute_current_phase(network, storage).await?;
@@ -296,7 +296,7 @@ Update `SyncStage::DownloadingTransactions`:
 ```rust
 DownloadingTransactions {
     current_batch: u32,
-    total_batches: u32,
+    batches_total: u32,
     batch_filters_completed: u32,
     batch_filters_total: u32,
     blocks_pending: usize,

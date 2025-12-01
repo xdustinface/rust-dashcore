@@ -11,7 +11,7 @@ use crate::sync::filters::types::TRANSACTION_SYNC_BATCH_SIZE;
 use key_wallet_manager::wallet_interface::WalletInterface;
 
 use super::manager::SequentialSyncManager;
-use super::phases::SyncPhase;
+use super::phases::{StoredFilter, SyncPhase};
 
 impl<
         S: StorageManager + Send + Sync + 'static,
@@ -480,7 +480,8 @@ impl<
         storage: &mut S,
     ) -> SyncResult<()> {
         // Collect the stored filters and new addresses to avoid borrow issues
-        let (filters_to_check, addresses_to_check): (Vec<(BlockHash, Vec<u8>)>, Vec<dashcore::Address>) =
+        // Vec<StoredFilter> is already in height order since filters arrive sequentially
+        let (filters_to_check, addresses_to_check): (Vec<StoredFilter>, Vec<dashcore::Address>) =
             if let SyncPhase::DownloadingTransactions {
                 stored_filters,
                 new_addresses,
@@ -488,7 +489,7 @@ impl<
             } = &self.current_phase
             {
                 (
-                    stored_filters.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                    stored_filters.iter().cloned().collect(),
                     new_addresses.clone(),
                 )
             } else {
@@ -522,22 +523,15 @@ impl<
         }
 
         // Check ALL filters against only the new addresses
-        let mut matches_to_request = Vec::new();
-        for (block_hash, filter_data) in filters_to_check {
-            // Get height for this block
-            let height = storage
-                .get_header_height_by_hash(&block_hash)
-                .await
-                .map_err(|e| SyncError::Storage(format!("Failed to get block height: {}", e)))?
-                .unwrap_or(0);
-
-            // Reconstruct the BlockFilter and check against new addresses only
-            let filter = dashcore::bip158::BlockFilter::new(&filter_data);
+        // Filters are already in height order from the Vec
+        let mut matches_found: Vec<(BlockHash, u32)> = Vec::new();
+        for stored_filter in filters_to_check {
+            let filter = dashcore::bip158::BlockFilter::new(&stored_filter.filter_data);
 
             // Check if filter matches any of the new addresses
             let wallet = self.wallet.read().await;
             let matches = wallet
-                .check_filter_against_addresses(&filter, &block_hash, &addresses_to_check, self.config.network)
+                .check_filter_against_addresses(&filter, &stored_filter.block_hash, &addresses_to_check, self.config.network)
                 .await;
             drop(wallet);
 
@@ -545,28 +539,35 @@ impl<
             if matches {
                 tracing::info!(
                     "🔄 Rescan: New match at height {} (block {})",
-                    height,
-                    block_hash
+                    stored_filter.height,
+                    stored_filter.block_hash
                 );
-
-                if let SyncPhase::DownloadingTransactions {
-                    pending_blocks,
-                    downloading_blocks,
-                    last_progress,
-                    ..
-                } = &mut self.current_phase
-                {
-                    pending_blocks.push((block_hash, height));
-                    downloading_blocks.insert(block_hash, Instant::now());
-                    *last_progress = Instant::now();
-                }
-
-                matches_to_request.push(crate::types::FilterMatch {
-                    block_hash,
-                    height,
-                    block_requested: false,
-                });
+                matches_found.push((stored_filter.block_hash, stored_filter.height));
             }
+        }
+
+        // matches_found is already in height order since we iterated the Vec in order
+
+        // Update state and build request list
+        let mut matches_to_request = Vec::new();
+        for (block_hash, height) in matches_found {
+            if let SyncPhase::DownloadingTransactions {
+                pending_blocks,
+                downloading_blocks,
+                last_progress,
+                ..
+            } = &mut self.current_phase
+            {
+                pending_blocks.push((block_hash, height));
+                downloading_blocks.insert(block_hash, Instant::now());
+                *last_progress = Instant::now();
+            }
+
+            matches_to_request.push(crate::types::FilterMatch {
+                block_hash,
+                height,
+                block_requested: false,
+            });
         }
 
         // Request all newly matched blocks

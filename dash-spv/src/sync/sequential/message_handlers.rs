@@ -13,7 +13,7 @@ use crate::types::PeerId;
 use key_wallet_manager::wallet_interface::WalletInterface;
 
 use super::manager::SequentialSyncManager;
-use super::phases::SyncPhase;
+use super::phases::{StoredFilter, SyncPhase};
 
 impl<
         S: StorageManager + Send + Sync + 'static,
@@ -627,7 +627,11 @@ impl<
             ..
         } = &mut self.current_phase
         {
-            stored_filters.insert(cfilter.block_hash, cfilter.filter.clone());
+            stored_filters.push(StoredFilter {
+                height,
+                block_hash: cfilter.block_hash,
+                filter_data: cfilter.filter.clone(),
+            });
         }
 
         let matches = self

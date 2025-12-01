@@ -416,7 +416,7 @@ impl TransitionManager {
             tip_height,
             current_batch: 0,
             total_batches,
-            stored_filters: std::collections::HashMap::new(),
+            stored_filters: Vec::new(),
             completed_filter_heights: std::collections::HashSet::new(),
             total_filters,
             pending_blocks: Vec::new(),

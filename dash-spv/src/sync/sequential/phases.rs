@@ -5,6 +5,14 @@ use std::time::{Duration, Instant};
 
 use dashcore::BlockHash;
 
+/// A stored filter with height for ordered iteration during rescan
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredFilter {
+    pub height: u32,
+    pub block_hash: BlockHash,
+    pub filter_data: Vec<u8>,
+}
+
 /// Represents the current synchronization phase
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncPhase {
@@ -84,8 +92,8 @@ pub enum SyncPhase {
         current_batch: u32,
         /// Total number of batches
         total_batches: u32,
-        /// Filter storage for re-scanning: block_hash -> filter data
-        stored_filters: HashMap<BlockHash, Vec<u8>>,
+        /// Filter storage for re-scanning, ordered by height
+        stored_filters: Vec<StoredFilter>,
         /// Heights for which filters have been downloaded in current batch
         completed_filter_heights: HashSet<u32>,
         /// Total number of filters in current batch
