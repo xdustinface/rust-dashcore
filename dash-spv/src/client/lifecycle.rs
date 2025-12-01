@@ -156,11 +156,11 @@ impl<
             self.config.network,
         );
 
-        tokio::spawn(async move {
-            tracing::info!("🏭 Starting block processor worker task");
-            block_processor.run().await;
-            tracing::info!("🏭 Block processor worker task completed");
-        });
+        // tokio::spawn(async move {
+        //     tracing::info!("🏭 Starting block processor worker task");
+        //     block_processor.run().await;
+        //     tracing::info!("🏭 Block processor worker task completed");
+        // });
 
         // For sequential sync, filter processor is handled internally
         if self.config.enable_filters && self.filter_processor.is_none() {
