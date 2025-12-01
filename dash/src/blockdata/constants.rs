@@ -158,9 +158,9 @@ pub fn genesis_block(network: Network) -> Block {
                     version: block::Version::ONE,
                     prev_blockhash: Hash::all_zeros(),
                     merkle_root,
-                    time: 1417713337, // Matches official Dash Core devnet genesis
+                    time: 1417713337,
                     bits: CompactTarget::from_consensus(0x1e0377ae),
-                    nonce: 1096447, // Matches official Dash Core devnet genesis
+                    nonce: 1096447,
                 },
                 txdata,
             }
@@ -173,9 +173,9 @@ pub fn genesis_block(network: Network) -> Block {
                     version: block::Version::ONE,
                     prev_blockhash: Hash::all_zeros(),
                     merkle_root,
-                    time: 1417713337, // Matches official Dash Core regtest genesis
+                    time: 1417713337,
                     bits: CompactTarget::from_consensus(0x207fffff),
-                    nonce: 1096447, // Matches official Dash Core regtest genesis
+                    nonce: 1096447,
                 },
                 txdata,
             }
