@@ -735,7 +735,7 @@ fn find_test_data_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Error>
 
     let possible_paths = vec![
         //workspace_root.join("../test-blockchain/data/regtest-10000"),
-        workspace_root.join("../test-blockchain/data/regtest-20000"),
+        workspace_root.join("../test-blockchain/data/regtest-1000"),
     ];
 
     // New structure: regtest-N/ contains regtest/ subdirectory (not datadir/)
