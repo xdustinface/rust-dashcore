@@ -34,6 +34,7 @@
 // Existing extracted modules
 pub mod block_processor;
 pub mod config;
+pub mod interface;
 pub mod message_handler;
 pub mod status_display;
 
