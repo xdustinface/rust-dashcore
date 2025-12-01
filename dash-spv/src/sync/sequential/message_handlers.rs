@@ -697,7 +697,7 @@ impl<
                 ..
             } = &self.current_phase
             {
-                // For flow control, we need to check:
+                // We need to check:
                 // 1. All expected filters have been received (completed_heights matches total_filters)
                 // 2. No more active or pending requests
                 let has_pending = self.filter_sync.pending_download_count() > 0
