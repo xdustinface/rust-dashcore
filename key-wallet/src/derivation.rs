@@ -370,7 +370,7 @@ impl DerivationStrategy {
     pub fn new(base_path: DerivationPath) -> Self {
         Self {
             base_path,
-            gap_limit: 100,
+            gap_limit: 20,
             lookahead: 20,
         }
     }
