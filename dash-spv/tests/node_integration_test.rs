@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use test_utils::{is_dashd_available, DashCoreNode};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 fn init_test_logging() {
@@ -449,13 +450,15 @@ async fn test_full_sync() {
     let mut progress_receiver =
         client.take_progress_receiver().expect("Progress receiver should be available");
 
+    let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let shutdown_token = CancellationToken::new();
+    let client_token = shutdown_token.clone();
+
     // Spawn monitor_network() in background
-    info!("Starting network monitoring task...");
-    let monitor_handle = tokio::task::spawn(async move {
-        if let Err(e) = client.monitor_network().await {
-            warn!("Monitor network error: {}", e);
-        }
-        client
+    info!("Starting client task...");
+    let client_task = tokio::spawn(async move {
+        tracing::info!("Run SPV client...");
+        client.run(command_receiver, client_token).await.expect("Client failed");
     });
 
     // Wait for sync to complete
@@ -522,7 +525,9 @@ async fn test_full_sync() {
 
     // Abort the monitoring task
     info!("Aborting network monitoring task...");
-    monitor_handle.abort();
+    shutdown_token.cancel();
+    client_task.abort();
+    tokio::join!(client_task);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Validate sync results

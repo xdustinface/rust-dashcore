@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "network": "Regtest",
+  "peers": [
+    {
+      "address": "127.0.0.1:19999",
+      "services": 1,
+      "last_seen": 1764604495
+    }
+  ]
+}
