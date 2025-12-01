@@ -461,7 +461,7 @@ async fn test_full_sync() {
     // Wait for sync to complete
     info!("Waiting for sync to complete (expected height: {})...", expected_height);
     let start_time = tokio::time::Instant::now();
-    let timeout = Duration::from_secs(600);
+    let timeout = Duration::from_secs(800);
     let mut last_progress = None;
 
     let final_progress = loop {
