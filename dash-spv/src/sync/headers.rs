@@ -941,12 +941,6 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         None
     }
 
-    /// Check if we're past all checkpoints and can relax validation
-    pub fn is_past_checkpoints(&self) -> bool {
-        // Use total_headers_synced which tracks absolute blockchain height
-        self.checkpoint_manager.is_past_last_checkpoint(self.total_headers_synced)
-    }
-
     /// Pre-populate headers from checkpoints for fast initial sync
     /// Note: This requires having prev_blockhash data for checkpoints
     pub async fn prepopulate_from_checkpoints(&mut self, storage: &S) -> SyncResult<u32> {
