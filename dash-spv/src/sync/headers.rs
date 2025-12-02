@@ -720,19 +720,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                         tracing::info!("Starting from genesis block: {}", genesis_hash);
                         Some(genesis_hash)
                     } else {
-                        // Check if we can start from a checkpoint
-                        if let Some((height, hash)) = self.get_sync_starting_point() {
-                            tracing::info!("Starting from checkpoint at height {}", height);
-                            Some(hash)
-                        } else {
-                            // Use network genesis as fallback
-                            let genesis_hash =
-                                self.config.network.known_genesis_block_hash().ok_or_else(
-                                    || SyncError::Storage("No known genesis hash".to_string()),
-                                )?;
-                            tracing::info!("Starting from network genesis: {}", genesis_hash);
-                            Some(genesis_hash)
-                        }
+                        let genesis_hash =
+                            self.config.network.known_genesis_block_hash().ok_or_else(
+                                || SyncError::Storage("No known genesis hash".to_string()),
+                            )?;
+                        tracing::info!("Starting from network genesis: {}", genesis_hash);
+                        Some(genesis_hash)
                     }
                 }
             }
