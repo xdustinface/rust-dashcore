@@ -2,6 +2,7 @@
 
 use super::phases::{PhaseTransition, SyncPhase};
 use super::transitions::TransitionManager;
+use crate::chain::Checkpoint;
 use crate::client::ClientConfig;
 use crate::error::SyncResult;
 use crate::network::NetworkManager;
@@ -378,8 +379,8 @@ impl<
     }
 
     /// Update the chain state (used for checkpoint sync initialization)
-    pub fn update_chain_state_cache(&mut self, sync_base_height: u32, headers_len: u32) {
-        self.header_sync.update_cached_from_state_snapshot(sync_base_height, headers_len);
+    pub fn update_chain_state_cache(&mut self, sync_checkpoint: Checkpoint, headers_len: u32) {
+        self.header_sync.update_cached_from_state_snapshot(sync_checkpoint, headers_len);
     }
 
     /// Get reference to the masternode engine if available.

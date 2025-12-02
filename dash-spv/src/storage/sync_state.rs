@@ -191,7 +191,7 @@ impl PersistentSyncState {
                 .calculate_chain_work()
                 .map(|work| format!("{:?}", work))
                 .unwrap_or_else(|| String::from("0")),
-            sync_base_height: chain_state.sync_base_height,
+            sync_base_height: chain_state.sync_base_height(),
         })
     }
 

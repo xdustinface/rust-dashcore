@@ -3,15 +3,15 @@
 //! This module contains the FilterSyncManager struct and high-level coordination logic
 //! that delegates to specialized sub-modules for headers, downloads, matching, etc.
 
-use dashcore::{hash_types::FilterHeader, network::message_filter::CFHeaders, BlockHash};
-use dashcore_hashes::{sha256d, Hash};
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use crate::chain::Checkpoint;
 use crate::client::ClientConfig;
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
 use crate::types::SharedFilterHeights;
+use dashcore::{hash_types::FilterHeader, network::message_filter::CFHeaders, BlockHash};
+use dashcore_hashes::{sha256d, Hash};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // Import types and constants from the types module
 use super::types::*;
@@ -46,8 +46,8 @@ pub struct FilterSyncManager<S: StorageManager, N: NetworkManager> {
     pub(super) syncing_filter_headers: bool,
     /// Current height being synced for filter headers
     pub(super) current_sync_height: u32,
-    /// Base height for sync (typically from checkpoint)
-    pub(super) sync_base_height: u32,
+    /// Sync start checkpoint
+    pub(super) sync_checkpoint: Option<Checkpoint>,
     /// Last time sync progress was made (for timeout detection)
     pub(super) last_sync_progress: std::time::Instant,
     /// Whether filter sync is currently in progress
@@ -95,7 +95,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             _config: config.clone(),
             syncing_filter_headers: false,
             current_sync_height: 0,
-            sync_base_height: 0,
+            sync_checkpoint: None,
             last_sync_progress: std::time::Instant::now(),
             syncing_filters: false,
             pending_block_downloads: VecDeque::new(),
@@ -124,16 +124,22 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
     }
 
-    /// Set the base height for sync (typically from checkpoint)
-    pub fn set_sync_base_height(&mut self, height: u32) {
-        self.sync_base_height = height;
+    /// Set the checkpoint for sync
+    pub fn set_sync_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
+        self.sync_checkpoint = checkpoint;
+    }
+
+    /// Get the sync base height (0 if not syncing from checkpoint)
+    pub fn sync_base_height(&self) -> u32 {
+        self.sync_checkpoint.map(|c| c.height).unwrap_or(0)
     }
 
     /// Convert absolute blockchain height to block header storage index.
     /// Storage indexing is base-inclusive: at checkpoint base B, storage index 0 == absolute height B.
     pub(super) fn header_abs_to_storage_index(&self, height: u32) -> Option<u32> {
-        if self.sync_base_height > 0 {
-            height.checked_sub(self.sync_base_height)
+        let base = self.sync_base_height();
+        if base > 0 {
+            height.checked_sub(base)
         } else {
             Some(height)
         }
@@ -142,8 +148,9 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Convert absolute blockchain height to filter header storage index.
     /// Storage indexing is base-inclusive for filter headers as well.
     pub(super) fn filter_abs_to_storage_index(&self, height: u32) -> Option<u32> {
-        if self.sync_base_height > 0 {
-            height.checked_sub(self.sync_base_height)
+        let base = self.sync_base_height();
+        if base > 0 {
+            height.checked_sub(base)
         } else {
             Some(height)
         }

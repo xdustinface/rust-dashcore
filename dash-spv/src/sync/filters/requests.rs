@@ -47,7 +47,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             filter_header_tip_height
         };
 
-        let base_height = self.sync_base_height;
+        let base_height = self.sync_base_height();
         let clamped_start = start.max(base_height);
 
         if clamped_start > end {

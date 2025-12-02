@@ -80,16 +80,16 @@ impl<'a, S: StorageManager + Send + Sync + 'static, W: WalletInterface + Send + 
             let blockchain_height = storage_tip;
             if with_logging {
                 tracing::debug!(
-                    "Status display: reported tip height={}, sync_base={}, raw_storage_tip={}",
+                    "Status display: reported tip height={}, sync_checkpoint={:?}, raw_storage_tip={}",
                     blockchain_height,
-                    state.sync_base_height,
+                    state.sync_checkpoint(),
                     storage_tip
                 );
             }
             blockchain_height
         } else {
             // No headers in storage yet
-            state.sync_base_height
+            state.sync_base_height()
         }
     }
 

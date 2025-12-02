@@ -34,7 +34,7 @@ impl DiskStorageManager {
 
         // Load chain state to get sync_base_height for proper blockchain height calculation
         let chain_state = self.load_chain_state().await?;
-        let sync_base_height = chain_state.as_ref().map(|cs| cs.sync_base_height).unwrap_or(0);
+        let sync_base_height = chain_state.as_ref().map(|cs| cs.sync_base_height()).unwrap_or(0);
 
         // Acquire write locks for the entire operation to prevent race conditions
         let mut cached_tip = self.cached_tip_height.write().await;
@@ -290,7 +290,7 @@ impl DiskStorageManager {
         let mut headers = Vec::new();
 
         // Convert blockchain height range to storage index range using sync_base_height
-        let sync_base_height = *self.sync_base_height.read().await;
+        let sync_base_height = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
         let storage_start = if sync_base_height > 0 && range.start >= sync_base_height {
             range.start - sync_base_height
         } else {
@@ -341,7 +341,7 @@ impl DiskStorageManager {
     /// Get a header at a specific blockchain height.
     pub async fn get_header(&self, height: u32) -> StorageResult<Option<BlockHeader>> {
         // Accept blockchain (absolute) height and convert to storage index using sync_base_height.
-        let sync_base_height = *self.sync_base_height.read().await;
+        let sync_base_height = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
 
         // Convert absolute height to storage index (base-inclusive mapping)
         let storage_index = if sync_base_height > 0 {
@@ -407,7 +407,7 @@ impl DiskStorageManager {
     pub async fn get_tip_height(&self) -> StorageResult<Option<u32>> {
         let tip_index_opt = *self.cached_tip_height.read().await;
         if let Some(tip_index) = tip_index_opt {
-            let base = *self.sync_base_height.read().await;
+            let base = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
             if base > 0 {
                 Ok(Some(base + tip_index))
             } else {

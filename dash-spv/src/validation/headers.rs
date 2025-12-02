@@ -1,7 +1,7 @@
 //! Header validation functionality.
 
-use std::time::Instant;
 use dashcore::{block::Header as BlockHeader, error::Error as DashError};
+use std::time::Instant;
 
 use crate::error::{ValidationError, ValidationResult};
 use crate::types::ValidationMode;

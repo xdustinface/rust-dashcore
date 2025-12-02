@@ -347,9 +347,10 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                         }
 
                         // If this is the first batch after a checkpoint, store the checkpoint filter header
-                        if self.sync_base_height > 0
-                            && start_height == self.sync_base_height + 1
-                            && current_filter_tip < self.sync_base_height
+                        let sync_base = self.sync_base_height();
+                        if sync_base > 0
+                            && start_height == sync_base + 1
+                            && current_filter_tip < sync_base
                         {
                             // Store the previous_filter_header as the filter header for the checkpoint block
                             let checkpoint_header = vec![cfheaders.previous_filter_header];
@@ -363,7 +364,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                             )?;
                             tracing::info!(
                                 "Stored checkpoint filter header at height {}: {:?}",
-                                self.sync_base_height,
+                                sync_base,
                                 cfheaders.previous_filter_header
                             );
                         }

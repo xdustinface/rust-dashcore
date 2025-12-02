@@ -3,32 +3,16 @@
 #[cfg(test)]
 mod tests {
     use super::super::checkpoints::*;
-    use dashcore::{BlockHash, CompactTarget, Target};
+    use dashcore::BlockHash;
     use dashcore_hashes::Hash;
 
     fn create_test_checkpoint(height: u32, timestamp: u32) -> Checkpoint {
         let hash_bytes = dashcore_hashes::hash_x11::Hash::hash(&height.to_le_bytes());
-        let prev_bytes = if height > 0 {
-            dashcore_hashes::hash_x11::Hash::hash(&(height - 1).to_le_bytes())
-        } else {
-            dashcore_hashes::hash_x11::Hash::all_zeros()
-        };
 
         Checkpoint {
             height,
             block_hash: BlockHash::from_raw_hash(hash_bytes),
-            prev_blockhash: BlockHash::from_raw_hash(prev_bytes),
             timestamp,
-            target: Target::from_compact(CompactTarget::from_consensus(0x1d00ffff)),
-            merkle_root: Some(BlockHash::from_raw_hash(hash_bytes)),
-            chain_work: format!("0x{:064x}", height * 1000),
-            masternode_list_name: if height.is_multiple_of(100000) && height > 0 {
-                Some(format!("ML{}__70230", height))
-            } else {
-                None
-            },
-            protocol_version: None,
-            nonce: height * 123,
         }
     }
 
@@ -82,28 +66,6 @@ mod tests {
         // Should not reject forks after last checkpoint
         assert!(!manager.should_reject_fork(200001));
         assert!(!manager.should_reject_fork(300000));
-    }
-
-    #[test]
-    fn test_checkpoint_protocol_version_extraction() {
-        let mut checkpoint = create_test_checkpoint(100000, 1500000000);
-
-        // Test with masternode list name
-        checkpoint.masternode_list_name = Some("ML100000__70227".to_string());
-        assert_eq!(checkpoint.protocol_version(), Some(70227));
-
-        // Test with explicit protocol version (should take precedence)
-        checkpoint.protocol_version = Some(70230);
-        assert_eq!(checkpoint.protocol_version(), Some(70230));
-
-        // Test with invalid masternode list format
-        checkpoint.protocol_version = None;
-        checkpoint.masternode_list_name = Some("ML100000_invalid".to_string());
-        assert_eq!(checkpoint.protocol_version(), None);
-
-        // Test with no masternode list
-        checkpoint.masternode_list_name = None;
-        assert_eq!(checkpoint.protocol_version(), None);
     }
 
     #[test]
@@ -188,15 +150,11 @@ mod tests {
             assert!(heights[i] > heights[i - 1], "Checkpoints not in ascending order");
         }
 
-        // Verify all checkpoints have valid data
+        // Verify all checkpoints have valid data (height, hash, timestamp)
         for checkpoint in &checkpoints {
             assert!(checkpoint.timestamp > 0);
-            assert!(checkpoint.nonce > 0);
-            assert!(!checkpoint.chain_work.is_empty());
-
-            if checkpoint.height > 0 {
-                assert_ne!(checkpoint.prev_blockhash, BlockHash::from([0u8; 32]));
-            }
+            // block_hash should not be all zeros
+            assert_ne!(checkpoint.block_hash, BlockHash::from([0u8; 32]));
         }
     }
 
@@ -211,9 +169,11 @@ mod tests {
             assert!(heights[i] > heights[i - 1]);
         }
 
+        // Verify all checkpoints have valid data (height, hash, timestamp)
         for checkpoint in &checkpoints {
             assert!(checkpoint.timestamp > 0);
-            assert!(!checkpoint.chain_work.is_empty());
+            // block_hash should not be all zeros
+            assert_ne!(checkpoint.block_hash, BlockHash::from([0u8; 32]));
         }
     }
 }

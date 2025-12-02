@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
-use dashcore::{block::Header as BlockHeader, hash_types::FilterHeader, BlockHash, Txid};
-
+use crate::chain::Checkpoint;
 use crate::error::{StorageError, StorageResult};
 use crate::types::{MempoolState, UnconfirmedTransaction};
+use dashcore::{block::Header as BlockHeader, hash_types::FilterHeader, BlockHash, Txid};
 
 use super::segments::{FilterSegmentCache, SegmentCache};
 use super::HEADERS_PER_SEGMENT;
@@ -64,7 +64,7 @@ pub struct DiskStorageManager {
     pub(super) cached_filter_tip_height: Arc<RwLock<Option<u32>>>,
 
     // Checkpoint sync support
-    pub(super) sync_base_height: Arc<RwLock<u32>>,
+    pub(super) sync_checkpoint: Arc<RwLock<Option<Checkpoint>>>,
 
     // Index save tracking to avoid redundant saves
     pub(super) last_index_save_count: Arc<RwLock<usize>>,
@@ -107,7 +107,7 @@ impl DiskStorageManager {
             notification_rx: Arc::new(RwLock::new(mpsc::channel(1).1)), // Temporary placeholder
             cached_tip_height: Arc::new(RwLock::new(None)),
             cached_filter_tip_height: Arc::new(RwLock::new(None)),
-            sync_base_height: Arc::new(RwLock::new(0)),
+            sync_checkpoint: Arc::new(RwLock::new(None)),
             last_index_save_count: Arc::new(RwLock::new(0)),
             mempool_transactions: Arc::new(RwLock::new(HashMap::new())),
             mempool_state: Arc::new(RwLock::new(None)),
@@ -121,11 +121,16 @@ impl DiskStorageManager {
 
         // Load chain state to get sync_base_height
         if let Ok(Some(chain_state)) = storage.load_chain_state().await {
-            *storage.sync_base_height.write().await = chain_state.sync_base_height;
-            tracing::debug!("Loaded sync_base_height: {}", chain_state.sync_base_height);
+            *storage.sync_checkpoint.write().await = chain_state.sync_checkpoint().copied();
+            tracing::debug!("Loaded sync_checkpoint: {:?}", chain_state.sync_checkpoint());
         }
 
         Ok(storage)
+    }
+
+    /// Get the sync base height (0 if not syncing from checkpoint)
+    pub async fn sync_base_height(&self) -> u32 {
+        self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0)
     }
 
     /// Start the background worker and notification channel.
@@ -314,7 +319,7 @@ impl DiskStorageManager {
                 // Load chain state to get sync_base_height for proper height calculation
                 let sync_base_height = if let Ok(Some(chain_state)) = self.load_chain_state().await
                 {
-                    chain_state.sync_base_height
+                    chain_state.sync_base_height()
                 } else {
                     0 // Assume genesis sync if no chain state
                 };
@@ -384,9 +389,9 @@ impl DiskStorageManager {
                         segment_id * HEADERS_PER_SEGMENT + segment.filter_headers.len() as u32 - 1;
 
                     // Convert storage index to blockchain height
-                    let sync_base_height = *self.sync_base_height.read().await;
-                    let blockchain_height = if sync_base_height > 0 {
-                        sync_base_height + storage_index
+                    let sync_checkpoint = *self.sync_checkpoint.read().await;
+                    let blockchain_height = if let Some(checkpoint) = sync_checkpoint {
+                        checkpoint.height + storage_index
                     } else {
                         storage_index
                     };

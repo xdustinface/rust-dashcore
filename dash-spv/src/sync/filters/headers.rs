@@ -178,7 +178,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
 
         tracing::info!("🚀 Starting filter header synchronization");
-        tracing::debug!("FilterSync start: sync_base_height={}", self.sync_base_height);
+        tracing::debug!("FilterSync start: sync_base_height={}", self.sync_base_height());
 
         // Get current filter tip
         let current_filter_height = storage
@@ -198,7 +198,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         tracing::debug!(
             "FilterSync context: header_tip_height={} (base={})",
             header_tip_height,
-            self.sync_base_height
+            self.sync_base_height()
         );
 
         if current_filter_height >= header_tip_height {
@@ -210,17 +210,17 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // In checkpoint sync, request from the checkpoint height itself. CFHeaders includes
         // previous_filter_header for (start_height - 1), so we can compute the chain from the
         // checkpoint and store its filter header as the first element.
-        let next_height =
-            if self.sync_base_height > 0 && current_filter_height < self.sync_base_height {
-                tracing::info!(
-                    "Starting filter sync from checkpoint base {} (current filter height: {})",
-                    self.sync_base_height,
-                    current_filter_height
-                );
-                self.sync_base_height
-            } else {
-                current_filter_height + 1
-            };
+        let sync_base = self.sync_base_height();
+        let next_height = if sync_base > 0 && current_filter_height < sync_base {
+            tracing::info!(
+                "Starting filter sync from checkpoint base {} (current filter height: {})",
+                sync_base,
+                current_filter_height
+            );
+            sync_base
+        } else {
+            current_filter_height + 1
+        };
         tracing::debug!(
             "FilterSync plan: next_height={}, current_filter_height={}, header_tip_height={}",
             next_height,
@@ -269,7 +269,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             self.current_sync_height,
             batch_end_height,
             batch_end_height - self.current_sync_height + 1,
-            self.sync_base_height
+            self.sync_base_height()
         );
 
         // Get the hash at batch_end_height for the stop_hash
@@ -351,7 +351,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             "Sending GetCFHeaders: start_height={}, stop_hash={}, base_height={} (header storage idx {:?}, filter storage idx {:?})",
             start_height,
             stop_hash,
-            self.sync_base_height,
+            self.sync_base_height(),
             self.header_abs_to_storage_index(start_height),
             self.filter_abs_to_storage_index(start_height)
         );
@@ -417,17 +417,17 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
 
         // Determine next height to request
-        let next_height =
-            if self.sync_base_height > 0 && current_filter_height < self.sync_base_height {
-                tracing::info!(
-                    "Starting filter sync from checkpoint base {} (current filter height: {})",
-                    self.sync_base_height,
-                    current_filter_height
-                );
-                self.sync_base_height
-            } else {
-                current_filter_height + 1
-            };
+        let sync_base = self.sync_base_height();
+        let next_height = if sync_base > 0 && current_filter_height < sync_base {
+            tracing::info!(
+                "Starting filter sync from checkpoint base {} (current filter height: {})",
+                sync_base,
+                current_filter_height
+            );
+            sync_base
+        } else {
+            current_filter_height + 1
+        };
 
         if next_height > header_tip_height {
             tracing::warn!(
@@ -916,15 +916,14 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // - Genesis sync: start_height == 1 (we don't have genesis filter header)
         // - Checkpoint sync (expected first batch): start_height == sync_base_height + 1
         // - Checkpoint overlap batch: start_height == sync_base_height (peer included one extra)
+        let sync_base = self.sync_base_height();
         if start_height <= 1
-            || (self.sync_base_height > 0
-                && (start_height == self.sync_base_height
-                    || start_height == self.sync_base_height + 1))
+            || (sync_base > 0 && (start_height == sync_base || start_height == sync_base + 1))
         {
             tracing::debug!(
                 "Skipping filter header chain verification for first batch (start_height={}, sync_base_height={})",
                 start_height,
-                self.sync_base_height
+                sync_base
             );
             return Ok(true);
         }
