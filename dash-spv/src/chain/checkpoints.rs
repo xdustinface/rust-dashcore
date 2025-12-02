@@ -121,11 +121,6 @@ impl CheckpointManager {
         &self.sorted_heights
     }
 
-    /// Check if we're past the last checkpoint
-    pub fn is_past_last_checkpoint(&self, height: u32) -> bool {
-        self.sorted_heights.last().is_none_or(|&last| height > last)
-    }
-
     /// Get the last checkpoint before a given timestamp
     pub fn last_checkpoint_before_timestamp(&self, timestamp: u32) -> Option<&Checkpoint> {
         let mut best_checkpoint = None;
@@ -139,15 +134,6 @@ impl CheckpointManager {
         }
 
         best_checkpoint
-    }
-
-    /// Get the last checkpoint that has a masternode list
-    pub fn last_checkpoint_having_masternode_list(&self) -> Option<&Checkpoint> {
-        self.sorted_heights
-            .iter()
-            .rev()
-            .filter_map(|height| self.checkpoints.get(height))
-            .find(|checkpoint| checkpoint.has_masternode_list())
     }
 
     /// Get the checkpoint to use for sync chain based on override settings
@@ -495,19 +481,6 @@ mod tests {
 
         // Should not reject fork after last checkpoint
         assert!(!manager.should_reject_fork(2000000));
-    }
-
-    #[test]
-    #[ignore] // Test depends on specific mainnet checkpoint data
-    fn test_masternode_list_checkpoint() {
-        let checkpoints = mainnet_checkpoints();
-        let manager = CheckpointManager::new(checkpoints);
-
-        // Find last checkpoint with masternode list
-        let ml_checkpoint = manager.last_checkpoint_having_masternode_list();
-        assert!(ml_checkpoint.is_some());
-        assert!(ml_checkpoint.expect("Should have ML checkpoint").has_masternode_list());
-        assert_eq!(ml_checkpoint.expect("Should have ML checkpoint").height, 1900000);
     }
 
     #[test]
