@@ -4,7 +4,6 @@
 //! - Prevent accepting blocks from invalid chains
 //! - Optimize initial sync by starting from recent checkpoints
 //! - Protect against deep reorganizations
-//! - Bootstrap masternode lists at specific heights
 
 use dashcore::{BlockHash, CompactTarget, Target};
 use dashcore_hashes::{hex, Hash};
@@ -18,69 +17,25 @@ pub struct Checkpoint {
     pub height: u32,
     /// Block hash
     pub block_hash: BlockHash,
-    /// Previous block hash
-    pub prev_blockhash: BlockHash,
-    /// Block timestamp
-    pub timestamp: u32,
-    /// Difficulty target
-    pub target: Target,
-    /// Merkle root (optional for older checkpoints)
-    pub merkle_root: Option<BlockHash>,
-    /// Cumulative chain work up to this block (as hex string)
-    pub chain_work: String,
-    /// Masternode list identifier (e.g., "ML1088640__70218")
-    pub masternode_list_name: Option<String>,
-    /// Protocol version at this checkpoint
-    pub protocol_version: Option<u32>,
-    /// Nonce value for the block
-    pub nonce: u32,
-}
-
-impl Checkpoint {
-    /// Extract protocol version from masternode list name or use stored value
-    pub fn protocol_version(&self) -> Option<u32> {
-        // Prefer explicitly stored protocol version
-        if let Some(version) = self.protocol_version {
-            return Some(version);
-        }
-
-        // Otherwise extract from masternode list name
-        self.masternode_list_name.as_ref().and_then(|name| {
-            // Format: "ML{height}__{protocol_version}"
-            name.split("__").nth(1).and_then(|s| s.parse().ok())
-        })
-    }
-
-    /// Check if this checkpoint has an associated masternode list
-    pub fn has_masternode_list(&self) -> bool {
-        self.masternode_list_name.is_some()
-    }
 }
 
 /// Manages checkpoints for a specific network
 pub struct CheckpointManager {
     /// Checkpoints indexed by height
     checkpoints: BTreeMap<u32, Checkpoint>,
-    /// Sorted list of checkpoint heights for efficient searching
-    sorted_heights: Vec<u32>,
 }
 
 impl CheckpointManager {
     /// Create a new checkpoint manager from a list of checkpoints
     pub fn new(checkpoints: Vec<Checkpoint>) -> Self {
-        let mut checkpoint_map = HashMap::new();
-        let mut heights = Vec::new();
+        let mut checkpoint_map = BTreeMap::new();
 
         for checkpoint in checkpoints {
-            heights.push(checkpoint.height);
             checkpoint_map.insert(checkpoint.height, checkpoint);
         }
 
-        heights.sort_unstable();
-
         Self {
             checkpoints: checkpoint_map,
-            sorted_heights: heights,
         }
     }
 
@@ -99,24 +54,12 @@ impl CheckpointManager {
 
     /// Get the last checkpoint at or before the given height
     pub fn last_checkpoint_before_height(&self, height: u32) -> Option<&Checkpoint> {
-        // Binary search for the highest checkpoint <= height
-        let pos = self.sorted_heights.partition_point(|&h| h <= height);
-        if pos > 0 {
-            let checkpoint_height = self.sorted_heights[pos - 1];
-            self.checkpoints.get(&checkpoint_height)
-        } else {
-            None
-        }
+        self.checkpoints.range(..=height).next_back().map(|(_, cp)| cp)
     }
 
     /// Get the last checkpoint
     pub fn last_checkpoint(&self) -> Option<&Checkpoint> {
-        self.sorted_heights.last().and_then(|&height| self.checkpoints.get(&height))
-    }
-
-    /// Get all checkpoint heights
-    pub fn checkpoint_heights(&self) -> &[u32] {
-        &self.sorted_heights
+        self.checkpoints.values().next_back()
     }
 
     /// Get the last checkpoint before a given timestamp
@@ -341,7 +284,6 @@ fn create_checkpoint(
         merkle_root: Some(parse_block_hash_safe(merkle_root)),
         chain_work: chain_work.to_string(),
         masternode_list_name: masternode_list.map(|s| s.to_string()),
-        include_merkle_root: true,
         protocol_version: masternode_list.and_then(|ml| {
             // Extract protocol version from masternode list name
             ml.split("__").nth(1).and_then(|s| s.parse().ok())
