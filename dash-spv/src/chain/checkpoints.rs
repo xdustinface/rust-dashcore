@@ -9,7 +9,7 @@
 use dashcore::{BlockHash, CompactTarget, Target};
 use dashcore_hashes::{hex, Hash};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A checkpoint representing a known valid block
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,7 +62,7 @@ impl Checkpoint {
 /// Manages checkpoints for a specific network
 pub struct CheckpointManager {
     /// Checkpoints indexed by height
-    checkpoints: HashMap<u32, Checkpoint>,
+    checkpoints: BTreeMap<u32, Checkpoint>,
     /// Sorted list of checkpoint heights for efficient searching
     sorted_heights: Vec<u32>,
 }
