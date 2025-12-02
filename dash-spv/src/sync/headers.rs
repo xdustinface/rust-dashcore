@@ -732,19 +732,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                         tracing::info!("Starting from genesis block: {}", genesis_hash);
                         Some(genesis_hash)
                     } else {
-                        // Check if we can start from a checkpoint
-                        if let Some((height, hash)) = self.get_sync_starting_point() {
-                            tracing::info!("Starting from checkpoint at height {}", height);
-                            Some(hash)
-                        } else {
-                            // Use network genesis as fallback
-                            let genesis_hash =
-                                self.config.network.known_genesis_block_hash().ok_or_else(
-                                    || SyncError::Storage("No known genesis hash".to_string()),
-                                )?;
-                            tracing::info!("Starting from network genesis: {}", genesis_hash);
-                            Some(genesis_hash)
-                        }
+                        let genesis_hash =
+                            self.config.network.known_genesis_block_hash().ok_or_else(
+                                || SyncError::Storage("No known genesis hash".to_string()),
+                            )?;
+                        tracing::info!("Starting from network genesis: {}", genesis_hash);
+                        Some(genesis_hash)
                     }
                 }
             }
@@ -905,24 +898,6 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
 
         Ok(false)
-    }
-
-    /// Get the optimal starting point for sync based on checkpoints
-    pub fn get_sync_starting_point(&self) -> Option<(u32, BlockHash)> {
-        // For now, we can't check storage here without passing it as parameter
-        // The actual implementation would need to check if headers exist in storage
-        // before deciding to use checkpoints
-
-        // No headers in storage, use checkpoint based on wallet creation time
-        // TODO: Pass wallet creation time from client config
-        if let Some(checkpoint) = self.checkpoint_manager.get_sync_checkpoint(None) {
-            // Return checkpoint as starting point
-            // Note: We'll need to prepopulate headers from checkpoints for this to work properly
-            return Some((checkpoint.height, checkpoint.block_hash));
-        }
-
-        // No suitable checkpoint, start from genesis
-        None
     }
 
     /// Check if we can skip ahead to a checkpoint during sync
