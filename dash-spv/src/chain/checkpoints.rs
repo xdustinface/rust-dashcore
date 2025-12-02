@@ -155,33 +155,6 @@ impl CheckpointManager {
         }
     }
 
-    /// Validate a block header against checkpoints
-    pub fn validate_header(
-        &self,
-        height: u32,
-        block_hash: &BlockHash,
-        merkle_root: Option<&BlockHash>,
-    ) -> bool {
-        if let Some(checkpoint) = self.get_checkpoint(height) {
-            // Check block hash
-            if checkpoint.block_hash != *block_hash {
-                return false;
-            }
-
-            // Check merkle root if required
-            if checkpoint.include_merkle_root {
-                if let (Some(expected), Some(actual)) = (&checkpoint.merkle_root, merkle_root) {
-                    if expected != actual {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-}
-
 /// Create mainnet checkpoints
 pub fn mainnet_checkpoints() -> Vec<Checkpoint> {
     vec![
@@ -406,10 +379,6 @@ mod tests {
 
         // Test no checkpoint at height
         assert!(manager.validate_block(1, &invalid_hash)); // No checkpoint at height 1
-
-        // Test header validation
-        assert!(manager.validate_header(0, &genesis_hash, None));
-        assert!(!manager.validate_header(0, &invalid_hash, None));
     }
 
     #[test]

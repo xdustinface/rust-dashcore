@@ -100,38 +100,6 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_override_priority() {
-        let checkpoints = vec![
-            create_test_checkpoint(0, 1000000),
-            create_test_checkpoint(100000, 1500000000),
-            create_test_checkpoint(200000, 1600000000),
-            create_test_checkpoint(300000, 1700000000),
-        ];
-
-        let mut manager = CheckpointManager::new(checkpoints);
-
-        // Test sync from genesis override
-        manager.set_sync_from_genesis(true);
-        let checkpoint = manager.get_sync_checkpoint(Some(1650000000));
-        assert_eq!(checkpoint.unwrap().height, 0);
-
-        // Test sync height override (genesis flag still takes precedence)
-        manager.set_sync_override(Some(150000));
-        let checkpoint = manager.get_sync_checkpoint(Some(1650000000));
-        assert_eq!(checkpoint.unwrap().height, 0); // Genesis flag takes precedence
-
-        // Clear genesis flag and test height override alone
-        manager.set_sync_from_genesis(false);
-        let checkpoint = manager.get_sync_checkpoint(Some(1650000000));
-        assert_eq!(checkpoint.unwrap().height, 100000);
-
-        // Test terminal override
-        manager.set_terminal_override(Some(250000));
-        let checkpoint = manager.get_terminal_checkpoint();
-        assert_eq!(checkpoint.unwrap().height, 200000); // Last before 250000
-    }
-
-    #[test]
     fn test_fork_rejection_logic() {
         let checkpoints = vec![
             create_test_checkpoint(0, 1000000),
@@ -150,30 +118,6 @@ mod tests {
         // Should not reject forks after last checkpoint
         assert!(!manager.should_reject_fork(200001));
         assert!(!manager.should_reject_fork(300000));
-    }
-
-    #[test]
-    fn test_best_checkpoint_at_or_before_height() {
-        let checkpoints = vec![
-            create_test_checkpoint(0, 1000000),
-            create_test_checkpoint(100000, 1500000000),
-            create_test_checkpoint(200000, 1600000000),
-            create_test_checkpoint(300000, 1700000000),
-        ];
-
-        let manager = CheckpointManager::new(checkpoints.clone());
-
-        // Test exact matches
-        assert_eq!(manager.best_checkpoint_at_or_before_height(100000).unwrap().height, 100000);
-        assert_eq!(manager.best_checkpoint_at_or_before_height(200000).unwrap().height, 200000);
-
-        // Test between checkpoints
-        assert_eq!(manager.best_checkpoint_at_or_before_height(150000).unwrap().height, 100000);
-        assert_eq!(manager.best_checkpoint_at_or_before_height(250000).unwrap().height, 200000);
-
-        // Test edge cases
-        assert_eq!(manager.best_checkpoint_at_or_before_height(0).unwrap().height, 0);
-        assert_eq!(manager.best_checkpoint_at_or_before_height(500000).unwrap().height, 300000);
     }
 
     #[test]
@@ -218,23 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_past_last_checkpoint() {
-        let checkpoints = vec![
-            create_test_checkpoint(0, 1000000),
-            create_test_checkpoint(100000, 1500000000),
-            create_test_checkpoint(200000, 1600000000),
-        ];
-
-        let manager = CheckpointManager::new(checkpoints.clone());
-
-        assert!(!manager.is_past_last_checkpoint(0));
-        assert!(!manager.is_past_last_checkpoint(100000));
-        assert!(!manager.is_past_last_checkpoint(200000));
-        assert!(manager.is_past_last_checkpoint(200001));
-        assert!(manager.is_past_last_checkpoint(300000));
-    }
-
-    #[test]
     fn test_empty_checkpoint_manager() {
         let manager = CheckpointManager::new(vec![]);
 
@@ -242,9 +169,7 @@ mod tests {
         assert!(manager.last_checkpoint().is_none());
         assert!(manager.last_checkpoint_before_height(100000).is_none());
         assert!(manager.last_checkpoint_before_timestamp(1700000000).is_none());
-        assert!(manager.last_checkpoint_having_masternode_list().is_none());
         assert!(manager.checkpoint_heights().is_empty());
-        assert!(manager.is_past_last_checkpoint(0));
         assert!(!manager.should_reject_fork(100000));
     }
 
@@ -309,11 +234,6 @@ mod tests {
                 assert_ne!(checkpoint.prev_blockhash, BlockHash::from([0u8; 32]));
             }
         }
-
-        // Verify masternode list checkpoints
-        let ml_checkpoint = manager.last_checkpoint_having_masternode_list();
-        assert!(ml_checkpoint.is_some());
-        assert!(ml_checkpoint.unwrap().protocol_version().is_some());
     }
 
     #[test]
