@@ -6,7 +6,7 @@
 use dashcore::{hash_types::FilterHeader, network::message_filter::CFHeaders, BlockHash};
 use dashcore_hashes::{sha256d, Hash};
 use std::collections::{HashMap, HashSet, VecDeque};
-
+use crate::chain::Checkpoint;
 use crate::client::ClientConfig;
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
@@ -46,8 +46,8 @@ pub struct FilterSyncManager<S: StorageManager, N: NetworkManager> {
     pub(super) syncing_filter_headers: bool,
     /// Current height being synced for filter headers
     pub(super) current_sync_height: u32,
-    /// Base height for sync (typically from checkpoint)
-    pub(super) sync_base_height: u32,
+    /// Sync start checkpoint
+    pub(super) sync_checkpoint: Option<Checkpoint>,
     /// Last time sync progress was made (for timeout detection)
     pub(super) last_sync_progress: std::time::Instant,
     /// Whether filter sync is currently in progress

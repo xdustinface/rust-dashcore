@@ -10,7 +10,7 @@ use dashcore::{
 use dashcore_hashes::Hash;
 
 use crate::chain::checkpoints::{mainnet_checkpoints, testnet_checkpoints, CheckpointManager};
-use crate::chain::{ChainTip, ChainTipManager, ChainWork, ForkDetector};
+use crate::chain::{ChainTip, ChainTipManager, ChainWork, Checkpoint, ForkDetector};
 use crate::client::ClientConfig;
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
@@ -59,8 +59,8 @@ pub struct HeaderSyncManager<S: StorageManager, N: NetworkManager> {
     syncing_headers: bool,
     last_sync_progress: std::time::Instant,
     headers2_failed: bool,
-    // Cached flag for quick access without locking
-    cached_sync_base_height: u32,
+    // Cached checkpoint for quick access without locking
+    cached_sync_checkpoint: Option<Checkpoint>,
 }
 
 impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync + 'static>
@@ -1097,19 +1097,19 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     }
 
     /// Get the sync base height (used when syncing from checkpoint)
-    pub fn get_sync_base_height(&self) -> u32 {
-        self.cached_sync_base_height
+    pub fn get_checkpoint(&self) -> Option<Checkpoint> {
+        self.cached_sync_checkpoint
     }
 
     /// Whether we're syncing from a checkpoint
     pub fn is_synced_from_checkpoint(&self) -> bool {
-        self.cached_sync_base_height > 0
+        self.cached_sync_checkpoint.is_some()
     }
 
     /// Update cached flags and totals based on an external state snapshot
-    pub fn update_cached_from_state_snapshot(&mut self, sync_base_height: u32, headers_len: u32) {
-        self.cached_sync_base_height = sync_base_height;
+    pub fn update_cached_from_state_snapshot(&mut self, sync_checkpoint: Checkpoint, headers_len: u32) {
         // Absolute blockchain tip height = base + headers_len - 1 (if any headers exist)
-        self.total_headers_synced = sync_base_height.saturating_add(headers_len).saturating_sub(1);
+        self.total_headers_synced = sync_checkpoint.height.saturating_add(headers_len).saturating_sub(1);
+        self.cached_sync_checkpoint = Some(sync_checkpoint);
     }
 }

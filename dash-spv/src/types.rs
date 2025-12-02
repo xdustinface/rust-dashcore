@@ -24,6 +24,7 @@ use dashcore::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use crate::chain::Checkpoint;
 
 /// Shared, mutex-protected set of filter heights used across components.
 ///
@@ -275,8 +276,8 @@ pub struct ChainState {
     /// Last masternode diff height processed.
     pub last_masternode_diff_height: Option<u32>,
 
-    /// Base height when syncing from a checkpoint (0 if syncing from genesis).
-    pub sync_base_height: u32,
+    /// Contains the checkpoint data when syncing from a checkpoint (None if syncing from genesis).
+    pub sync_checkpoint: Option<Checkpoint>,
 }
 
 impl ChainState {
@@ -319,25 +320,26 @@ impl ChainState {
         state.masternode_engine = Some(engine);
 
         // Initialize checkpoint fields
-        state.sync_base_height = 0;
+        state.sync_checkpoint = None;
 
         state
     }
 
     /// Whether the chain was synced from a checkpoint rather than genesis.
     pub fn synced_from_checkpoint(&self) -> bool {
-        self.sync_base_height > 0
+        self.sync_checkpoint.is_some()
     }
 
     /// Get the current tip height.
     pub fn tip_height(&self) -> u32 {
+        let sync_base_height = self.sync_base_height();
         if self.headers.is_empty() {
             // When headers is empty, sync_base_height represents our current position
             // This happens when we're syncing from a checkpoint but haven't received headers yet
-            self.sync_base_height
+            sync_base_height
         } else {
             // Normal case: base + number of headers - 1
-            self.sync_base_height + self.headers.len() as u32 - 1
+            sync_base_height + self.headers.len() as u32 - 1
         }
     }
 
@@ -348,19 +350,13 @@ impl ChainState {
 
     /// Get header at the given height.
     pub fn header_at_height(&self, height: u32) -> Option<&BlockHeader> {
-        if height < self.sync_base_height {
-            return None; // Height is before our sync base
-        }
-        let index = (height - self.sync_base_height) as usize;
+        let index = self.height_to_index(height)?;
         self.headers.get(index)
     }
 
     /// Get filter header at the given height.
     pub fn filter_header_at_height(&self, height: u32) -> Option<&FilterHeader> {
-        if height < self.sync_base_height {
-            return None; // Height is before our sync base
-        }
-        let index = (height - self.sync_base_height) as usize;
+        let index = self.height_to_index(height)?;
         self.filter_headers.get(index)
     }
 
@@ -452,44 +448,47 @@ impl ChainState {
     /// Initialize chain state from a checkpoint.
     pub fn init_from_checkpoint(
         &mut self,
-        checkpoint_height: u32,
-        checkpoint_header: BlockHeader,
+        checkpoint: Checkpoint,
         network: Network,
     ) {
         // Clear any existing headers
         self.headers.clear();
         self.filter_headers.clear();
 
-        // Set sync base height to checkpoint
-        self.sync_base_height = checkpoint_height;
-
-        // Add the checkpoint header as our first header
-        self.headers.push(checkpoint_header);
-
         tracing::info!(
             "Initialized ChainState from checkpoint - height: {}, hash: {}, network: {:?}",
-            checkpoint_height,
-            checkpoint_header.block_hash(),
+            checkpoint.height,
+            checkpoint.block_hash,
             network
         );
 
         // Initialize masternode engine for the network, starting from checkpoint
         let mut engine = MasternodeListEngine::default_for_network(network);
-        engine.feed_block_height(checkpoint_height, checkpoint_header.block_hash());
+        engine.feed_block_height(checkpoint.height, checkpoint.block_hash);
         self.masternode_engine = Some(engine);
+
+        self.sync_checkpoint = Some(checkpoint);
+    }
+
+    fn sync_base_height(&self) -> u32 {
+        match self.sync_checkpoint {
+            None => {0}
+            Some(checkpoint) => {checkpoint.height}
+        }
     }
 
     /// Get the absolute height for a given index in our headers vector.
     pub fn index_to_height(&self, index: usize) -> u32 {
-        self.sync_base_height + index as u32
+        self.sync_base_height() + index as u32
     }
 
     /// Get the index in our headers vector for a given absolute height.
     pub fn height_to_index(&self, height: u32) -> Option<usize> {
-        if height < self.sync_base_height {
+        let sync_base_height = self.sync_base_height();
+        if height < sync_base_height {
             None
         } else {
-            Some((height - self.sync_base_height) as usize)
+            Some((height - sync_base_height) as usize)
         }
     }
 }
@@ -503,7 +502,7 @@ impl std::fmt::Debug for ChainState {
             .field("last_chainlock_hash", &self.last_chainlock_hash)
             .field("current_filter_tip", &self.current_filter_tip)
             .field("last_masternode_diff_height", &self.last_masternode_diff_height)
-            .field("sync_base_height", &self.sync_base_height)
+            .field("sync_checkpoint", &self.sync_checkpoint)
             .finish()
     }
 }
