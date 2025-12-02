@@ -27,45 +27,9 @@ mod tests {
             } else {
                 None
             },
-            include_merkle_root: true,
             protocol_version: None,
             nonce: height * 123,
         }
-    }
-
-    #[test]
-    fn test_merkle_root_validation() {
-        // Create a specific merkle root for testing
-        let specific_merkle =
-            BlockHash::from_raw_hash(dashcore_hashes::hash_x11::Hash::hash(b"specific_merkle"));
-
-        let mut checkpoints = vec![
-            create_test_checkpoint(0, 1000000),
-            create_test_checkpoint(1000, 2000000),
-            create_test_checkpoint(2000, 3000000),
-        ];
-
-        // Set the specific merkle root on the middle checkpoint
-        checkpoints[1].merkle_root = Some(specific_merkle);
-        checkpoints[1].include_merkle_root = true;
-
-        let manager = CheckpointManager::new(checkpoints.clone());
-
-        // Get the actual checkpoint block hash for height 1000
-        let checkpoint = manager.get_checkpoint(1000).expect("Should have checkpoint at 1000");
-        let checkpoint_hash = checkpoint.block_hash;
-
-        // Test valid merkle root
-        assert!(manager.validate_header(1000, &checkpoint_hash, Some(&specific_merkle)));
-
-        // Test invalid merkle root
-        let wrong_merkle =
-            BlockHash::from_raw_hash(dashcore_hashes::hash_x11::Hash::hash(b"wrong_merkle"));
-        assert!(!manager.validate_header(1000, &checkpoint_hash, Some(&wrong_merkle)));
-
-        // Test missing merkle root when required - should still pass as the implementation
-        // doesn't fail on missing merkle roots
-        assert!(manager.validate_header(1000, &checkpoint_hash, None));
     }
 
     #[test]

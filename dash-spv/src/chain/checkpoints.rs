@@ -30,8 +30,6 @@ pub struct Checkpoint {
     pub chain_work: String,
     /// Masternode list identifier (e.g., "ML1088640__70218")
     pub masternode_list_name: Option<String>,
-    /// Whether to include merkle root in validation
-    pub include_merkle_root: bool,
     /// Protocol version at this checkpoint
     pub protocol_version: Option<u32>,
     /// Nonce value for the block
