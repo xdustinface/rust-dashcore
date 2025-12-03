@@ -466,7 +466,7 @@ impl ChainState {
     /// Initialize chain state from a checkpoint.
     pub fn init_from_checkpoint(
         &mut self,
-        checkpoint: Checkpoint,
+        checkpoint: &Checkpoint,
         network: Network,
     ) {
         // Clear any existing headers
@@ -485,7 +485,7 @@ impl ChainState {
         engine.feed_block_height(checkpoint.height, checkpoint.block_hash);
         self.masternode_engine = Some(engine);
 
-        self.sync_checkpoint = Some(checkpoint);
+        self.sync_checkpoint = Some(checkpoint.clone());
     }
 
     /// Get the absolute height for a given index in our headers vector.

@@ -317,69 +317,66 @@ impl<
             return Ok(());
         }
 
-        // Check if we should use a checkpoint instead of genesis
-        if let Some(start_height) = self.config.start_from_height {
-            // Get checkpoints for this network
-            let checkpoints = match self.config.network {
-                dashcore::Network::Dash => crate::chain::checkpoints::mainnet_checkpoints(),
-                dashcore::Network::Testnet => crate::chain::checkpoints::testnet_checkpoints(),
-                _ => vec![],
-            };
 
-            // Create checkpoint manager
-            let checkpoint_manager = crate::chain::checkpoints::CheckpointManager::new(checkpoints);
+        // Get checkpoints for this network
+        let checkpoints = match self.config.network {
+            dashcore::Network::Dash => crate::chain::checkpoints::mainnet_checkpoints(),
+            dashcore::Network::Testnet => crate::chain::checkpoints::testnet_checkpoints(),
+            _ => vec![],
+        };
 
-            // Find the best checkpoint at or before the requested height
-            if let Some(checkpoint) =
-                checkpoint_manager.best_checkpoint_at_or_before_height(start_height)
-            {
-                if checkpoint.height > 0 {
-                    tracing::info!(
-                        "🚀 Starting sync from checkpoint at height {} instead of genesis (requested start height: {})",
-                        checkpoint.height,
-                        start_height
-                    );
+        // Create checkpoint manager
+        let checkpoint_manager = crate::chain::checkpoints::CheckpointManager::new(checkpoints);
 
-                    // Initialize chain state with checkpoint
-                    let mut chain_state = self.state.write().await;
 
-                    // Initialize chain state from checkpoint
-                    chain_state.init_from_checkpoint(
-                        checkpoint.clone(),
-                        self.config.network,
-                    );
+        let checkpoint = if let Some(start_height) = self.config.start_from_height {
+            tracing::info!("Use checkpoint before start height: {}", start_height);
+            checkpoint_manager.best_checkpoint_at_or_before_height(start_height)
+        } else {
+            tracing::info!("Use last checkpoint");
+            checkpoint_manager.last_checkpoint()
+        };
 
-                    // Clone the chain state for storage
-                    let chain_state_for_storage = (*chain_state).clone();
-                    let headers_len = chain_state_for_storage.headers.len() as u32;
-                    drop(chain_state);
+        // Find the best checkpoint at or before the requested height
+        if let Some(checkpoint) = checkpoint {
+            if checkpoint.height > 0 {
 
-                    // Update storage with chain state including sync_base_height
-                    {
-                        let mut storage = self.storage.lock().await;
-                        storage
-                            .store_chain_state(&chain_state_for_storage)
-                            .await
-                            .map_err(SpvError::Storage)?;
-                    }
 
-                    // Don't store the checkpoint header itself - we'll request headers from peers
-                    // starting from this checkpoint
+                // Initialize chain state with checkpoint
+                let mut chain_state = self.state.write().await;
 
-                    tracing::info!(
-                        "✅ Initialized from checkpoint at height {}, skipping {} headers",
-                        checkpoint.height,
-                        checkpoint.height
-                    );
+                // Initialize chain state from checkpoint
+                chain_state.init_from_checkpoint(
+                    checkpoint,
+                    self.config.network,
+                );
 
-                    // Update the sync manager's cached flags from the checkpoint-initialized state
-                    self.sync_manager.update_chain_state_cache(checkpoint, headers_len);
-                    tracing::info!(
-                        "Updated sync manager with checkpoint-initialized chain state"
-                    );
+                // Clone the chain state for storage
+                let chain_state_for_storage = (*chain_state).clone();
+                let headers_len = chain_state_for_storage.headers.len() as u32;
+                drop(chain_state);
 
-                    return Ok(());
+                // Update storage with chain state including sync_base_height
+                {
+                    let mut storage = self.storage.lock().await;
+                    storage
+                        .store_chain_state(&chain_state_for_storage)
+                        .await
+                        .map_err(SpvError::Storage)?;
                 }
+
+                // Don't store the checkpoint header itself - we'll request headers from peers
+                // starting from this checkpoint
+
+                tracing::info!("Initialized from checkpoint at height {}", checkpoint.height);
+
+                // Update the sync manager's cached flags from the checkpoint-initialized state
+                self.sync_manager.update_chain_state_cache(checkpoint, headers_len);
+                tracing::info!(
+                    "Updated sync manager with checkpoint-initialized chain state"
+                );
+
+                return Ok(());
             }
         }
 

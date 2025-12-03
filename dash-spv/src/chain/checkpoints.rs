@@ -118,14 +118,14 @@ impl CheckpointManager {
     }
 
     /// Find the best checkpoint at or before a given height
-    pub fn best_checkpoint_at_or_before_height(&self, height: u32) -> Option<Checkpoint> {
+    pub fn best_checkpoint_at_or_before_height(&self, height: u32) -> Option<&Checkpoint> {
         let mut best_checkpoint = None;
         let mut best_height = 0;
 
         for checkpoint in self.checkpoints.values() {
             if checkpoint.height <= height && checkpoint.height >= best_height {
                 best_height = checkpoint.height;
-                best_checkpoint = Some(checkpoint.clone());
+                best_checkpoint = Some(checkpoint);
             }
         }
 

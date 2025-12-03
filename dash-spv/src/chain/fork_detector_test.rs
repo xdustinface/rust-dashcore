@@ -41,7 +41,7 @@ mod tests {
             block_hash: checkpoint_header.block_hash(),
             timestamp: checkpoint_header.time,
         };
-        chain_state.init_from_checkpoint(test_checkpoint, Network::Dash);
+        chain_state.init_from_checkpoint(&test_checkpoint, Network::Dash);
 
         // Add a checkpoint header at height 1000
         let checkpoint_header = create_test_header(BlockHash::from([0u8; 32]), 1000);

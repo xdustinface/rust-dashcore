@@ -827,7 +827,7 @@ mod tests {
             block_hash: headers[0].block_hash(),
             timestamp: headers[0].time,
         };
-        base_state.init_from_checkpoint(test_checkpoint, dashcore::Network::Testnet);
+        base_state.init_from_checkpoint(&test_checkpoint, dashcore::Network::Testnet);
         storage.store_chain_state(&base_state).await?;
 
         // Verify headers are stored at correct blockchain heights
@@ -863,7 +863,7 @@ mod tests {
             block_hash: headers[0].block_hash(),
             timestamp: headers[0].time,
         };
-        chain_state.init_from_checkpoint(persist_checkpoint, dashcore::Network::Testnet);
+        chain_state.init_from_checkpoint(&persist_checkpoint, dashcore::Network::Testnet);
         storage.store_chain_state(&chain_state).await?;
 
         // Force save to disk
