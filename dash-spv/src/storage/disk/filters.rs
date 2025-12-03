@@ -13,7 +13,7 @@ use super::segments::SegmentState;
 impl DiskStorageManager {
     /// Store filter headers.
     pub async fn store_filter_headers(&mut self, headers: &[FilterHeader]) -> StorageResult<()> {
-        let sync_base_height = *self.sync_base_height.read().await;
+        let sync_checkpoint = *self.sync_checkpoint.read().await;
 
         // Determine the next blockchain height
         let mut next_blockchain_height = {

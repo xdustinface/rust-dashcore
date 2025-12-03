@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use dashcore::{block::Header as BlockHeader, BlockHash, Txid};
 #[cfg(test)]
 use dashcore_hashes::Hash;
-
+use crate::chain::Checkpoint;
 use crate::error::StorageResult;
 use crate::storage::{MasternodeState, StorageManager, StorageStats};
 use crate::types::{ChainState, MempoolState, UnconfirmedTransaction};
@@ -17,13 +17,14 @@ impl DiskStorageManager {
     /// Store chain state to disk.
     pub async fn store_chain_state(&mut self, state: &ChainState) -> StorageResult<()> {
         // Update our sync_base_height
-        *self.sync_base_height.write().await = state.sync_base_height;
+        *self.sync_checkpoint.write().await = state.sync_checkpoint().copied();
 
+        // TODO: Check this
         // First store all headers
         // For checkpoint sync, we need to store headers starting from the checkpoint height
         if state.synced_from_checkpoint() && !state.headers.is_empty() {
             // Store headers starting from the checkpoint height
-            self.store_headers_from_height(&state.headers, state.sync_base_height).await?;
+            self.store_headers_from_height(&state.headers, state.sync_base_height()).await?;
         } else {
             self.store_headers_impl(&state.headers, None).await?;
         }
@@ -37,7 +38,7 @@ impl DiskStorageManager {
             "last_chainlock_hash": state.last_chainlock_hash,
             "current_filter_tip": state.current_filter_tip,
             "last_masternode_diff_height": state.last_masternode_diff_height,
-            "sync_base_height": state.sync_base_height,
+            "sync_checkpoint": state.sync_checkpoint(),
         });
 
         let path = self.base_path.join("state/chain.json");
@@ -62,7 +63,7 @@ impl DiskStorageManager {
 
         // Load all headers
         if let Some(tip_height) = self.get_tip_height().await? {
-            let range_start = state.sync_base_height;
+            let range_start = state.sync_base_height();
             state.headers = self.load_headers(range_start..tip_height + 1).await?;
         }
 
@@ -81,8 +82,8 @@ impl DiskStorageManager {
             value.get("last_masternode_diff_height").and_then(|v| v.as_u64()).map(|h| h as u32);
 
         // Load checkpoint sync fields
-        state.sync_base_height =
-            value.get("sync_base_height").and_then(|v| v.as_u64()).map(|h| h as u32).unwrap_or(0);
+        state.sync_checkpoint =
+            value.get("sync_checkpoint").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
 
         Ok(Some(state))
     }

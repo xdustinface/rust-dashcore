@@ -95,7 +95,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             _config: config.clone(),
             syncing_filter_headers: false,
             current_sync_height: 0,
-            sync_base_height: 0,
+            sync_checkpoint: None,
             last_sync_progress: std::time::Instant::now(),
             syncing_filters: false,
             pending_block_downloads: VecDeque::new(),
@@ -142,8 +142,8 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Convert absolute blockchain height to filter header storage index.
     /// Storage indexing is base-inclusive for filter headers as well.
     pub(super) fn filter_abs_to_storage_index(&self, height: u32) -> Option<u32> {
-        if self.sync_base_height > 0 {
-            height.checked_sub(self.sync_base_height)
+        if self.sync_base_height() > 0 {
+            height.checked_sub(self.sync_base_height())
         } else {
             Some(height)
         }

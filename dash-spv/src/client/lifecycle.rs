@@ -351,7 +351,7 @@ impl<
 
                     // Initialize chain state from checkpoint
                     chain_state.init_from_checkpoint(
-                        checkpoint,
+                        checkpoint.clone(),
                         self.config.network,
                     );
 

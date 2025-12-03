@@ -277,7 +277,7 @@ pub struct ChainState {
     pub last_masternode_diff_height: Option<u32>,
 
     /// Contains the checkpoint data when syncing from a checkpoint (None if syncing from genesis).
-    pub sync_checkpoint: Option<Checkpoint>,
+    sync_checkpoint: Option<Checkpoint>,
 }
 
 impl ChainState {
@@ -325,9 +325,22 @@ impl ChainState {
         state
     }
 
+    /// Get a reference to the sync checkpoint
+    pub fn sync_checkpoint(&self) -> Option<&Checkpoint> {
+        self.sync_checkpoint.as_ref()
+    }
+
     /// Whether the chain was synced from a checkpoint rather than genesis.
     pub fn synced_from_checkpoint(&self) -> bool {
         self.sync_checkpoint.is_some()
+    }
+
+    /// The start height of the sync
+    pub fn sync_base_height(&self) -> u32 {
+        match self.sync_checkpoint {
+            None => {0}
+            Some(checkpoint) => {checkpoint.height}
+        }
     }
 
     /// Get the current tip height.
@@ -468,13 +481,6 @@ impl ChainState {
         self.masternode_engine = Some(engine);
 
         self.sync_checkpoint = Some(checkpoint);
-    }
-
-    fn sync_base_height(&self) -> u32 {
-        match self.sync_checkpoint {
-            None => {0}
-            Some(checkpoint) => {checkpoint.height}
-        }
     }
 
     /// Get the absolute height for a given index in our headers vector.

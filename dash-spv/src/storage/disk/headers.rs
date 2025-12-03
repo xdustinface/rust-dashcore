@@ -34,7 +34,7 @@ impl DiskStorageManager {
 
         // Load chain state to get sync_base_height for proper blockchain height calculation
         let chain_state = self.load_chain_state().await?;
-        let sync_base_height = chain_state.as_ref().map(|cs| cs.sync_base_height).unwrap_or(0);
+        let sync_base_height = chain_state.as_ref().map(|cs| cs.sync_base_height()).unwrap_or(0);
 
         // Acquire write locks for the entire operation to prevent race conditions
         let mut cached_tip = self.cached_tip_height.write().await;
