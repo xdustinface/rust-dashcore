@@ -1,13 +1,65 @@
 //! Header validation functionality.
 
-use dashcore::{block::Header as BlockHeader, error::Error as DashError};
+use dashcore::{block::Header as BlockHeader, error::Error as DashError, BlockHash};
 use std::time::Instant;
 
 use crate::error::{ValidationError, ValidationResult};
-use crate::types::ValidationMode;
+use crate::types::{CachedHeader, ValidationMode};
+
+// Trait that allows types to be used in the header validation function
+pub trait ValidationHeader {
+    fn block_hash(&self) -> BlockHash;
+    fn prev_block_hash(&self) -> &BlockHash;
+    fn validate_pow(&self) -> ValidationResult<()>;
+}
+
+fn validate_pow(header: &BlockHeader) -> ValidationResult<()> {
+    let target = header.target();
+    if let Err(e) = header.validate_pow(target) {
+        return match e {
+            DashError::BlockBadProofOfWork => Err(ValidationError::InvalidProofOfWork),
+            DashError::BlockBadTarget => {
+                Err(ValidationError::InvalidHeaderChain("Invalid target".to_string()))
+            }
+            _ => Err(ValidationError::InvalidHeaderChain(format!("PoW validation error: {:?}", e))),
+        };
+    }
+    Ok(())
+}
+
+impl ValidationHeader for BlockHeader {
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash()
+    }
+
+    fn prev_block_hash(&self) -> &BlockHash {
+        &self.prev_blockhash
+    }
+
+    fn validate_pow(&self) -> ValidationResult<()> {
+        validate_pow(self)
+    }
+}
+
+impl ValidationHeader for CachedHeader {
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash()
+    }
+
+    fn prev_block_hash(&self) -> &BlockHash {
+        &self.header().prev_blockhash
+    }
+
+    fn validate_pow(&self) -> ValidationResult<()> {
+        validate_pow(self.header())
+    }
+}
 
 /// Validate a chain of headers considering the validation mode.
-pub fn validate_headers(headers: &[BlockHeader], mode: ValidationMode) -> ValidationResult<()> {
+pub fn validate_headers<H>(headers: &[H], mode: ValidationMode) -> ValidationResult<()>
+where
+    H: ValidationHeader,
+{
     if mode == ValidationMode::None {
         tracing::debug!("Skipping header validation: disabled");
         return Ok(());
@@ -20,11 +72,11 @@ pub fn validate_headers(headers: &[BlockHeader], mode: ValidationMode) -> Valida
 
     let start = Instant::now();
 
-    let mut prev_header_hash = None;
+    let mut prev_block_hash = None;
     for header in headers {
         // Check chain continuity if we have previous header
-        if let Some(prev) = prev_header_hash {
-            if header.prev_blockhash != prev {
+        if let Some(prev) = prev_block_hash {
+            if header.prev_block_hash() != &prev {
                 return Err(ValidationError::InvalidHeaderChain(
                     "Header does not connect to previous header".to_string(),
                 ));
@@ -33,22 +85,10 @@ pub fn validate_headers(headers: &[BlockHeader], mode: ValidationMode) -> Valida
 
         if mode == ValidationMode::Full {
             // Validate proof of work with X11 hashing
-            let target = header.target();
-            if let Err(e) = header.validate_pow(target) {
-                return match e {
-                    DashError::BlockBadProofOfWork => Err(ValidationError::InvalidProofOfWork),
-                    DashError::BlockBadTarget => {
-                        Err(ValidationError::InvalidHeaderChain("Invalid target".to_string()))
-                    }
-                    _ => Err(ValidationError::InvalidHeaderChain(format!(
-                        "PoW validation error: {:?}",
-                        e
-                    ))),
-                };
-            }
+            header.validate_pow()?;
         }
 
-        prev_header_hash = Some(header.block_hash());
+        prev_block_hash = Some(header.block_hash());
     }
 
     tracing::debug!(
