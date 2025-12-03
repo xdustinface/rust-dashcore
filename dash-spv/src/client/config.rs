@@ -146,6 +146,12 @@ pub struct ClientConfig {
     /// Used to determine appropriate checkpoint for sync.
     pub wallet_creation_time: Option<u32>,
 
+    /// Skip PoW validation for blocks before the last checkpoint during initial sync.
+    /// This dramatically speeds up IBD (Initial Block Download) but trusts hardcoded
+    /// checkpoint hashes. Once past the last checkpoint, Full validation is used.
+    /// Default: true (for faster initial sync).
+    pub trust_checkpoints_during_ibd: bool,
+
     // QRInfo configuration (simplified per plan)
     /// Request extra share data in QRInfo (default: false per DMLviewer.patch).
     pub qr_info_extra_share: bool,
@@ -194,6 +200,7 @@ impl Default for ClientConfig {
             blocks_request_rate_limit: None,
             start_from_height: None,
             wallet_creation_time: None,
+            trust_checkpoints_during_ibd: true,
             // CFHeaders flow control defaults
             max_concurrent_cfheaders_requests_parallel: 50,
             cfheaders_request_timeout_secs: 30,
@@ -327,6 +334,14 @@ impl ClientConfig {
     /// Set the starting height for synchronization.
     pub fn with_start_height(mut self, height: u32) -> Self {
         self.start_from_height = Some(height);
+        self
+    }
+
+    /// Set whether to trust checkpoints during initial block download.
+    /// When true (default), PoW validation is skipped for blocks before the last checkpoint,
+    /// dramatically speeding up initial sync. Set to false to validate all PoW.
+    pub fn with_trust_checkpoints_during_ibd(mut self, trust: bool) -> Self {
+        self.trust_checkpoints_during_ibd = trust;
         self
     }
 

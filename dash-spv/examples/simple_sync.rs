@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    init_logging("info")?;
+    init_logging("debug")?;
 
     // Create a simple configuration
     let config = ClientConfig::mainnet()

@@ -104,7 +104,7 @@ mod tests {
             block_hash: BlockHash::from([1u8; 32]),
             timestamp: genesis.time,
         };
-        chain_state.init_from_checkpoint(test_checkpoint, network);
+        chain_state.init_from_checkpoint(&test_checkpoint, network);
 
         // Current tip at height 50100
         let main_tip = ChainTip::new(genesis, 50100, ChainWork::from_header(&genesis));

@@ -379,7 +379,7 @@ impl<
     }
 
     /// Update the chain state (used for checkpoint sync initialization)
-    pub fn update_chain_state_cache(&mut self, sync_checkpoint: Checkpoint, headers_len: u32) {
+    pub fn update_chain_state_cache(&mut self, sync_checkpoint: &Checkpoint, headers_len: u32) {
         self.header_sync.update_cached_from_state_snapshot(sync_checkpoint, headers_len);
     }
 

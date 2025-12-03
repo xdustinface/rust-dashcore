@@ -14,6 +14,7 @@ use crate::network::NetworkManager;
 use crate::storage::StorageManager;
 use crate::sync::headers2::Headers2StateManager;
 use crate::types::{CachedHeader, ChainState};
+use crate::validation::validate_headers;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -241,45 +242,100 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         // Step 2: Validate Batch Connection Point
         let first_cached = &cached_headers[0];
         let first_header = first_cached.header();
-        let tip =
-            self.chain_state.read().await.get_tip_header().ok_or_else(|| {
-                SyncError::InvalidState("No tip header in chain state".to_string())
-            })?;
 
-        // Check if the first header connects to our tip
-        // Cache tip hash to avoid recomputing it
-        let tip_cached = CachedHeader::new(tip);
-        let tip_hash = tip_cached.block_hash();
+        // Get the expected prev_hash - either from our tip header or from checkpoint
+        let chain_state = self.chain_state.read().await;
+        let tip_opt = chain_state.get_tip_header();
+        let checkpoint_opt = chain_state.sync_checkpoint().copied();
+        drop(chain_state);
 
-        if first_header.prev_blockhash != tip_hash {
-            tracing::warn!(
-                "Received header batch that does not connect to our tip. Expected prev_hash: {}, got: {}. Dropping message.",
-                tip_hash,
-                first_header.prev_blockhash
-            );
-            // Gracefully drop the message and let timeout mechanism handle re-requesting
-            return Ok(true);
-        }
+        // Determine what hash the first header should connect to
+        let (expected_prev_hash, is_first_after_checkpoint) = match (tip_opt, checkpoint_opt) {
+            // Normal case: we have headers, check against tip
+            (Some(tip), _) => {
+                let tip_cached = CachedHeader::new(tip);
+                (tip_cached.block_hash(), false)
+            }
+            // Checkpoint sync with empty chain: first header must connect to checkpoint
+            (None, Some(checkpoint)) => {
+                tracing::info!(
+                    "🔐 CHECKPOINT VALIDATION: First header batch after checkpoint init. \
+                    Expecting prev_blockhash to match checkpoint block_hash at height {}",
+                    checkpoint.height
+                );
+                (checkpoint.block_hash, true)
+            }
+            // No tip and no checkpoint - invalid state
+            (None, None) => {
+                return Err(SyncError::InvalidState(
+                    "No tip header and no checkpoint in chain state".to_string(),
+                ));
+            }
+        };
 
-        // Special handling for checkpoint sync validation
-        if self.is_synced_from_checkpoint() && !headers.is_empty() {
-            // Check if this might be a genesis or very early block
-            let is_genesis = first_header.prev_blockhash == BlockHash::from_byte_array([0; 32]);
-            let is_early_block =
-                first_header.bits.to_consensus() == 0x1e0ffff0 || first_header.time < 1400000000;
-
-            if is_genesis || is_early_block {
+        // Validate connection point
+        if first_header.prev_blockhash != expected_prev_hash {
+            if is_first_after_checkpoint {
+                // This is critical - peer doesn't recognize our checkpoint
                 tracing::error!(
-                    "CHECKPOINT SYNC FAILED: Peer sent headers from genesis instead of connecting to checkpoint at height {}. \
-                    This indicates the checkpoint may not be valid for this network or the peer doesn't have it.",
+                    "🚫 CHECKPOINT VALIDATION FAILED: First header's prev_blockhash ({}) does not match \
+                    checkpoint block_hash ({}) at height {}. Peer does not recognize our checkpoint!",
+                    first_header.prev_blockhash,
+                    expected_prev_hash,
                     self.get_sync_base_height()
                 );
-                return Err(SyncError::InvalidState(format!(
-                    "Checkpoint sync failed: peer doesn't recognize checkpoint at height {}",
-                    self.get_sync_base_height()
+                return Err(SyncError::Validation(format!(
+                    "Checkpoint validation failed: peer's header does not connect to checkpoint at height {}. \
+                    Expected prev_hash: {}, got: {}",
+                    self.get_sync_base_height(),
+                    expected_prev_hash,
+                    first_header.prev_blockhash
                 )));
+            } else {
+                tracing::warn!(
+                    "Received header batch that does not connect to our tip. Expected prev_hash: {}, got: {}. Dropping message.",
+                    expected_prev_hash,
+                    first_header.prev_blockhash
+                );
+                // Gracefully drop the message and let timeout mechanism handle re-requesting
+                return Ok(true);
             }
         }
+
+        // Log successful checkpoint validation
+        if is_first_after_checkpoint {
+            tracing::info!(
+                "✅ CHECKPOINT VALIDATION PASSED: First header correctly connects to checkpoint at height {}. \
+                Block hash {} is confirmed by peer.",
+                self.get_sync_base_height(),
+                expected_prev_hash
+            );
+        }
+
+        // If trust_checkpoints_during_ibd is enabled and we're still before the last checkpoint,
+        // we use Basic validation (skip PoW) for faster initial sync. Once past checkpoints,
+        // we use the configured validation mode (typically Full).
+        let validation_mode = if self.config.trust_checkpoints_during_ibd
+            && self.config.validation_mode == ValidationMode::Full
+            && !self.is_past_checkpoints()
+        {
+            tracing::debug!(
+                "Using Basic validation (trusting checkpoints) - height {} is before last checkpoint",
+                self.total_headers_synced
+            );
+            ValidationMode::Basic
+        } else {
+            self.config.validation_mode
+        };
+
+        // Header Chain Validation: Verify chain linkage (and PoW in full validation mode)
+        // This ensures ALL headers in the batch link correctly to each other
+        validate_headers(&headers, validation_mode)
+            .map_err(|e| {
+                let error = format!("Header validation failed: {}", e);
+                tracing::error!(error);
+                SyncError::Validation(error)
+            })?;
 
         self.last_sync_progress = std::time::Instant::now();
 
@@ -420,17 +476,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             }
             None => {
                 // Check if we're syncing from a checkpoint
-                if self.is_synced_from_checkpoint()
-                    && !self.chain_state.read().await.headers.is_empty()
-                {
-                    // Use the checkpoint hash from chain state
-                    let checkpoint_hash = self.chain_state.read().await.headers[0].block_hash();
+                if let Some(checkpoint) = self.cached_sync_checkpoint {
                     tracing::info!(
-                        "📍 No base_hash provided but syncing from checkpoint at height {}. Using checkpoint hash: {}",
-                        self.get_sync_base_height(),
-                        checkpoint_hash
+                        "📍 No base_hash provided but syncing from checkpoint: {:?}",
+                        checkpoint
                     );
-                    vec![checkpoint_hash]
+                    vec![checkpoint.block_hash]
                 } else {
                     // Normal sync from genesis
                     let genesis_hash = self
@@ -1032,12 +1083,12 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Update cached flags and totals based on an external state snapshot
     pub fn update_cached_from_state_snapshot(
         &mut self,
-        sync_checkpoint: Checkpoint,
+        sync_checkpoint: &Checkpoint,
         headers_len: u32,
     ) {
         // Absolute blockchain tip height = base + headers_len - 1 (if any headers exist)
         self.total_headers_synced =
             sync_checkpoint.height.saturating_add(headers_len).saturating_sub(1);
-        self.cached_sync_checkpoint = Some(sync_checkpoint);
+        self.cached_sync_checkpoint = Some(sync_checkpoint.clone());
     }
 }

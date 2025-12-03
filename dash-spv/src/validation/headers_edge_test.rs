@@ -245,7 +245,8 @@ mod tests {
 
     #[test]
     fn test_single_header_chain_validation() {
-        let header = create_test_header_with_params(
+        // Test Basic mode with a fake header (no PoW validation)
+        let fake_header = create_test_header_with_params(
             0x20000000,
             dashcore::BlockHash::from_raw_hash(dashcore_hashes::hash_x11::Hash::from_byte_array(
                 [0; 32],
@@ -257,7 +258,7 @@ mod tests {
         );
 
         // Single header chain should validate
-        assert!(validate_headers(&[header], ValidationMode::Basic).is_ok());
+        assert!(validate_headers(&[fake_header], ValidationMode::Basic).is_ok());
     }
 
     #[test]
