@@ -15,6 +15,7 @@ use crate::client::ClientConfig;
 use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
+use crate::sync::headers::validate_headers;
 use crate::sync::headers2::Headers2StateManager;
 use crate::types::{CachedHeader, ChainState};
 use std::sync::Arc;
@@ -241,7 +242,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         let cached_headers: Vec<CachedHeader> =
             headers.iter().map(|h| CachedHeader::new(*h)).collect();
 
-        // Step 2: Validate Batch Connection Point
+        // Step 2: Validate Batch
         let first_cached = &cached_headers[0];
         let first_header = first_cached.header();
         let tip =
@@ -283,6 +284,14 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 )));
             }
         }
+
+        // Header Chain Validation: Verify chain linkage (and PoW in full validation mode)
+        // This ensures ALL headers in the batch link correctly to each other
+        validate_headers(&headers, self.config.validation_mode).map_err(|e| {
+            let error = format!("Header validation failed: {}", e);
+            tracing::error!(error);
+            SyncError::Validation(error)
+        })?;
 
         self.last_sync_progress = std::time::Instant::now();
 
