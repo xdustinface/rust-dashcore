@@ -69,8 +69,10 @@ name = "dash_spv"
 path = "src/lib.rs"
 
 [features]
+default = ["terminal-ui"]
+
 # Gate incomplete mock-dependent tests to avoid "unexpected cfg" warnings.
 skip_mock_implementation_incomplete = []
 
-# Terminal UI feature (off by default, for use by binary only)
+# Terminal UI feature
 terminal-ui = ["dep:crossterm"]
