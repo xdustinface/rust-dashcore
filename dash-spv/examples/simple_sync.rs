@@ -2,7 +2,7 @@
 
 use dash_spv::network::PeerNetworkManager;
 use dash_spv::storage::MemoryStorageManager;
-use dash_spv::{init_logging, ClientConfig, DashSpvClient};
+use dash_spv::{init_logging, ClientConfig, DashSpvClient, ValidationMode};
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 
 use key_wallet_manager::wallet_manager::WalletManager;

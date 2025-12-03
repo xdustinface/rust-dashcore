@@ -1,5 +1,6 @@
 //! Header validation functionality.
 
+use std::time::Instant;
 use dashcore::{
     block::Header as BlockHeader, error::Error as DashError, network::constants::NetworkExt,
     Network,
@@ -96,6 +97,8 @@ impl HeaderValidator {
             return Ok(());
         }
 
+        let start = Instant::now();
+
         // For the first header, we might need to check it connects to genesis or our existing chain
         // For now, we'll just validate internal chain continuity
 
@@ -116,9 +119,10 @@ impl HeaderValidator {
         }
 
         tracing::debug!(
-            "Header chain validation passed for {} headers in mode: {:?}",
+            "Header chain validation passed for {} headers in mode: {:?}, duration: {:?}",
             headers.len(),
-            self.mode
+            self.mode,
+            start.elapsed(),
         );
         Ok(())
     }

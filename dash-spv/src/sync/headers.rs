@@ -16,7 +16,8 @@ use crate::error::{SyncError, SyncResult};
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
 use crate::sync::headers2_state::Headers2StateManager;
-use crate::types::{CachedHeader, ChainState};
+use crate::types::{CachedHeader, ChainState, ValidationMode};
+use crate::validation::HeaderValidator;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -61,6 +62,7 @@ pub struct HeaderSyncManager<S: StorageManager, N: NetworkManager> {
     headers2_failed: bool,
     // Cached checkpoint for quick access without locking
     cached_sync_checkpoint: Option<Checkpoint>,
+    header_validator: HeaderValidator,
 }
 
 impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync + 'static>
@@ -82,6 +84,8 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         };
         let checkpoint_manager = CheckpointManager::new(checkpoints);
 
+        let header_validator = HeaderValidator::new(config.validation_mode, config.network);
+
         Ok(Self {
             config: config.clone(),
             fork_detector: ForkDetector::new(reorg_config.max_forks)
@@ -97,6 +101,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             last_sync_progress: std::time::Instant::now(),
             headers2_failed: false,
             cached_sync_checkpoint: None,
+            header_validator,
             _phantom_s: std::marker::PhantomData,
             _phantom_n: std::marker::PhantomData,
         })
@@ -241,7 +246,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         let cached_headers: Vec<CachedHeader> =
             headers.iter().map(|h| CachedHeader::new(*h)).collect();
 
-        // Step 2: Validate Batch Connection Point
+        // Step 2: Validate Batch
         let first_cached = &cached_headers[0];
         let first_header = first_cached.header();
 
@@ -313,6 +318,15 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 expected_prev_hash
             );
         }
+
+        // Header Chain Validation: Verify chain linkage (and PoW in full validation mode)
+        // This ensures ALL headers in the batch link correctly to each other
+        self.header_validator.validate_headers(&headers)
+            .map_err(|e| {
+                let error = format!("Header validation failed: {}", e);
+                tracing::error!(error);
+                SyncError::Validation(error)
+            })?;
 
         self.last_sync_progress = std::time::Instant::now();
 
