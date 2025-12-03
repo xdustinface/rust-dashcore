@@ -114,9 +114,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("terminal-ui")
-                .long("terminal-ui")
-                .help("Enable terminal UI status bar")
+            Arg::new("no-terminal-ui")
+                .long("no-terminal-ui")
+                .help("Disable terminal UI status bar")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -222,8 +222,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Validation mode: {:?}", validation_mode);
     tracing::info!("Sync strategy: Sequential");
 
-    // Check if terminal UI should be enabled
-    let enable_terminal_ui = matches.get_flag("terminal-ui");
+    // Terminal UI is enabled by default, can be disabled with --no-terminal-ui
+    let enable_terminal_ui = !matches.get_flag("no-terminal-ui");
 
     // Initialize logging first (without terminal UI)
     dash_spv::init_logging(log_level)?;
