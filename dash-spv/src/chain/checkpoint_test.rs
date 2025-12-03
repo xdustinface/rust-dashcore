@@ -3,70 +3,20 @@
 #[cfg(test)]
 mod tests {
     use super::super::checkpoints::*;
-    use dashcore::{BlockHash, CompactTarget, Target};
+    use dashcore::BlockHash;
     use dashcore_hashes::Hash;
 
     fn create_test_checkpoint(height: u32, timestamp: u32) -> Checkpoint {
         let hash_bytes = dashcore_hashes::hash_x11::Hash::hash(&height.to_le_bytes());
-        let prev_bytes = if height > 0 {
-            dashcore_hashes::hash_x11::Hash::hash(&(height - 1).to_le_bytes())
-        } else {
-            dashcore_hashes::hash_x11::Hash::all_zeros()
-        };
 
         Checkpoint {
             height,
             block_hash: BlockHash::from_raw_hash(hash_bytes),
-            prev_blockhash: BlockHash::from_raw_hash(prev_bytes),
             timestamp,
-            target: Target::from_compact(CompactTarget::from_consensus(0x1d00ffff)),
-            merkle_root: Some(BlockHash::from_raw_hash(hash_bytes)),
-            chain_work: format!("0x{:064x}", height * 1000),
-            masternode_list_name: if height.is_multiple_of(100000) && height > 0 {
-                Some(format!("ML{}__70230", height))
-            } else {
-                None
-            },
-            include_merkle_root: true,
-            protocol_version: None,
-            nonce: height * 123,
         }
     }
 
-    #[test]
-    fn test_merkle_root_validation() {
-        // Create a specific merkle root for testing
-        let specific_merkle =
-            BlockHash::from_raw_hash(dashcore_hashes::hash_x11::Hash::hash(b"specific_merkle"));
-
-        let mut checkpoints = vec![
-            create_test_checkpoint(0, 1000000),
-            create_test_checkpoint(1000, 2000000),
-            create_test_checkpoint(2000, 3000000),
-        ];
-
-        // Set the specific merkle root on the middle checkpoint
-        checkpoints[1].merkle_root = Some(specific_merkle);
-        checkpoints[1].include_merkle_root = true;
-
-        let manager = CheckpointManager::new(checkpoints.clone());
-
-        // Get the actual checkpoint block hash for height 1000
-        let checkpoint = manager.get_checkpoint(1000).expect("Should have checkpoint at 1000");
-        let checkpoint_hash = checkpoint.block_hash;
-
-        // Test valid merkle root
-        assert!(manager.validate_header(1000, &checkpoint_hash, Some(&specific_merkle)));
-
-        // Test invalid merkle root
-        let wrong_merkle =
-            BlockHash::from_raw_hash(dashcore_hashes::hash_x11::Hash::hash(b"wrong_merkle"));
-        assert!(!manager.validate_header(1000, &checkpoint_hash, Some(&wrong_merkle)));
-
-        // Test missing merkle root when required - should still pass as the implementation
-        // doesn't fail on missing merkle roots
-        assert!(manager.validate_header(1000, &checkpoint_hash, None));
-    }
+    // Note: test_merkle_root_validation removed - merkle_root is no longer part of Checkpoint
 
     #[test]
     fn test_wallet_creation_time_checkpoint_selection() {
@@ -176,27 +126,7 @@ mod tests {
         assert_eq!(manager.best_checkpoint_at_or_before_height(500000).unwrap().height, 300000);
     }
 
-    #[test]
-    fn test_checkpoint_protocol_version_extraction() {
-        let mut checkpoint = create_test_checkpoint(100000, 1500000000);
-
-        // Test with masternode list name
-        checkpoint.masternode_list_name = Some("ML100000__70227".to_string());
-        assert_eq!(checkpoint.protocol_version(), Some(70227));
-
-        // Test with explicit protocol version (should take precedence)
-        checkpoint.protocol_version = Some(70230);
-        assert_eq!(checkpoint.protocol_version(), Some(70230));
-
-        // Test with invalid masternode list format
-        checkpoint.protocol_version = None;
-        checkpoint.masternode_list_name = Some("ML100000_invalid".to_string());
-        assert_eq!(checkpoint.protocol_version(), None);
-
-        // Test with no masternode list
-        checkpoint.masternode_list_name = None;
-        assert_eq!(checkpoint.protocol_version(), None);
-    }
+    // Note: test_checkpoint_protocol_version_extraction removed - protocol_version is no longer part of Checkpoint
 
     #[test]
     fn test_checkpoint_binary_search_efficiency() {
@@ -321,9 +251,11 @@ mod tests {
             assert!(heights[i] > heights[i - 1]);
         }
 
+        // Verify all checkpoints have valid data (height, hash, timestamp)
         for checkpoint in &checkpoints {
             assert!(checkpoint.timestamp > 0);
-            assert!(!checkpoint.chain_work.is_empty());
+            // block_hash should not be all zeros
+            assert_ne!(checkpoint.block_hash, BlockHash::from([0u8; 32]));
         }
     }
 }

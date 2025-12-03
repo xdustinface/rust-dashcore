@@ -275,6 +275,7 @@ pub fn testnet_checkpoints() -> Vec<Checkpoint> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use dashcore_hashes::Hash;
     use super::*;
 
     #[test]

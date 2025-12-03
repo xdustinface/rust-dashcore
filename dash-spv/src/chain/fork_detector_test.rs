@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use crate::chain::Checkpoint;
     use crate::storage::{ChainStorage, MemoryStorage};
     use crate::types::ChainState;
     use dashcore::blockdata::constants::genesis_block;
@@ -31,8 +32,16 @@ mod tests {
         let storage = MemoryStorage::new();
         let mut chain_state = ChainState::new();
 
+        // Create a checkpoint header for testing
+        let checkpoint_header = create_test_header(BlockHash::from([0u8; 32]), 1000);
+
         // Simulate checkpoint sync from height 1000
-        chain_state.sync_base_height = 1000;
+        let test_checkpoint = Checkpoint {
+            height: 1000,
+            block_hash: checkpoint_header.block_hash(),
+            timestamp: checkpoint_header.time,
+        };
+        chain_state.init_from_checkpoint(test_checkpoint, Network::Dash);
 
         // Add a checkpoint header at height 1000
         let checkpoint_header = create_test_header(BlockHash::from([0u8; 32]), 1000);

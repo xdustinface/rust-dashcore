@@ -3,10 +3,10 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use crate::chain::ChainWork;
+    use crate::chain::{Checkpoint, ChainWork};
     use crate::storage::MemoryStorage;
     use crate::types::ChainState;
-    use dashcore::{blockdata::constants::genesis_block, Network};
+    use dashcore::{blockdata::constants::genesis_block, BlockHash, Network};
     use dashcore_hashes::Hash;
 
     fn create_test_header(prev: &BlockHeader, nonce: u32) -> BlockHeader {
@@ -99,7 +99,12 @@ mod tests {
         let storage = MemoryStorage::new();
 
         // Simulate checkpoint sync from height 50000
-        chain_state.sync_base_height = 50000;
+        let test_checkpoint = Checkpoint {
+            height: 50000,
+            block_hash: BlockHash::from([1u8; 32]),
+            timestamp: genesis.time,
+        };
+        chain_state.init_from_checkpoint(test_checkpoint, network);
 
         // Current tip at height 50100
         let main_tip = ChainTip::new(genesis, 50100, ChainWork::from_header(&genesis));
