@@ -1,5 +1,6 @@
 //! Configuration management for the Dash SPV client.
 
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -36,7 +37,7 @@ pub struct ClientConfig {
     pub restrict_to_configured_peers: bool,
 
     /// Optional path for persistent storage.
-    pub storage_path: Option<PathBuf>,
+    pub storage_path: PathBuf,
 
     /// Validation mode.
     pub validation_mode: ValidationMode,
@@ -160,7 +161,7 @@ impl Default for ClientConfig {
             network: Network::Dash,
             peers: vec![],
             restrict_to_configured_peers: false,
-            storage_path: None,
+            storage_path: env::temp_dir(),
             validation_mode: ValidationMode::Full,
             filter_checkpoint_interval: 1000,
             max_headers_per_message: 2000,
