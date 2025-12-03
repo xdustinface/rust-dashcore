@@ -102,14 +102,13 @@ impl<
             } => {
                 tracing::info!("📥 Starting filter header download phase");
 
-                // Get sync base height from header sync
-                let sync_base_height = self.header_sync.get_sync_base_height();
-                if sync_base_height > 0 {
+                // Get sync checkpoint from header sync
+                if let Some(checkpoint) = self.header_sync.get_checkpoint() {
                     tracing::info!(
-                        "Setting filter sync base height to {} for checkpoint sync",
-                        sync_base_height
+                        "Setting filter sync checkpoint to height {} for checkpoint sync",
+                        checkpoint.height
                     );
-                    self.filter_sync.set_sync_base_height(sync_base_height);
+                    self.filter_sync.set_sync_checkpoint(Some(checkpoint));
                 }
 
                 let sync_started =

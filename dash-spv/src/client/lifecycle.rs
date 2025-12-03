@@ -343,12 +343,6 @@ impl<
                     // Initialize chain state with checkpoint
                     let mut chain_state = self.state.write().await;
 
-                    // Build header from checkpoint
-                    use dashcore::{
-                        block::{Header as BlockHeader, Version},
-                        pow::CompactTarget,
-                    };
-
                     // Initialize chain state from checkpoint
                     chain_state.init_from_checkpoint(
                         checkpoint.clone(),

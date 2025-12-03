@@ -289,7 +289,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 "Skipping retry for range {}-{} because end is below checkpoint base {}",
                 start,
                 end,
-                self.sync_base_height
+                self.sync_base_height()
             );
             return Ok(());
         }

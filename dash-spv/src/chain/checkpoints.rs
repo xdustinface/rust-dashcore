@@ -6,10 +6,10 @@
 //! - Protect against deep reorganizations
 //! - Bootstrap masternode lists at specific heights
 
-use dashcore::{BlockHash, CompactTarget, Target};
-use dashcore_hashes::{hex, Hash};
+use dashcore::BlockHash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// A checkpoint representing a known valid block
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -130,15 +130,6 @@ impl CheckpointManager {
         }
 
         best_checkpoint
-    }
-
-    /// Get the last checkpoint that has a masternode list
-    pub fn last_checkpoint_having_masternode_list(&self) -> Option<&Checkpoint> {
-        self.sorted_heights
-            .iter()
-            .rev()
-            .filter_map(|height| self.checkpoints.get(height))
-            .find(|checkpoint| checkpoint.has_masternode_list())
     }
 
     /// Set override checkpoint for sync chain
@@ -368,19 +359,6 @@ mod tests {
 
         // Should not reject fork after last checkpoint
         assert!(!manager.should_reject_fork(2000000));
-    }
-
-    #[test]
-    #[ignore] // Test depends on specific mainnet checkpoint data
-    fn test_masternode_list_checkpoint() {
-        let checkpoints = mainnet_checkpoints();
-        let manager = CheckpointManager::new(checkpoints);
-
-        // Find last checkpoint with masternode list
-        let ml_checkpoint = manager.last_checkpoint_having_masternode_list();
-        assert!(ml_checkpoint.is_some());
-        assert!(ml_checkpoint.expect("Should have ML checkpoint").has_masternode_list());
-        assert_eq!(ml_checkpoint.expect("Should have ML checkpoint").height, 1900000);
     }
 
     #[test]

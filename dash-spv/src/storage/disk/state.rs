@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use dashcore::{block::Header as BlockHeader, BlockHash, Txid};
 #[cfg(test)]
 use dashcore_hashes::Hash;
-use crate::chain::Checkpoint;
 use crate::error::StorageResult;
 use crate::storage::{MasternodeState, StorageManager, StorageStats};
 use crate::types::{ChainState, MempoolState, UnconfirmedTransaction};
@@ -82,8 +81,9 @@ impl DiskStorageManager {
             value.get("last_masternode_diff_height").and_then(|v| v.as_u64()).map(|h| h as u32);
 
         // Load checkpoint sync fields
-        state.sync_checkpoint =
-            value.get("sync_checkpoint").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+        let checkpoint: Option<crate::chain::Checkpoint> =
+            value.get("sync_checkpoint").and_then(|v| serde_json::from_value(v.clone()).ok());
+        state.set_sync_checkpoint(checkpoint);
 
         Ok(Some(state))
     }
@@ -820,9 +820,14 @@ mod tests {
         // Store headers using checkpoint sync method
         storage.store_headers_from_height(&headers, checkpoint_height).await?;
 
-        // Set sync base height so storage interprets heights as blockchain heights
+        // Set sync checkpoint so storage interprets heights as blockchain heights
         let mut base_state = ChainState::new();
-        base_state.sync_base_height = checkpoint_height;
+        let test_checkpoint = crate::chain::Checkpoint {
+            height: checkpoint_height,
+            block_hash: headers[0].block_hash(),
+            timestamp: headers[0].time,
+        };
+        base_state.init_from_checkpoint(test_checkpoint, dashcore::Network::Testnet);
         storage.store_chain_state(&base_state).await?;
 
         // Verify headers are stored at correct blockchain heights
@@ -851,9 +856,14 @@ mod tests {
             "Hash should map to blockchain height 1,100,099"
         );
 
-        // Store chain state to persist sync_base_height
+        // Store chain state to persist sync_checkpoint
         let mut chain_state = ChainState::new();
-        chain_state.sync_base_height = checkpoint_height;
+        let persist_checkpoint = crate::chain::Checkpoint {
+            height: checkpoint_height,
+            block_hash: headers[0].block_hash(),
+            timestamp: headers[0].time,
+        };
+        chain_state.init_from_checkpoint(persist_checkpoint, dashcore::Network::Testnet);
         storage.store_chain_state(&chain_state).await?;
 
         // Force save to disk

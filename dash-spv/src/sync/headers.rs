@@ -1,11 +1,11 @@
 //! Header synchronization with fork detection and reorganization handling.
 
 use dashcore::{
-    block::{Header as BlockHeader, Version},
+    block::Header as BlockHeader,
     network::constants::NetworkExt,
     network::message::NetworkMessage,
     network::message_blockdata::GetHeadersMessage,
-    BlockHash, TxMerkleNode,
+    BlockHash,
 };
 use dashcore_hashes::Hash;
 
@@ -96,7 +96,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             syncing_headers: false,
             last_sync_progress: std::time::Instant::now(),
             headers2_failed: false,
-            cached_sync_base_height: 0,
+            cached_sync_checkpoint: None,
             _phantom_s: std::marker::PhantomData,
             _phantom_n: std::marker::PhantomData,
         })
@@ -104,15 +104,15 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     /// Load headers from storage into the chain state
     pub async fn load_headers_from_storage(&mut self, storage: &S) -> SyncResult<u32> {
-        // First, try to load the persisted chain state which may contain sync_base_height
+        // First, try to load the persisted chain state which may contain sync_checkpoint
         if let Ok(Some(stored_chain_state)) = storage.load_chain_state().await {
             tracing::info!(
                 "Loaded chain state from storage with sync_base_height: {}",
-                stored_chain_state.sync_base_height,
+                stored_chain_state.sync_base_height(),
             );
-            // Update our chain state with the loaded one to preserve sync_base_height
+            // Update our chain state with the loaded one to preserve sync_checkpoint
             {
-                self.cached_sync_base_height = stored_chain_state.sync_base_height;
+                self.cached_sync_checkpoint = stored_chain_state.sync_checkpoint().copied();
                 let mut cs = self.chain_state.write().await;
                 *cs = stored_chain_state;
             }
@@ -949,74 +949,15 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     }
 
     /// Pre-populate headers from checkpoints for fast initial sync
-    /// Note: This requires having prev_blockhash data for checkpoints
-    pub async fn prepopulate_from_checkpoints(&mut self, storage: &S) -> SyncResult<u32> {
-        // Check if we already have headers
-        if let Some(tip_height) = storage
-            .get_tip_height()
-            .await
-            .map_err(|e| SyncError::Storage(format!("Failed to get tip height: {}", e)))?
-        {
-            if tip_height > 0 {
-                tracing::debug!("Headers already exist in storage (height {}), skipping checkpoint prepopulation", tip_height);
-                return Ok(0);
-            }
-        }
-
-        tracing::info!("Pre-populating headers from checkpoints for fast sync");
-
-        // Now that we have prev_blockhash data, we can implement this!
-        let checkpoints = self.checkpoint_manager.checkpoint_heights();
-        let mut headers_to_insert = Vec::new();
-
-        for &height in checkpoints {
-            if let Some(checkpoint) = self.checkpoint_manager.get_checkpoint(height) {
-                // Convert checkpoint to header
-                let header = BlockHeader {
-                    version: Version::from_consensus(1),
-                    prev_blockhash: checkpoint.prev_blockhash,
-                    merkle_root: checkpoint
-                        .merkle_root
-                        .map(|hash| TxMerkleNode::from_byte_array(*hash.as_byte_array()))
-                        .unwrap_or_else(|| TxMerkleNode::from_byte_array([0u8; 32])),
-                    time: checkpoint.timestamp,
-                    bits: checkpoint.target.to_compact_lossy(),
-                    nonce: checkpoint.nonce,
-                };
-
-                // Verify the header hash matches the checkpoint
-                let calculated_hash = header.block_hash();
-                if calculated_hash != checkpoint.block_hash {
-                    tracing::error!(
-                        "Checkpoint hash mismatch at height {}: expected {:?}, got {:?}",
-                        height,
-                        checkpoint.block_hash,
-                        calculated_hash
-                    );
-                    continue;
-                }
-
-                headers_to_insert.push((height, header));
-            }
-        }
-
-        if headers_to_insert.is_empty() {
-            tracing::warn!("No valid headers to prepopulate from checkpoints");
-            return Ok(0);
-        }
-
-        tracing::info!("Prepopulating {} checkpoint headers", headers_to_insert.len());
-
-        // TODO: Implement batch storage operation
-        // For now, we'll need to store them one by one
-        let mut count = 0;
-        for (height, _header) in headers_to_insert {
-            // Note: This would need proper storage implementation
-            tracing::debug!("Would store checkpoint header at height {}", height);
-            count += 1;
-        }
-
-        Ok(count)
+    /// NOTE: With simplified checkpoints (height, hash, timestamp only), we cannot
+    /// reconstruct full block headers. Checkpoints are now used for validation only.
+    #[allow(dead_code)]
+    pub async fn prepopulate_from_checkpoints(&mut self, _storage: &S) -> SyncResult<u32> {
+        // Checkpoints no longer contain full header data (prev_blockhash, merkle_root, etc.)
+        // They are now used purely for validation: verifying that blocks at checkpoint
+        // heights have the expected hash.
+        tracing::debug!("Checkpoint prepopulation skipped - checkpoints are for validation only");
+        Ok(0)
     }
 
     /// Check if header sync is currently in progress
@@ -1096,9 +1037,14 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         self.chain_state.read().await.tip_hash()
     }
 
-    /// Get the sync base height (used when syncing from checkpoint)
+    /// Get the checkpoint (if syncing from one)
     pub fn get_checkpoint(&self) -> Option<Checkpoint> {
         self.cached_sync_checkpoint
+    }
+
+    /// Get the sync base height (0 if not syncing from checkpoint)
+    pub fn get_sync_base_height(&self) -> u32 {
+        self.cached_sync_checkpoint.map(|c| c.height).unwrap_or(0)
     }
 
     /// Whether we're syncing from a checkpoint

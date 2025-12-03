@@ -124,16 +124,22 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
     }
 
-    /// Set the base height for sync (typically from checkpoint)
-    pub fn set_sync_base_height(&mut self, height: u32) {
-        self.sync_base_height = height;
+    /// Set the checkpoint for sync
+    pub fn set_sync_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
+        self.sync_checkpoint = checkpoint;
+    }
+
+    /// Get the sync base height (0 if not syncing from checkpoint)
+    pub fn sync_base_height(&self) -> u32 {
+        self.sync_checkpoint.map(|c| c.height).unwrap_or(0)
     }
 
     /// Convert absolute blockchain height to block header storage index.
     /// Storage indexing is base-inclusive: at checkpoint base B, storage index 0 == absolute height B.
     pub(super) fn header_abs_to_storage_index(&self, height: u32) -> Option<u32> {
-        if self.sync_base_height > 0 {
-            height.checked_sub(self.sync_base_height)
+        let base = self.sync_base_height();
+        if base > 0 {
+            height.checked_sub(base)
         } else {
             Some(height)
         }
@@ -142,8 +148,9 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
     /// Convert absolute blockchain height to filter header storage index.
     /// Storage indexing is base-inclusive for filter headers as well.
     pub(super) fn filter_abs_to_storage_index(&self, height: u32) -> Option<u32> {
-        if self.sync_base_height() > 0 {
-            height.checked_sub(self.sync_base_height())
+        let base = self.sync_base_height();
+        if base > 0 {
+            height.checked_sub(base)
         } else {
             Some(height)
         }

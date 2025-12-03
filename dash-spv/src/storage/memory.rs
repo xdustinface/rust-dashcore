@@ -44,7 +44,7 @@ impl MemoryStorageManager {
     }
     pub fn sync_base_height(&self) -> u32 {
         match self.chain_state.as_ref() {
-            Some(state) => state.sync_base_height,
+            Some(state) => state.sync_base_height(),
             None => 0,
         }
     }

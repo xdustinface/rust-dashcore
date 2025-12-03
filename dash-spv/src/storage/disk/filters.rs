@@ -13,7 +13,7 @@ use super::segments::SegmentState;
 impl DiskStorageManager {
     /// Store filter headers.
     pub async fn store_filter_headers(&mut self, headers: &[FilterHeader]) -> StorageResult<()> {
-        let sync_checkpoint = *self.sync_checkpoint.read().await;
+        let sync_base_height = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
 
         // Determine the next blockchain height
         let mut next_blockchain_height = {
@@ -92,7 +92,7 @@ impl DiskStorageManager {
 
     /// Load filter headers for a blockchain height range.
     pub async fn load_filter_headers(&self, range: Range<u32>) -> StorageResult<Vec<FilterHeader>> {
-        let sync_base_height = *self.sync_base_height.read().await;
+        let sync_base_height = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
         let mut filter_headers = Vec::new();
 
         // Convert blockchain height range to storage index range
@@ -144,7 +144,7 @@ impl DiskStorageManager {
         &self,
         blockchain_height: u32,
     ) -> StorageResult<Option<FilterHeader>> {
-        let sync_base_height = *self.sync_base_height.read().await;
+        let sync_base_height = self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0);
 
         // Convert blockchain height to storage index
         let storage_index = if sync_base_height > 0 {

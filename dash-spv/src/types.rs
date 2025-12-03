@@ -330,6 +330,11 @@ impl ChainState {
         self.sync_checkpoint.as_ref()
     }
 
+    /// Set the sync checkpoint (used when loading from storage)
+    pub fn set_sync_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
+        self.sync_checkpoint = checkpoint;
+    }
+
     /// Whether the chain was synced from a checkpoint rather than genesis.
     pub fn synced_from_checkpoint(&self) -> bool {
         self.sync_checkpoint.is_some()

@@ -128,6 +128,11 @@ impl DiskStorageManager {
         Ok(storage)
     }
 
+    /// Get the sync base height (0 if not syncing from checkpoint)
+    pub async fn sync_base_height(&self) -> u32 {
+        self.sync_checkpoint.read().await.map(|c| c.height).unwrap_or(0)
+    }
+
     /// Start the background worker and notification channel.
     pub(super) async fn start_worker(&mut self) {
         use super::io::{save_filter_segment_to_disk, save_index_to_disk, save_segment_to_disk};

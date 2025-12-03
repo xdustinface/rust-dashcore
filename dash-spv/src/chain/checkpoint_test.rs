@@ -242,7 +242,6 @@ mod tests {
         assert!(manager.last_checkpoint().is_none());
         assert!(manager.last_checkpoint_before_height(100000).is_none());
         assert!(manager.last_checkpoint_before_timestamp(1700000000).is_none());
-        assert!(manager.last_checkpoint_having_masternode_list().is_none());
         assert!(manager.checkpoint_heights().is_empty());
         assert!(manager.is_past_last_checkpoint(0));
         assert!(!manager.should_reject_fork(100000));
@@ -299,21 +298,16 @@ mod tests {
             assert!(heights[i] > heights[i - 1], "Checkpoints not in ascending order");
         }
 
-        // Verify all checkpoints have valid data
+        // Verify all checkpoints have valid data (height, hash, timestamp)
         for checkpoint in &checkpoints {
             assert!(checkpoint.timestamp > 0);
-            assert!(checkpoint.nonce > 0);
-            assert!(!checkpoint.chain_work.is_empty());
-
-            if checkpoint.height > 0 {
-                assert_ne!(checkpoint.prev_blockhash, BlockHash::from([0u8; 32]));
-            }
+            // block_hash should not be all zeros
+            assert_ne!(checkpoint.block_hash, BlockHash::from([0u8; 32]));
         }
 
-        // Verify masternode list checkpoints
-        let ml_checkpoint = manager.last_checkpoint_having_masternode_list();
-        assert!(ml_checkpoint.is_some());
-        assert!(ml_checkpoint.unwrap().protocol_version().is_some());
+        // Verify we have the last checkpoint
+        let last_checkpoint = manager.last_checkpoint();
+        assert!(last_checkpoint.is_some());
     }
 
     #[test]
