@@ -1,6 +1,7 @@
 //! Header validation functionality.
 
 use dashcore::{block::Header as BlockHeader, error::Error as DashError};
+use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::error::{ValidationError, ValidationResult};
@@ -32,20 +33,20 @@ pub fn validate_headers(headers: &[BlockHeader], mode: ValidationMode) -> Valida
         }
 
         if mode == ValidationMode::Full {
-            // Validate proof of work with X11 hashing
-            let target = header.target();
-            if let Err(e) = header.validate_pow(target) {
-                return match e {
-                    DashError::BlockBadProofOfWork => Err(ValidationError::InvalidProofOfWork),
+            // Parallelized proof of work validation
+            headers.par_iter().try_for_each(|header| {
+                let target = header.target();
+                header.validate_pow(target).map(|_| ()).map_err(|e| match e {
+                    DashError::BlockBadProofOfWork => ValidationError::InvalidProofOfWork,
                     DashError::BlockBadTarget => {
-                        Err(ValidationError::InvalidHeaderChain("Invalid target".to_string()))
+                        ValidationError::InvalidHeaderChain("Invalid target".to_string())
                     }
-                    _ => Err(ValidationError::InvalidHeaderChain(format!(
+                    _ => ValidationError::InvalidHeaderChain(format!(
                         "PoW validation error: {:?}",
                         e
-                    ))),
-                };
-            }
+                    )),
+                })
+            })?;
         }
 
         prev_header_hash = Some(header.block_hash());
