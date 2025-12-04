@@ -61,6 +61,12 @@ impl DiskStorageManager {
 
         let mut state = ChainState::default();
 
+        // Load checkpoint sync fields
+        state.sync_base_height =
+            value.get("sync_base_height").and_then(|v| v.as_u64()).map(|h| h as u32).unwrap_or(0);
+        state.synced_from_checkpoint =
+            value.get("synced_from_checkpoint").and_then(|v| v.as_bool()).unwrap_or(false);
+
         // Load all headers
         if let Some(tip_height) = self.get_tip_height().await? {
             let range_start = if state.synced_from_checkpoint && state.sync_base_height > 0 {
@@ -84,12 +90,6 @@ impl DiskStorageManager {
             value.get("current_filter_tip").and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
         state.last_masternode_diff_height =
             value.get("last_masternode_diff_height").and_then(|v| v.as_u64()).map(|h| h as u32);
-
-        // Load checkpoint sync fields
-        state.sync_base_height =
-            value.get("sync_base_height").and_then(|v| v.as_u64()).map(|h| h as u32).unwrap_or(0);
-        state.synced_from_checkpoint =
-            value.get("synced_from_checkpoint").and_then(|v| v.as_bool()).unwrap_or(false);
 
         Ok(Some(state))
     }

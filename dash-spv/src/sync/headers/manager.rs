@@ -107,6 +107,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     /// Load headers from storage into the chain state
     pub async fn load_headers_from_storage(&mut self, storage: &S) -> SyncResult<u32> {
+        let start_time = std::time::Instant::now();
         // First, try to load the persisted chain state which may contain sync_base_height
         if let Ok(Some(stored_chain_state)) = storage.load_chain_state().await {
             tracing::info!(
@@ -145,87 +146,18 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         }
 
         tracing::info!("Loading {} headers from storage into HeaderSyncManager", tip_height);
-        let start_time = std::time::Instant::now();
-
-        // Load headers in batches
-        const BATCH_SIZE: u32 = 10_000;
-        let mut loaded_count = 0u32;
-
-        // Determine the first blockchain height we need to load.
-        // For checkpoint syncs we start at the checkpoint base; otherwise we skip genesis (already present).
-        let base_height = if self.is_synced_from_checkpoint() && self.get_sync_base_height() > 0 {
-            self.get_sync_base_height()
-        } else {
-            1
-        };
-
-        let mut current_height = base_height;
-
-        while current_height <= tip_height {
-            let end_height = (current_height + BATCH_SIZE - 1).min(tip_height);
-
-            // Load batch from storage
-            let headers_result = storage.load_headers(current_height..end_height + 1).await;
-
-            match headers_result {
-                Ok(headers) if !headers.is_empty() => {
-                    // Add headers to chain state
-                    {
-                        let mut cs = self.chain_state.write().await;
-                        for header in headers {
-                            cs.add_header(header);
-                            loaded_count += 1;
-                        }
-                    }
-                }
-                Ok(_) => {
-                    // Empty headers - this can happen for checkpoint sync with minimal headers
-                    tracing::debug!(
-                        "No headers found for range {}..{} - continuing",
-                        current_height,
-                        end_height + 1
-                    );
-                    // Break out of the loop since we've reached the end of available headers
-                    break;
-                }
-                Err(e) => {
-                    // For checkpoint sync with only 1 header stored, this is expected
-                    if self.is_synced_from_checkpoint() && loaded_count == 0 && tip_height == 0 {
-                        tracing::info!(
-                            "No additional headers to load for checkpoint sync - this is expected"
-                        );
-                        return Ok(0);
-                    }
-                    return Err(SyncError::Storage(format!("Failed to load headers: {}", e)));
-                }
-            }
-
-            // Progress logging
-            if loaded_count.is_multiple_of(50_000) || loaded_count == tip_height {
-                let elapsed = start_time.elapsed();
-                let headers_per_sec = loaded_count as f64 / elapsed.as_secs_f64();
-                tracing::info!(
-                    "Loaded {}/{} headers ({:.0} headers/sec)",
-                    loaded_count,
-                    tip_height,
-                    headers_per_sec
-                );
-            }
-
-            current_height = end_height + 1;
-        }
 
         self.total_headers_synced = tip_height;
-
+        let header_count = self.chain_state.read().await.headers.len();
         let elapsed = start_time.elapsed();
         tracing::info!(
             "✅ Loaded {} headers into HeaderSyncManager in {:.2}s ({:.0} headers/sec)",
-            loaded_count,
+            header_count,
             elapsed.as_secs_f64(),
-            loaded_count as f64 / elapsed.as_secs_f64()
+            header_count as f64 / elapsed.as_secs_f64()
         );
 
-        Ok(loaded_count)
+        Ok(header_count as u32)
     }
 
     /// Handle a Headers message
@@ -339,18 +271,38 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
         // Checkpoint Validation: Perform in-memory security check against checkpoints
         let current_height = self.chain_state.read().await.get_height();
+        let batch_start_height = current_height + 1;
+        let batch_end_height = current_height + cached_headers.len() as u32;
+        tracing::debug!(
+            "Processing batch: chain_state_height={}, batch_range={}..{} ({} headers)",
+            current_height, batch_start_height, batch_end_height, cached_headers.len()
+        );
         for (index, cached_header) in cached_headers.iter().enumerate() {
             let prospective_height = current_height + (index as u32) + 1;
+            let header_hash = cached_header.block_hash();
+            let prev_hash = cached_header.header().prev_blockhash;
 
+            // Only log at checkpoint heights for cleaner output
+            if let Some(checkpoint) = self.checkpoint_manager.get_checkpoint(prospective_height) {
+                tracing::info!(
+                    "🔍 CHECKPOINT CHECK: height={}, received_hash={}, expected_hash={}, prev_blockhash={}",
+                    prospective_height, header_hash, checkpoint.block_hash, prev_hash
+                );
+            }
             if self.reorg_config.enforce_checkpoints {
                 // Use cached hash to avoid redundant X11 computation in loop
                 let header_hash = cached_header.block_hash();
                 if !self.checkpoint_manager.validate_block(prospective_height, &header_hash) {
+                    let checkpoint = self.checkpoint_manager.get_checkpoint(prospective_height);
+                    tracing::error!(
+                        "❌ CHECKPOINT MISMATCH at height {}: received={}, expected={:?}",
+                        prospective_height, header_hash, checkpoint.map(|c| c.block_hash)
+                    );
                     return Err(SyncError::Validation(format!(
                         "Block at height {} with hash {} does not match checkpoint {:?}",
                         prospective_height,
                         header_hash,
-                        self.checkpoint_manager.get_checkpoint(prospective_height),
+                        checkpoint,
                     )));
                 }
             }
@@ -990,7 +942,7 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
 
     /// Pre-populate headers from checkpoints for fast initial sync
     /// Note: This requires having prev_blockhash data for checkpoints
-    pub async fn prepopulate_from_checkpoints(&mut self, storage: &S) -> SyncResult<u32> {
+    async fn prepopulate_from_checkpoints(&mut self, storage: &S) -> SyncResult<u32> {
         // Check if we already have headers
         if let Some(tip_height) = storage
             .get_tip_height()
