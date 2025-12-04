@@ -263,8 +263,9 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
         let tip_hash = tip_cached.block_hash();
 
         if first_header.prev_blockhash != tip_hash {
-            tracing::warn!(
-                "Received header batch that does not connect to our tip. Expected prev_hash: {}, got: {}. Dropping message.",
+            tracing::error!(
+                "Received header batch that does not connect to our tip at height {}. Expected prev_hash: {}, got: {}. Dropping message.",
+                self.total_headers_synced,
                 tip_hash,
                 first_header.prev_blockhash
             );
@@ -321,8 +322,10 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
                 let header_hash = cached_header.block_hash();
                 if !self.checkpoint_manager.validate_block(prospective_height, &header_hash) {
                     return Err(SyncError::Validation(format!(
-                        "Block at height {} does not match checkpoint",
-                        prospective_height
+                        "Block at height {} with hash {} does not match checkpoint {:?}",
+                        prospective_height,
+                        header_hash,
+                        self.checkpoint_manager.get_checkpoint(prospective_height),
                     )));
                 }
             }
