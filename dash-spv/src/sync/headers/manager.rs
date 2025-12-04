@@ -17,7 +17,7 @@ use crate::network::NetworkManager;
 use crate::storage::StorageManager;
 use crate::sync::headers::validate_headers;
 use crate::sync::headers2::Headers2StateManager;
-use crate::types::{CachedHeader, ChainState};
+use crate::types::{CachedHeader, ChainState, ValidationMode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -285,9 +285,25 @@ impl<S: StorageManager + Send + Sync + 'static, N: NetworkManager + Send + Sync 
             }
         }
 
+        // If trust_checkpoints_during_ibd is enabled and we're still before the last checkpoint,
+        // we use Basic validation (skip PoW) for faster initial sync. Once past checkpoints,
+        // we use the configured validation mode (typically Full).
+        let validation_mode = if self.config.trust_checkpoints_during_ibd
+            && self.config.validation_mode == ValidationMode::Full
+            && !self.is_past_checkpoints()
+        {
+            tracing::debug!(
+                "Using Basic validation (trusting checkpoints) - height {} is before last checkpoint",
+                self.total_headers_synced
+            );
+            ValidationMode::Basic
+        } else {
+            self.config.validation_mode
+        };
+
         // Header Chain Validation: Verify chain linkage (and PoW in full validation mode)
         // This ensures ALL headers in the batch link correctly to each other
-        validate_headers(&headers, self.config.validation_mode).map_err(|e| {
+        validate_headers(&headers, validation_mode).map_err(|e| {
             let error = format!("Header validation failed: {}", e);
             tracing::error!(error);
             SyncError::Validation(error)
