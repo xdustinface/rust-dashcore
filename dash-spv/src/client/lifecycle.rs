@@ -17,9 +17,8 @@ use crate::error::{Result, SpvError};
 use crate::mempool_filter::MempoolFilter;
 use crate::network::NetworkManager;
 use crate::storage::StorageManager;
-use crate::sync::sequential::SequentialSyncManager;
+use crate::sync::SyncManager;
 use crate::types::{ChainState, MempoolState, SpvStats};
-use crate::validation::ValidationManager;
 use dashcore::network::constants::NetworkExt;
 use dashcore_hashes::Hash;
 use key_wallet_manager::wallet_interface::WalletInterface;
@@ -52,7 +51,7 @@ impl<
         // Create sync manager
         let received_filter_heights = stats.read().await.received_filter_heights.clone();
         tracing::info!("Creating sequential sync manager");
-        let sync_manager = SequentialSyncManager::new(
+        let sync_manager = SyncManager::new(
             &config,
             received_filter_heights,
             wallet.clone(),
@@ -60,9 +59,6 @@ impl<
             stats.clone(),
         )
         .map_err(SpvError::Sync)?;
-
-        // Create validation manager
-        let validation = ValidationManager::new(config.validation_mode);
 
         // Create ChainLock manager
         let chainlock_manager = Arc::new(ChainLockManager::new(true));
@@ -87,7 +83,6 @@ impl<
             storage,
             wallet,
             sync_manager,
-            validation,
             chainlock_manager,
             running: Arc::new(RwLock::new(false)),
             #[cfg(feature = "terminal-ui")]
