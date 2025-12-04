@@ -108,7 +108,7 @@ impl CheckpointManager {
     /// Check if a block hash matches the checkpoint at the given height
     pub fn validate_block(&self, height: u32, block_hash: &BlockHash) -> bool {
         match self.checkpoints.get(&height) {
-            Some(checkpoint) => checkpoint.block_hash == *block_hash,
+            Some(checkpoint) => &checkpoint.block_hash == block_hash,
             None => true, // No checkpoint at this height, so it's valid
         }
     }
