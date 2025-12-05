@@ -272,7 +272,7 @@ impl<
                             ))?
                     } else {
                         // Genesis block case
-                        dashcore::blockdata::constants::genesis_block(self.config.network)
+                        dashcore::blockdata::constants::genesis_header(self.config.network)
                             .block_hash()
                     };
 
@@ -321,7 +321,7 @@ impl<
                             "Previous block not found for CFHeaders stop".to_string(),
                         ))?
                 } else {
-                    dashcore::blockdata::constants::genesis_block(self.config.network).block_hash()
+                    dashcore::blockdata::constants::genesis_header(self.config.network).block_hash()
                 };
 
                 // Resolve the absolute blockchain height for stop_hash

@@ -94,14 +94,11 @@ impl OutPoint {
     /// # Examples
     ///
     /// ```rust
-    /// use dashcore::blockdata::constants::genesis_block;
-    /// use dashcore::Network;
+    /// use dashcore::blockdata::transaction::outpoint::OutPoint;
     ///
-    /// let block = genesis_block(Network::Dash);
-    /// let tx = &block.txdata[0];
-    ///
-    /// // Coinbase transactions don't have any previous output.
-    /// assert!(tx.input[0].previous_output.is_null());
+    /// // Coinbase transactions use a null OutPoint for their input.
+    /// let null_outpoint = OutPoint::null();
+    /// assert!(null_outpoint.is_null());
     /// ```
     #[inline]
     pub fn is_null(&self) -> bool {

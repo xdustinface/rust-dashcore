@@ -5,14 +5,14 @@ mod tests {
     use super::super::*;
     use crate::storage::{ChainStorage, MemoryStorage};
     use crate::types::ChainState;
-    use dashcore::blockdata::constants::genesis_block;
+    use dashcore::blockdata::constants::genesis_header;
     use dashcore::{BlockHash, Header as BlockHeader, Network};
     use dashcore_hashes::Hash;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
     fn create_test_header(prev_hash: BlockHash, nonce: u32) -> BlockHeader {
-        let mut header = genesis_block(Network::Dash).header;
+        let mut header = genesis_header(Network::Dash);
         header.prev_blockhash = prev_hash;
         header.nonce = nonce;
         header.time = 1390095618 + nonce * 600; // Increment time for each block
@@ -68,7 +68,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Setup genesis and main chain
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -120,7 +120,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Setup genesis and build a main chain
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -159,7 +159,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Setup genesis and build a main chain
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -205,7 +205,7 @@ mod tests {
         let chain_state = Arc::new(Mutex::new(ChainState::new()));
 
         // Setup genesis
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.lock().unwrap().add_header(genesis);
 
@@ -285,7 +285,7 @@ mod tests {
         assert!(matches!(result, ForkDetectionResult::Orphan));
 
         // Add genesis
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -308,7 +308,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Setup genesis and build a main chain
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -353,7 +353,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Add genesis to storage and chain state
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis");
         chain_state.add_header(genesis);
 
@@ -373,7 +373,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Add headers to chain state but not storage (simulating sync issue)
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         chain_state.add_header(genesis);
 
         let header1 = create_test_header(genesis.block_hash(), 1);

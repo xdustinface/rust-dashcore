@@ -7,7 +7,7 @@ mod tests {
     use crate::types::ValidationMode;
     use dashcore::{
         block::{Header as BlockHeader, Version},
-        blockdata::constants::genesis_block,
+        blockdata::constants::genesis_header,
         Network,
     };
     use dashcore_hashes::Hash;
@@ -255,7 +255,7 @@ mod tests {
         let mut validator = HeaderValidator::new(ValidationMode::Basic);
         validator.set_network(Network::Dash);
 
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         let valid_header =
             create_test_header(genesis.block_hash(), 1, 0x1e0fffff, genesis.time + 600);
 
@@ -284,7 +284,7 @@ mod tests {
         let mut validator = HeaderValidator::new(ValidationMode::Basic);
         validator.set_network(Network::Testnet);
 
-        let genesis = genesis_block(Network::Testnet).header;
+        let genesis = genesis_header(Network::Testnet);
         let valid_header =
             create_test_header(genesis.block_hash(), 1, 0x1e0fffff, genesis.time + 600);
 
@@ -350,7 +350,7 @@ mod tests {
         for network in [Network::Dash, Network::Testnet] {
             validator.set_network(network);
 
-            let genesis = genesis_block(network).header;
+            let genesis = genesis_header(network);
             let valid_header =
                 create_test_header(genesis.block_hash(), 1, 0x1e0fffff, genesis.time + 600);
 

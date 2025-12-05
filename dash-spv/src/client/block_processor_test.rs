@@ -7,7 +7,14 @@ mod tests {
     use crate::storage::memory::MemoryStorageManager;
     use crate::storage::StorageManager;
     use crate::types::{SpvEvent, SpvStats};
-    use dashcore::{blockdata::constants::genesis_block, Block, Network, Transaction};
+    use dashcore::block::{Header, Version};
+    use dashcore::blockdata::constants::genesis_header;
+    use dashcore::blockdata::transaction::outpoint::OutPoint;
+    use dashcore::blockdata::transaction::txin::TxIn;
+    use dashcore::blockdata::transaction::txout::TxOut;
+    use dashcore::blockdata::witness::Witness;
+    use dashcore::{Block, CompactTarget, Network, ScriptBuf, Transaction};
+    use dashcore_hashes::Hash;
 
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -88,7 +95,21 @@ mod tests {
     }
 
     fn create_test_block(network: Network) -> Block {
-        genesis_block(network)
+        // Create a minimal coinbase transaction for testing
+        let coinbase_tx = Transaction {
+            version: 1,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xFFFFFFFF,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut { value: 50 * 100_000_000, script_pubkey: ScriptBuf::new() }],
+            special_transaction_payload: None,
+        };
+
+        Block { header: genesis_header(network), txdata: vec![coinbase_tx] }
     }
 
     async fn setup_processor() -> (

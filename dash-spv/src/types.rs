@@ -292,21 +292,8 @@ impl ChainState {
     pub fn new_for_network(network: Network) -> Self {
         let mut state = Self::default();
 
-        // Initialize with genesis block
-        let genesis_header = match network {
-            Network::Dash => {
-                // Use known genesis for mainnet
-                dashcore::blockdata::constants::genesis_block(network).header
-            }
-            Network::Testnet => {
-                // Use known genesis for testnet
-                dashcore::blockdata::constants::genesis_block(network).header
-            }
-            _ => {
-                // For other networks, use the existing genesis block function
-                dashcore::blockdata::constants::genesis_block(network).header
-            }
-        };
+        // Initialize with genesis header
+        let genesis_header = dashcore::blockdata::constants::genesis_header(network);
 
         // Add genesis header to the chain state
         state.headers.push(genesis_header);

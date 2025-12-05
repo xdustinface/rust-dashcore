@@ -7,7 +7,7 @@ mod tests {
     use crate::types::ValidationMode;
     use dashcore::{
         block::{Header as BlockHeader, Version},
-        blockdata::constants::genesis_block,
+        blockdata::constants::genesis_header,
         CompactTarget, Network,
     };
     use dashcore_hashes::Hash;
@@ -37,7 +37,7 @@ mod tests {
 
         for network in [Network::Dash, Network::Testnet, Network::Regtest] {
             validator.set_network(network);
-            let genesis = genesis_block(network).header;
+            let genesis = genesis_header(network);
 
             // Genesis block should validate with no previous header
             assert!(validator.validate(&genesis, None).is_ok());

@@ -237,12 +237,12 @@ pub enum ForkDetectionResult {
 mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
-    use dashcore::blockdata::constants::genesis_block;
+    use dashcore::blockdata::constants::genesis_header;
     use dashcore::Network;
     use dashcore_hashes::Hash;
 
     fn create_test_header(prev_hash: BlockHash, nonce: u32) -> BlockHeader {
-        let mut header = genesis_block(Network::Dash).header;
+        let mut header = genesis_header(Network::Dash);
         header.prev_blockhash = prev_hash;
         header.nonce = nonce;
         header
@@ -255,7 +255,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Add genesis
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis header");
         chain_state.add_header(genesis);
 
@@ -305,7 +305,7 @@ mod tests {
         let mut chain_state = ChainState::new();
 
         // Add genesis
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         storage.store_header(&genesis, 0).expect("Failed to store genesis header");
         chain_state.add_header(genesis);
 

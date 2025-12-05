@@ -195,11 +195,11 @@ impl ChainTipManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dashcore::blockdata::constants::genesis_block;
+    use dashcore::blockdata::constants::genesis_header;
     use dashcore::Network;
 
     fn create_test_tip(height: u32, work_value: u8) -> ChainTip {
-        let mut header = genesis_block(Network::Dash).header;
+        let mut header = genesis_header(Network::Dash);
         header.nonce = height; // Make it unique
 
         let mut work_bytes = [0u8; 32];

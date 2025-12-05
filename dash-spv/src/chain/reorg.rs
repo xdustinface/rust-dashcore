@@ -539,7 +539,7 @@ mod tests {
     use super::*;
     use crate::chain::ChainWork;
     use crate::storage::MemoryStorage;
-    use dashcore::blockdata::constants::genesis_block;
+    use dashcore::blockdata::constants::genesis_header;
     use dashcore::Network;
     use dashcore_hashes::Hash;
 
@@ -547,7 +547,7 @@ mod tests {
     fn test_reorg_validation() {
         let reorg_mgr = ReorgManager::new(100, false);
 
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         let tip = ChainTip::new(genesis, 0, ChainWork::from_header(&genesis));
 
         // Create a fork with less work - should not reorg
@@ -571,7 +571,7 @@ mod tests {
     fn test_max_reorg_depth() {
         let reorg_mgr = ReorgManager::new(10, false);
 
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         let tip = ChainTip::new(genesis, 100, ChainWork::from_header(&genesis));
 
         // Create a fork that would require deep reorg

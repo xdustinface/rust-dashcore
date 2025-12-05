@@ -150,7 +150,7 @@ impl Add for ChainWork {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dashcore::blockdata::constants::genesis_block;
+    use dashcore::blockdata::constants::genesis_header;
     use dashcore::Network;
 
     #[test]
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_chain_work_from_header() {
-        let genesis = genesis_block(Network::Dash).header;
+        let genesis = genesis_header(Network::Dash);
         let work = ChainWork::from_header(&genesis);
         assert!(!work.is_zero());
     }

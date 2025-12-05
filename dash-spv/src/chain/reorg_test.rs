@@ -6,7 +6,7 @@ mod tests {
     use crate::chain::ChainWork;
     use crate::storage::MemoryStorage;
     use crate::types::ChainState;
-    use dashcore::{blockdata::constants::genesis_block, Network};
+    use dashcore::{blockdata::constants::genesis_header, Network};
     use dashcore_hashes::Hash;
 
     fn create_test_header(prev: &BlockHeader, nonce: u32) -> BlockHeader {
@@ -21,7 +21,7 @@ mod tests {
     fn test_should_reorganize() {
         // Create test components
         let network = Network::Dash;
-        let genesis = genesis_block(network).header;
+        let genesis = genesis_header(network);
         let chain_state = ChainState::new_for_network(network);
         let storage = MemoryStorage::new();
 
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn test_max_reorg_depth() {
         let network = Network::Dash;
-        let genesis = genesis_block(network).header;
+        let genesis = genesis_header(network);
         let chain_state = ChainState::new_for_network(network);
         let storage = MemoryStorage::new();
 
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn test_checkpoint_sync_reorg_protection() {
         let network = Network::Dash;
-        let genesis = genesis_block(network).header;
+        let genesis = genesis_header(network);
         let mut chain_state = ChainState::new_for_network(network);
         let storage = MemoryStorage::new();
 

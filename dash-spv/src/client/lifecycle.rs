@@ -433,7 +433,7 @@ impl<
         );
 
         let genesis_header =
-            dashcore::blockdata::constants::genesis_block(self.config.network).header;
+            dashcore::blockdata::constants::genesis_header(self.config.network);
 
         // Verify the header produces the expected genesis hash
         let calculated_hash = genesis_header.block_hash();

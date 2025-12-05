@@ -11,7 +11,7 @@ use dash_spv::client::{ClientConfig, DashSpvClient};
 use dash_spv::network::NetworkManager;
 use dash_spv::storage::DiskStorageManager;
 use dash_spv::types::ValidationMode;
-use dashcore::blockdata::constants::genesis_block;
+use dashcore::blockdata::constants::genesis_header;
 // use dashcore::sml::masternode_list_engine::MasternodeListEngine;
 use dashcore::Network;
 use dashcore::{BlockHash, ChainLock};
@@ -165,7 +165,7 @@ async fn test_chainlock_validation_with_masternode_engine() {
     let mut network = MockNetworkManager::new();
 
     // Add a test ChainLock to be received
-    let genesis = genesis_block(Network::Dash).header;
+    let genesis = genesis_header(Network::Dash);
     let chain_lock = create_test_chainlock(0, genesis.block_hash());
     network.add_chain_lock(chain_lock.clone());
 
@@ -292,7 +292,7 @@ async fn test_chainlock_manager_cache_operations() {
     let chainlock_manager = client.chainlock_manager();
 
     // Add test headers
-    let genesis = genesis_block(Network::Dash).header;
+    let genesis = genesis_header(Network::Dash);
     // let storage = client.storage();
     // storage.store_header(&genesis, 0).await.unwrap();
 
