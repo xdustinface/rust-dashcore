@@ -1,0 +1,31 @@
+# Test group configuration for CI
+# CI will fail if any workspace crate is not assigned to a group or excluded
+
+groups:
+  core:
+    - dashcore
+    - dashcore_hashes
+    - dashcore-private
+    - dash-network
+    - dash-network-ffi
+
+  spv:
+    - dash-spv
+    - dash-spv-ffi
+
+  wallet:
+    - key-wallet
+    - key-wallet-ffi
+    - key-wallet-manager
+
+  rpc:
+    - dashcore-rpc
+    - dashcore-rpc-json
+
+  tools:
+    - dashcore-test-utils
+    - dash-fuzz
+
+# Crates intentionally not tested (with reason)
+excluded:
+  - integration_test  # Requires live Dash node
