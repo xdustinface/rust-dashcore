@@ -171,10 +171,21 @@ pub unsafe extern "C" fn dash_spv_ffi_config_add_peer(
         return FFIErrorCode::Success as i32;
     }
 
-    // 3) Optionally attempt DNS name with explicit port only; if no port, reject
-    if !addr_str.contains(':') {
-        set_last_error("Missing port for hostname; supply 'host:port' or IP only");
-        return FFIErrorCode::InvalidArgument as i32;
+    // 3) Attempt DNS resolution for hostnames with explicit port
+    match addr_str.split_once(':') {
+        None => {
+            set_last_error("Invalid hostname. Use 'host:port' or IP address");
+            return FFIErrorCode::InvalidArgument as i32;
+        }
+        Some(("", _)) => {
+            set_last_error("Missing hostname. Use 'host:port' or IP address");
+            return FFIErrorCode::InvalidArgument as i32;
+        }
+        Some((_, "")) => {
+            set_last_error("Missing port. Use 'host:port' or IP address");
+            return FFIErrorCode::InvalidArgument as i32;
+        }
+        Some(_) => {}
     }
 
     match addr_str.to_socket_addrs() {

@@ -54,20 +54,24 @@ mod tests {
 
             // Test various invalid addresses
             let invalid_addrs = [
-                "not-an-ip:9999",
-                "256.256.256.256:9999",
-                "127.0.0.1:99999", // port too high
-                "127.0.0.1:-1",    // negative port
-                "localhost",       // hostname without port should be rejected
-                ":9999",           // missing IP
-                ":::",             // invalid IPv6
-                "localhost:abc",   // non-numeric port
+                "256.256.256.256:9999",  // invalid IP octets
+                "127.0.0.1:99999",       // port too high
+                "127.0.0.1:-1",          // negative port
+                "hostname-without-port", // hostname without port should be rejected
+                ":9999",                 // missing IP
+                ":::",                   // invalid IPv6
+                "localhost:abc",         // non-numeric port
             ];
 
             for addr in &invalid_addrs {
                 let c_addr = CString::new(*addr).unwrap();
                 let result = dash_spv_ffi_config_add_peer(config, c_addr.as_ptr());
-                assert_eq!(result, FFIErrorCode::InvalidArgument as i32);
+                assert_eq!(
+                    result,
+                    FFIErrorCode::InvalidArgument as i32,
+                    "Expected '{}' to be invalid",
+                    addr
+                );
 
                 // Check error message
                 let error_ptr = dash_spv_ffi_get_last_error();
@@ -80,8 +84,9 @@ mod tests {
                 "192.168.1.1:8333",
                 "[::1]:9999",
                 "[2001:db8::1]:8333",
-                "127.0.0.1",   // IP-only v4
-                "2001:db8::1", // IP-only v6
+                "127.0.0.1",      // IP-only v4
+                "2001:db8::1",    // IP-only v6
+                "localhost:9999", // Hostname with port
             ];
 
             for addr in &valid_addrs {
