@@ -14,7 +14,7 @@ fn get_temp_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("temp");
     let unique_id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    temp_path.set_file_name(format!(".{}.{}.{}.tmp", file_name, pid, unique_id));
+    temp_path.set_file_name(format!("tmp_{}_{}_{}_.tmp", file_name, pid, unique_id));
     temp_path
 }
 
@@ -75,10 +75,10 @@ mod tests {
         // Check temp file is in same directory as original
         assert_eq!(temp1.parent(), path.parent());
 
-        // Check temp file name starts with dot and ends with .tmp
+        // Check temp file name starts with tmp_ and ends with .tmp
         let file_name = temp1.file_name().unwrap().to_string_lossy();
-        assert!(file_name.starts_with(".file.dat."));
-        assert!(file_name.ends_with(".tmp"));
+        assert!(file_name.starts_with("tmp_file.dat_"));
+        assert!(file_name.ends_with("_.tmp"));
     }
 
     #[tokio::test]
