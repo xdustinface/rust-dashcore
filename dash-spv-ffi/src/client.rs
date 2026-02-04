@@ -82,7 +82,7 @@ where
 
             // Send initial progress
             {
-                let progress = receiver.borrow().clone();
+                let progress = receiver.borrow_and_update().clone();
                 let guard = callbacks.lock().unwrap();
                 if let Some(ref cb) = *guard {
                     dispatch_fn(cb, &progress);
@@ -94,7 +94,7 @@ where
                     result = receiver.changed() => {
                         match result {
                             Ok(()) => {
-                                let progress = receiver.borrow().clone();
+                                let progress = receiver.borrow_and_update().clone();
                                 let guard = callbacks.lock().unwrap();
                                 if let Some(ref cb) = *guard {
                                     dispatch_fn(cb, &progress);
