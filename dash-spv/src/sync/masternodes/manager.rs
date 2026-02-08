@@ -225,10 +225,11 @@ impl<H: BlockHeaderStorage> std::fmt::Debug for MasternodesManager<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, NetworkEvent, NetworkRequest};
     use crate::storage::{DiskStorageManager, PersistentBlockHeaderStorage, StorageManager};
     use crate::sync::sync_manager::SyncManager;
     use crate::sync::{ManagerIdentifier, SyncManagerProgress};
+    use tokio::sync::mpsc;
 
     type TestMasternodesManager = MasternodesManager<PersistentBlockHeaderStorage>;
 
@@ -238,6 +239,19 @@ mod tests {
             dashcore::Network::Testnet,
         )));
         MasternodesManager::new(storage.block_headers(), engine, dashcore::Network::Testnet).await
+    }
+
+    fn create_request_sender() -> (RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (RequestSender::new(tx), rx)
+    }
+
+    fn peers_updated_event(count: usize, height: Option<u32>) -> NetworkEvent {
+        NetworkEvent::PeersUpdated {
+            connected_count: count,
+            addresses: vec![],
+            best_height: height,
+        }
     }
 
     #[tokio::test]
@@ -267,5 +281,131 @@ mod tests {
         } else {
             panic!("Expected SyncManagerProgress::Masternodes");
         }
+    }
+
+    #[tokio::test]
+    async fn test_recovery_from_error_state_on_peer_reconnect() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        // Simulate: initialized -> error state (as happens after QRInfo timeouts)
+        manager.set_state(SyncState::Error);
+        assert_eq!(manager.state(), SyncState::Error);
+
+        // Peers reconnect
+        let event = peers_updated_event(3, Some(1000));
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Should have recovered from error state
+        assert_ne!(manager.state(), SyncState::Error);
+        assert!(
+            manager.state() == SyncState::WaitForEvents || manager.state() == SyncState::Syncing,
+            "Expected WaitForEvents or Syncing, got {:?}",
+            manager.state()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_state_resets_retry_count() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        // Simulate exhausted retries leading to error state
+        manager.set_state(SyncState::Error);
+        manager.sync_state.qrinfo_retry_count = 3;
+        manager.sync_state.waiting_for_qrinfo = true;
+
+        // Peers reconnect
+        let event = peers_updated_event(2, Some(500));
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Retry count should be reset
+        assert_eq!(manager.sync_state.qrinfo_retry_count, 0);
+        assert!(!manager.sync_state.waiting_for_qrinfo);
+    }
+
+    #[tokio::test]
+    async fn test_no_recovery_when_no_peers() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        manager.set_state(SyncState::Error);
+
+        // All peers disconnected
+        let event = peers_updated_event(0, None);
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Should transition to WaitingForConnections (stop_sync), not stay in Error
+        assert_eq!(manager.state(), SyncState::WaitingForConnections);
+    }
+
+    #[tokio::test]
+    async fn test_waiting_for_connections_still_works() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        manager.set_state(SyncState::WaitingForConnections);
+
+        // Peers connect
+        let event = peers_updated_event(1, Some(100));
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Should transition to WaitForEvents via start_sync()
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+    }
+
+    #[tokio::test]
+    async fn test_synced_state_not_affected_by_peer_update() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        manager.set_state(SyncState::Synced);
+
+        // Peers update
+        let event = peers_updated_event(3, Some(1000));
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Should stay Synced (no unnecessary recovery)
+        assert_eq!(manager.state(), SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn test_full_disconnect_reconnect_cycle_recovery() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        // Step 1: Manager in Error state after QRInfo timeouts
+        manager.set_state(SyncState::Error);
+        manager.sync_state.qrinfo_retry_count = 3;
+
+        // Step 2: All peers disconnect (wifi off)
+        let disconnect = peers_updated_event(0, None);
+        let _ = manager.handle_network_event(&disconnect, &requests).await;
+        assert_eq!(manager.state(), SyncState::WaitingForConnections);
+
+        // Step 3: Peers reconnect (wifi back)
+        let reconnect = peers_updated_event(3, Some(1000));
+        let _ = manager.handle_network_event(&reconnect, &requests).await;
+
+        // Should have started sync via start_sync() from WaitingForConnections
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+    }
+
+    #[tokio::test]
+    async fn test_error_recovery_without_disconnect_first() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_request_sender();
+
+        // Error state but peers never fully disconnected (e.g., only QRInfo failed)
+        manager.set_state(SyncState::Error);
+        manager.sync_state.qrinfo_retry_count = 3;
+
+        // A new peer connects (PeersUpdated with more peers)
+        let event = peers_updated_event(4, Some(2000));
+        let _ = manager.handle_network_event(&event, &requests).await;
+
+        // Should recover directly from Error state
+        assert_ne!(manager.state(), SyncState::Error);
+        assert_eq!(manager.sync_state.qrinfo_retry_count, 0);
     }
 }

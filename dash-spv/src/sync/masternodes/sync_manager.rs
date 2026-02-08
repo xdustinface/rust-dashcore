@@ -1,5 +1,5 @@
 use crate::error::SyncResult;
-use crate::network::{Message, MessageType, RequestSender};
+use crate::network::{Message, MessageType, NetworkEvent, RequestSender};
 use crate::storage::BlockHeaderStorage;
 use crate::sync::{
     ManagerIdentifier, MasternodesManager, SyncEvent, SyncManager, SyncManagerProgress, SyncState,
@@ -498,6 +498,40 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
             }
         }
 
+        Ok(vec![])
+    }
+
+    async fn handle_network_event(
+        &mut self,
+        event: &NetworkEvent,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
+        if let NetworkEvent::PeersUpdated {
+            connected_count,
+            best_height,
+            ..
+        } = event
+        {
+            if let Some(best_height) = best_height {
+                self.update_target_height(*best_height);
+            }
+
+            if *connected_count == 0 {
+                self.stop_sync();
+            } else if self.state() == SyncState::WaitingForConnections {
+                return self.start_sync(requests).await;
+            } else if self.state() == SyncState::Error {
+                // Recover from error state when peers reconnect by retrying masternode sync
+                tracing::info!(
+                    "Peers reconnected ({}), recovering masternode sync from error state",
+                    connected_count
+                );
+                self.sync_state.qrinfo_retry_count = 0;
+                self.sync_state.clear_pending();
+                self.set_state(SyncState::WaitForEvents);
+                return self.send_qrinfo_for_tip(requests).await;
+            }
+        }
         Ok(vec![])
     }
 
