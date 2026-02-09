@@ -301,6 +301,7 @@ impl PeerNetworkManager {
                         }
                         Err(e) => {
                             log::warn!("Handshake failed with {}: {}", addr, e);
+                            pool.remove_peer(&addr).await;
                             // Update reputation for handshake failure
                             reputation_manager
                                 .update_reputation(
@@ -316,6 +317,7 @@ impl PeerNetworkManager {
                 }
                 Err(e) => {
                     log::debug!("Failed to connect to {}: {}", addr, e);
+                    pool.remove_peer(&addr).await;
                     // Minor reputation penalty for connection failure
                     reputation_manager
                         .update_reputation(
