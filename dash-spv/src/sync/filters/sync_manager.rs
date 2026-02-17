@@ -37,6 +37,11 @@ impl<
         &[MessageType::CFilter]
     }
 
+    fn stop_sync(&mut self) {
+        self.set_state(SyncState::WaitingForConnections);
+        self.clear_in_flight_state();
+    }
+
     async fn initialize(&mut self) -> SyncResult<()> {
         let wallet = self.wallet.read().await;
         let committed_height = wallet.filter_committed_height();
@@ -82,6 +87,9 @@ impl<
         // Already at or beyond stored filters tip - check if fully synced
         if stored_filters_tip > 0 && stored_filters_tip == self.progress.current_height() {
             self.progress.update_filter_header_tip_height(stored_filters_tip);
+            // Initialize the pipeline at the current tip. On full disconnect in-flight state gets
+            // reset, so we need to initialize the pipeline otherwise it would re-queue from height 1.
+            self.filter_pipeline.init(stored_filters_tip + 1, stored_filters_tip);
             // Only emit SyncComplete if we've also reached the chain tip
             if self.progress.current_height() >= self.progress.target_height() {
                 self.set_state(SyncState::Synced);
