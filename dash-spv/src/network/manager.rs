@@ -241,12 +241,27 @@ impl PeerNetworkManager {
         let message_dispatcher = self.message_dispatcher.clone();
         let network_event_sender = self.network_event_sender.clone();
 
-        // Spawn connection task
-        let mut tasks = self.tasks.lock().await;
+        // Spawn connection task — use select to avoid blocking on the lock during shutdown
+        let mut tasks = tokio::select! {
+            guard = self.tasks.lock() => guard,
+            _ = self.shutdown_token.cancelled() => {
+                self.pool.remove_peer(&addr).await;
+                return;
+            }
+        };
         tasks.spawn(async move {
             log::debug!("Attempting to connect to {}", addr);
 
-            match Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), network).await {
+            let connect_result = tokio::select! {
+                result = Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), network) => result,
+                _ = shutdown_token.cancelled() => {
+                    log::debug!("Connection to {} cancelled by shutdown", addr);
+                    pool.remove_peer(&addr).await;
+                    return;
+                }
+            };
+
+            match connect_result {
                 Ok(mut peer) => {
                     // Perform handshake
                     let mut handshake_manager =
@@ -841,6 +856,10 @@ impl PeerNetworkManager {
             }
         }
 
+        if self.shutdown_token.is_cancelled() {
+            return;
+        }
+
         // Send ping to all peers if needed
         for (addr, peer) in self.pool.get_all_peers().await {
             let mut peer_guard = peer.write().await;
@@ -1295,7 +1314,9 @@ impl PeerNetworkManager {
             log::warn!("Failed to save reputation data on shutdown: {}", e);
         }
 
-        // Wait for tasks to complete
+        // Drain tasks while holding the lock.  connect_to_peer() already uses
+        // `select!` with the cancellation token when acquiring this lock, so no
+        // deadlock can occur once the shutdown token is cancelled above.
         let mut tasks = self.tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
             if let Err(e) = result {
