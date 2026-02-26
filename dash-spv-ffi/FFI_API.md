@@ -55,7 +55,7 @@ Functions: 16
 
 ### Synchronization
 
-Functions: 6
+Functions: 5
 
 | Function | Description | Module |
 |----------|-------------|--------|
@@ -63,8 +63,7 @@ Functions: 6
 | `dash_spv_ffi_client_get_manager_sync_progress` | Get the current manager-based sync progress | client |
 | `dash_spv_ffi_client_get_sync_progress` | Get the current sync progress snapshot | client |
 | `dash_spv_ffi_client_set_sync_event_callbacks` | Set sync event callbacks for push-based event notifications | client |
-| `dash_spv_ffi_manager_sync_progress_destroy` | Destroy an `FFISyncProgress` object and all its nested pointers | types |
-| `dash_spv_ffi_sync_progress_destroy` | Destroy a `FFISyncProgress` object returned by this crate | client |
+| `dash_spv_ffi_sync_progress_destroy` | Destroy an `FFISyncProgress` object and all its nested pointers | types |
 
 ### Wallet Operations
 
@@ -448,7 +447,7 @@ dash_spv_ffi_client_get_manager_sync_progress(client: *mut FFIDashSpvClient,) ->
 ```
 
 **Description:**
-Get the current manager-based sync progress.  Returns the new parallel sync system's progress with per-manager details. Use `dash_spv_ffi_manager_sync_progress_destroy` to free the returned struct.  # Safety - `client` must be a valid, non-null pointer.
+Get the current manager-based sync progress.  Returns the new parallel sync system's progress with per-manager details. Use `dash_spv_ffi_sync_progress_destroy` to free the returned struct.  # Safety - `client` must be a valid, non-null pointer.
 
 **Safety:**
 - `client` must be a valid, non-null pointer.
@@ -489,10 +488,10 @@ Set sync event callbacks for push-based event notifications.  The monitoring tas
 
 ---
 
-#### `dash_spv_ffi_manager_sync_progress_destroy`
+#### `dash_spv_ffi_sync_progress_destroy`
 
 ```c
-dash_spv_ffi_manager_sync_progress_destroy(progress: *mut FFISyncProgress,) -> ()
+dash_spv_ffi_sync_progress_destroy(progress: *mut FFISyncProgress) -> ()
 ```
 
 **Description:**
@@ -502,22 +501,6 @@ Destroy an `FFISyncProgress` object and all its nested pointers.  # Safety - `pr
 - `progress` must be a pointer returned from this crate, or null.
 
 **Module:** `types`
-
----
-
-#### `dash_spv_ffi_sync_progress_destroy`
-
-```c
-dash_spv_ffi_sync_progress_destroy(progress: *mut FFISyncProgress) -> ()
-```
-
-**Description:**
-Destroy a `FFISyncProgress` object returned by this crate.  # Safety - `progress` must be a pointer returned from this crate, or null.
-
-**Safety:**
-- `progress` must be a pointer returned from this crate, or null.
-
-**Module:** `client`
 
 ---
 

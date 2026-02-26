@@ -506,7 +506,7 @@ int32_t dash_spv_ffi_client_update_config(struct FFIDashSpvClient *client,
  * Get the current manager-based sync progress.
  *
  * Returns the new parallel sync system's progress with per-manager details.
- * Use `dash_spv_ffi_manager_sync_progress_destroy` to free the returned struct.
+ * Use `dash_spv_ffi_sync_progress_destroy` to free the returned struct.
  *
  * # Safety
  * - `client` must be a valid, non-null pointer.
@@ -545,14 +545,6 @@ int32_t dash_spv_ffi_client_broadcast_transaction(struct FFIDashSpvClient *clien
  * - `client` must be either null or a pointer obtained from `dash_spv_ffi_client_new`.
  */
  void dash_spv_ffi_client_destroy(struct FFIDashSpvClient *client) ;
-
-/**
- * Destroy a `FFISyncProgress` object returned by this crate.
- *
- * # Safety
- * - `progress` must be a pointer returned from this crate, or null.
- */
- void dash_spv_ffi_sync_progress_destroy(struct FFISyncProgress *progress) ;
 
 /**
  * Get the wallet manager from the SPV client
@@ -939,7 +931,7 @@ struct FFIResult ffi_dash_spv_get_platform_activation_height(struct FFIDashSpvCl
  * # Safety
  * - `progress` must be a pointer returned from this crate, or null.
  */
- void dash_spv_ffi_manager_sync_progress_destroy(struct FFISyncProgress *progress) ;
+ void dash_spv_ffi_sync_progress_destroy(struct FFISyncProgress *progress) ;
 
 /**
  * Initialize logging for the SPV library.
