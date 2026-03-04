@@ -21,7 +21,7 @@ use dashcore_hashes::Hash;
 use std::collections::{BTreeSet, HashSet};
 
 /// What the MnListDiff pipeline is currently being used for.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(super) enum PipelineMode {
     /// Post-QRInfo quorum validation diffs. Run full `verify_and_complete()` on completion.
     #[default]
