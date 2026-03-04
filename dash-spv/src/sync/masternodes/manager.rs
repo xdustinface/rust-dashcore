@@ -172,7 +172,10 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
             .sync_state
             .last_synced_block_hash
             .or_else(|| self.network.known_genesis_block_hash())
-            .unwrap_or_else(BlockHash::all_zeros);
+            .unwrap_or_else(|| {
+                tracing::warn!("No last synced block hash or genesis hash available, falling back to all-zeros hash");
+                BlockHash::all_zeros()
+            });
 
         self.sync_state.pipeline_mode = PipelineMode::Incremental {
             target: tip_hash,
