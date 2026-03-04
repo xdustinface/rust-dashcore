@@ -112,9 +112,14 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         engine: Arc<RwLock<MasternodeListEngine>>,
         network: dashcore::Network,
     ) -> Self {
-        // Load current height from engine's masternode lists
-        let current_height =
-            engine.read().await.masternode_lists.keys().last().copied().unwrap_or(0);
+        // Recover sync state from engine's persisted masternode lists
+        let engine_guard = engine.read().await;
+        let (current_height, last_synced_block_hash) =
+            match engine_guard.masternode_lists.iter().next_back() {
+                Some((&height, list)) => (height, Some(list.block_hash)),
+                None => (0, None),
+            };
+        drop(engine_guard);
 
         // Load block header tip for progress display
         let header_tip =
@@ -126,12 +131,15 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         initial_progress.update_block_header_tip_height(header_tip);
         initial_progress.set_state(SyncState::WaitingForConnections);
 
+        let mut sync_state = MasternodeSyncState::new();
+        sync_state.last_synced_block_hash = last_synced_block_hash;
+
         Self {
             progress: initial_progress,
             header_storage,
             engine,
             network,
-            sync_state: MasternodeSyncState::new(),
+            sync_state,
         }
     }
 
