@@ -145,6 +145,24 @@ impl RequestSender {
             hashes.into_iter().map(Inventory::Block).collect(),
         ))
     }
+
+    /// Send a filterload message to the peer.
+    pub fn send_filter_load(
+        &self,
+        filter_load: dashcore::network::message_bloom::FilterLoad,
+    ) -> NetworkResult<()> {
+        self.send_message(NetworkMessage::FilterLoad(filter_load))
+    }
+
+    /// Send a filterclear message to the peer.
+    pub fn send_filter_clear(&self) -> NetworkResult<()> {
+        self.send_message(NetworkMessage::FilterClear)
+    }
+
+    /// Send a mempool message to request inventory of mempool transactions.
+    pub fn request_mempool(&self) -> NetworkResult<()> {
+        self.send_message(NetworkMessage::MemPool)
+    }
 }
 
 /// Network manager trait for abstracting network operations.

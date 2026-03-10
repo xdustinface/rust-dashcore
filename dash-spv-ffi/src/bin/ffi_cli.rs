@@ -5,6 +5,7 @@ use std::ptr;
 use clap::{Arg, ArgAction, Command};
 
 use dash_spv_ffi::*;
+use key_wallet_ffi::types::FFITransactionContext;
 use key_wallet_ffi::wallet_manager::wallet_manager_add_wallet_from_mnemonic;
 use key_wallet_ffi::{FFIError, FFINetwork};
 
@@ -28,6 +29,7 @@ extern "C" fn on_sync_start(manager_id: FFIManagerId, _user_data: *mut c_void) {
         FFIManagerId::Masternodes => "Masternodes",
         FFIManagerId::ChainLocks => "ChainLocks",
         FFIManagerId::InstantSend => "InstantSend",
+        FFIManagerId::Mempool => "Mempool",
     };
     println!("[Sync] Manager started: {}", manager_name);
 }
@@ -75,9 +77,14 @@ extern "C" fn on_block_processed(
     height: u32,
     _hash: *const [u8; 32],
     new_address_count: u32,
+    _confirmed_txids: *const [u8; 32],
+    confirmed_txid_count: u32,
     _user_data: *mut c_void,
 ) {
-    println!("[Sync] Block processed: height={}, new_addresses={}", height, new_address_count);
+    println!(
+        "[Sync] Block processed: height={}, new_addresses={}, confirmed_txs={}",
+        height, new_address_count, confirmed_txid_count
+    );
 }
 
 extern "C" fn on_masternode_state_updated(height: u32, _user_data: *mut c_void) {
@@ -150,6 +157,7 @@ extern "C" fn on_peers_updated(connected_count: u32, best_height: u32, _user_dat
 
 extern "C" fn on_transaction_received(
     wallet_id: *const c_char,
+    status: FFITransactionContext,
     account_index: u32,
     txid: *const [u8; 32],
     amount: i64,
@@ -165,9 +173,18 @@ extern "C" fn on_transaction_received(
     };
     let txid_hex = unsafe { hex::encode(*txid) };
     println!(
-        "[Wallet] TX received: wallet={}..., txid={}, account={}, amount={} duffs, addresses={}",
-        wallet_short, txid_hex, account_index, amount, addr_str
+        "[Wallet] TX received: wallet={}..., txid={}, account={}, amount={} duffs, status={:?}, addresses={}",
+        wallet_short, txid_hex, account_index, amount, status, addr_str
     );
+}
+
+extern "C" fn on_transaction_status_changed(
+    txid: *const [u8; 32],
+    status: FFITransactionContext,
+    _user_data: *mut c_void,
+) {
+    let txid_hex = unsafe { hex::encode(*txid) };
+    println!("[Wallet] TX status changed: txid={}, status={:?}", txid_hex, status);
 }
 
 extern "C" fn on_balance_updated(
@@ -431,6 +448,7 @@ fn main() {
 
         let wallet_callbacks = FFIWalletEventCallbacks {
             on_transaction_received: Some(on_transaction_received),
+            on_transaction_status_changed: Some(on_transaction_status_changed),
             on_balance_updated: Some(on_balance_updated),
             user_data: ptr::null_mut(),
         };

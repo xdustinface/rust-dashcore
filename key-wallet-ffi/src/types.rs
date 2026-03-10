@@ -712,10 +712,31 @@ impl FFIWalletAccountCreationOptions {
 pub enum FFITransactionContext {
     /// Transaction is in the mempool (unconfirmed)
     Mempool = 0,
+    /// Transaction is in the mempool with an InstantSend lock
+    InstantSend = 1,
     /// Transaction is in a block at the given height
-    InBlock = 1,
+    InBlock = 2,
     /// Transaction is in a chain-locked block at the given height
-    InChainLockedBlock = 2,
+    InChainLockedBlock = 3,
+}
+
+impl From<key_wallet::transaction_checking::TransactionContext> for FFITransactionContext {
+    fn from(ctx: key_wallet::transaction_checking::TransactionContext) -> Self {
+        match ctx {
+            key_wallet::transaction_checking::TransactionContext::Mempool => {
+                FFITransactionContext::Mempool
+            }
+            key_wallet::transaction_checking::TransactionContext::InstantSend => {
+                FFITransactionContext::InstantSend
+            }
+            key_wallet::transaction_checking::TransactionContext::InBlock {
+                ..
+            } => FFITransactionContext::InBlock,
+            key_wallet::transaction_checking::TransactionContext::InChainLockedBlock {
+                ..
+            } => FFITransactionContext::InChainLockedBlock,
+        }
+    }
 }
 
 /// FFI-compatible transaction context details
@@ -815,6 +836,7 @@ impl FFITransactionContextDetails {
                     },
                 }
             }
+            FFITransactionContext::InstantSend => TransactionContext::InstantSend,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::wallet_interface::{BlockProcessingResult, WalletInterface};
+use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 use crate::WalletEvent;
 use crate::WalletManager;
 use alloc::string::String;
@@ -6,10 +6,11 @@ use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Address, Block, Transaction};
+use dashcore::{Address, Block, Transaction, Txid};
 use key_wallet::transaction_checking::transaction_router::TransactionRouter;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+use std::collections::HashSet;
 use tokio::sync::broadcast;
 
 #[async_trait]
@@ -18,6 +19,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         &mut self,
         block: &Block,
         height: CoreBlockHeight,
+        best_chainlock_height: Option<u32>,
     ) -> BlockProcessingResult {
         let mut result = BlockProcessingResult::default();
         let block_hash = Some(block.block_hash());
@@ -25,10 +27,18 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 
         // Process each transaction using the base manager
         for tx in &block.txdata {
-            let context = TransactionContext::InBlock {
-                height,
-                block_hash,
-                timestamp: Some(timestamp),
+            let context = if best_chainlock_height.is_some_and(|cl| height <= cl) {
+                TransactionContext::InChainLockedBlock {
+                    height,
+                    block_hash,
+                    timestamp: Some(timestamp),
+                }
+            } else {
+                TransactionContext::InBlock {
+                    height,
+                    block_hash,
+                    timestamp: Some(timestamp),
+                }
             };
 
             let check_result = self.check_transaction_in_all_wallets(tx, context, true).await;
@@ -49,18 +59,68 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         result
     }
 
-    async fn process_mempool_transaction(&mut self, tx: &Transaction) {
-        let context = TransactionContext::Mempool;
+    async fn process_mempool_transaction(
+        &mut self,
+        tx: &Transaction,
+        is_instant_send: bool,
+    ) -> MempoolTransactionResult {
+        let context = if is_instant_send {
+            TransactionContext::InstantSend
+        } else {
+            TransactionContext::Mempool
+        };
 
-        // Check transaction against all wallets
-        self.check_transaction_in_all_wallets(
-            tx, context, true, // update state
-        )
-        .await;
+        // Capture balances before processing so we can detect changes
+        let old_balances: Vec<_> =
+            self.wallet_infos.iter().map(|(id, info)| (*id, info.balance())).collect();
+
+        let check_result = self
+            .check_transaction_in_all_wallets(
+                tx, context, true, // update state
+            )
+            .await;
+
+        let is_relevant = !check_result.affected_wallets.is_empty();
+        let net_amount = if is_relevant {
+            check_result.total_received as i64 - check_result.total_sent as i64
+        } else {
+            0
+        };
+
+        // Emit BalanceUpdated for any wallets whose balance changed
+        if is_relevant {
+            for (wallet_id, old_balance) in &old_balances {
+                if let Some(info) = self.wallet_infos.get(wallet_id) {
+                    let new_balance = info.balance();
+                    if *old_balance != new_balance {
+                        let event = WalletEvent::BalanceUpdated {
+                            wallet_id: *wallet_id,
+                            spendable: new_balance.spendable(),
+                            unconfirmed: new_balance.unconfirmed(),
+                            immature: new_balance.immature(),
+                            locked: new_balance.locked(),
+                        };
+                        let _ = self.event_sender.send(event);
+                    }
+                }
+            }
+        }
+
+        MempoolTransactionResult {
+            is_relevant,
+            net_amount,
+            is_outgoing: net_amount < 0,
+            addresses: check_result.involved_addresses,
+            new_addresses: check_result.new_addresses,
+        }
     }
 
     fn monitored_addresses(&self) -> Vec<Address> {
         self.monitored_addresses()
+    }
+
+    fn watched_outpoints(&self) -> Vec<dashcore::OutPoint> {
+        self.watched_outpoints()
     }
 
     async fn transaction_effect(&self, tx: &Transaction) -> Option<(i64, Vec<String>)> {
@@ -150,6 +210,82 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         self.event_sender.subscribe()
     }
 
+    fn notify_transaction_status_changed(&self, txid: Txid, status: TransactionContext) {
+        let event = WalletEvent::TransactionStatusChanged {
+            txid,
+            status,
+        };
+        let _ = self.event_sender().send(event);
+    }
+
+    fn process_instant_send_lock(&mut self, txid: Txid) {
+        let old_balances: Vec<_> =
+            self.wallet_infos.iter().map(|(id, info)| (*id, info.balance())).collect();
+
+        for info in self.wallet_infos.values_mut() {
+            info.mark_instant_send_utxos(&txid);
+            info.update_balance();
+        }
+
+        let event = WalletEvent::TransactionStatusChanged {
+            txid,
+            status: TransactionContext::InstantSend,
+        };
+        let _ = self.event_sender().send(event);
+
+        for (wallet_id, old_balance) in &old_balances {
+            if let Some(info) = self.wallet_infos.get(wallet_id) {
+                let new_balance = info.balance();
+                if *old_balance != new_balance {
+                    let event = WalletEvent::BalanceUpdated {
+                        wallet_id: *wallet_id,
+                        spendable: new_balance.spendable(),
+                        unconfirmed: new_balance.unconfirmed(),
+                        immature: new_balance.immature(),
+                        locked: new_balance.locked(),
+                    };
+                    let _ = self.event_sender().send(event);
+                }
+            }
+        }
+    }
+
+    fn process_chainlock(&mut self, height: u32) {
+        // Collect (wallet_id, txid, context) triples to avoid borrow conflicts.
+        // A txid may appear in multiple accounts/wallets, so we dedup by txid
+        // for event emission while marking each owning wallet individually.
+        let mut pending = Vec::new();
+        for (wallet_id, info) in &self.wallet_infos {
+            for account in info.accounts().all_accounts() {
+                for record in account.transactions.values() {
+                    if let Some(tx_height) = record.height {
+                        if tx_height <= height && !info.is_transaction_chainlocked(&record.txid) {
+                            pending.push((
+                                *wallet_id,
+                                record.txid,
+                                TransactionContext::InChainLockedBlock {
+                                    height: tx_height,
+                                    block_hash: record.block_hash,
+                                    timestamp: Some(record.timestamp as u32),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut emitted = HashSet::new();
+        for (wallet_id, txid, context) in &pending {
+            if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
+                info.mark_transaction_chainlocked(*txid);
+            }
+            if emitted.insert(*txid) {
+                self.notify_transaction_status_changed(*txid, *context);
+            }
+        }
+    }
+
     async fn describe(&self) -> String {
         let wallet_count = self.wallet_infos.len();
         if wallet_count == 0 {
@@ -183,8 +319,66 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dashcore::Network;
+    use crate::wallet_manager::WalletId;
+    use dashcore::hashes::Hash;
+    use dashcore::{Network, ScriptBuf, TxOut, Witness};
+    use key_wallet::wallet::initialization::WalletAccountCreationOptions;
+    use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
+
+    const TEST_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn setup_manager_with_wallet() -> (WalletManager<ManagedWalletInfo>, WalletId, Address) {
+        let mut manager = WalletManager::new(Network::Testnet);
+        let wallet_id = manager
+            .create_wallet_from_mnemonic(
+                TEST_MNEMONIC,
+                "",
+                0,
+                WalletAccountCreationOptions::Default,
+            )
+            .unwrap();
+        let addresses = manager.monitored_addresses();
+        assert!(!addresses.is_empty());
+        let addr = addresses[0].clone();
+        (manager, wallet_id, addr)
+    }
+
+    fn create_tx_paying_to(addr: &Address, input_seed: u8) -> Transaction {
+        Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![dashcore::TxIn {
+                previous_output: dashcore::OutPoint {
+                    txid: dashcore::Txid::from_byte_array([input_seed; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: 100_000,
+                script_pubkey: addr.script_pubkey(),
+            }],
+            special_transaction_payload: None,
+        }
+    }
+
+    fn make_block(txdata: Vec<Transaction>) -> Block {
+        Block {
+            header: dashcore::block::Header {
+                version: dashcore::block::Version::ONE,
+                prev_blockhash: dashcore::BlockHash::from_byte_array([0; 32]),
+                merkle_root: dashcore::TxMerkleNode::from_byte_array([0; 32]),
+                time: 1000,
+                bits: dashcore::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata,
+        }
+    }
 
     #[tokio::test]
     async fn test_synced_height() {
@@ -200,5 +394,124 @@ mod tests {
         // Decrease synced height
         manager.update_synced_height(10);
         assert_eq!(manager.synced_height(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_process_chainlock_idempotent() {
+        let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+        let tx = create_tx_paying_to(&addr, 0xaa);
+        let txid = tx.txid();
+        let block = make_block(vec![tx]);
+
+        // Process block at height 500 so the wallet has a confirmed tx
+        let result = manager.process_block(&block, 500, None).await;
+        assert_eq!(result.new_txids, vec![txid]);
+
+        // First chainlock marks the transaction
+        manager.process_chainlock(500);
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid));
+        let history = manager.wallet_transaction_history(&wallet_id).unwrap();
+        assert_eq!(history.len(), 1);
+
+        // Calling again with same height is idempotent
+        manager.process_chainlock(500);
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid));
+        let history = manager.wallet_transaction_history(&wallet_id).unwrap();
+        assert_eq!(history.len(), 1);
+
+        // Calling with lower height is safe
+        manager.process_chainlock(300);
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_process_chainlock_incremental() {
+        let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+        let tx1 = create_tx_paying_to(&addr, 0xaa);
+        let tx2 = create_tx_paying_to(&addr, 0xbb);
+        let txid1 = tx1.txid();
+        let txid2 = tx2.txid();
+
+        // Process two blocks at different heights
+        let block1 = make_block(vec![tx1]);
+        let block2 = make_block(vec![tx2]);
+        manager.process_block(&block1, 500, None).await;
+        manager.process_block(&block2, 600, None).await;
+
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(!info.is_transaction_chainlocked(&txid1));
+        assert!(!info.is_transaction_chainlocked(&txid2));
+
+        // Chainlock at 500 marks only the first tx
+        manager.process_chainlock(500);
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid1));
+        assert!(!info.is_transaction_chainlocked(&txid2));
+
+        // Chainlock at 600 also marks the second tx
+        manager.process_chainlock(600);
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid1));
+        assert!(info.is_transaction_chainlocked(&txid2));
+    }
+
+    #[tokio::test]
+    async fn test_process_block_uses_chainlocked_context() {
+        let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+        let tx = create_tx_paying_to(&addr, 0xcc);
+        let txid = tx.txid();
+        let block = make_block(vec![tx]);
+
+        // Process block at height 500 with best_chainlock_height=1000 (height <= cl)
+        let result = manager.process_block(&block, 500, Some(1000)).await;
+        assert_eq!(result.new_txids, vec![txid]);
+        assert_eq!(manager.synced_height(), 500);
+
+        // Transaction should be in history and already marked as chainlocked
+        let history = manager.wallet_transaction_history(&wallet_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].txid, txid);
+        assert_eq!(history[0].height, Some(500));
+
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(info.is_transaction_chainlocked(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_process_block_uses_confirmed_context() {
+        let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+        let tx = create_tx_paying_to(&addr, 0xdd);
+        let txid = tx.txid();
+        let block = make_block(vec![tx]);
+
+        // Process block at height 500 with best_chainlock_height=100 (height > cl)
+        let result = manager.process_block(&block, 500, Some(100)).await;
+        assert_eq!(result.new_txids, vec![txid]);
+        assert_eq!(manager.synced_height(), 500);
+
+        // Transaction should be confirmed but not chainlocked
+        let history = manager.wallet_transaction_history(&wallet_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].txid, txid);
+        assert_eq!(history[0].height, Some(500));
+
+        let info = manager.get_all_wallet_infos().get(&wallet_id).unwrap();
+        assert!(!info.is_transaction_chainlocked(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_mempool_transaction_result_contains_wallet_effect_data() {
+        let (mut manager, _wallet_id, addr) = setup_manager_with_wallet();
+        let tx = create_tx_paying_to(&addr, 0xaa);
+
+        let result = manager.process_mempool_transaction(&tx, false).await;
+
+        assert!(result.is_relevant);
+        assert_eq!(result.net_amount, 100_000);
+        assert!(!result.is_outgoing);
+        assert!(!result.addresses.is_empty());
     }
 }

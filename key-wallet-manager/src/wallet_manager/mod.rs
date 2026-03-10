@@ -67,6 +67,12 @@ pub struct CheckTransactionsResult {
     pub is_new_transaction: bool,
     /// New addresses generated during gap limit maintenance
     pub new_addresses: Vec<Address>,
+    /// Total value received across all wallets
+    pub total_received: u64,
+    /// Total value sent across all wallets
+    pub total_sent: u64,
+    /// Addresses involved across all wallets
+    pub involved_addresses: Vec<Address>,
 }
 
 /// High-level wallet manager that manages multiple wallets
@@ -524,27 +530,48 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                         result.is_new_transaction = true;
                     }
 
-                    // Emit TransactionReceived events for each affected account
-                    #[cfg(feature = "std")]
+                    // Aggregate totals and involved addresses across wallets
+                    result.total_received =
+                        result.total_received.saturating_add(check_result.total_received);
+                    result.total_sent = result.total_sent.saturating_add(check_result.total_sent);
                     for account_match in &check_result.affected_accounts {
-                        let Some(account_index) = account_match.account_type_match.account_index()
-                        else {
-                            continue;
-                        };
-                        let amount = account_match.received as i64 - account_match.sent as i64;
-                        let addresses: Vec<Address> = account_match
-                            .account_type_match
-                            .all_involved_addresses()
-                            .into_iter()
-                            .map(|info| info.address)
-                            .collect();
+                        for addr_info in account_match.account_type_match.all_involved_addresses() {
+                            result.involved_addresses.push(addr_info.address);
+                        }
+                    }
 
-                        let event = WalletEvent::TransactionReceived {
-                            wallet_id,
-                            account_index,
+                    #[cfg(feature = "std")]
+                    if check_result.is_new_transaction {
+                        // First time seeing this transaction — emit TransactionReceived
+                        for account_match in &check_result.affected_accounts {
+                            let Some(account_index) =
+                                account_match.account_type_match.account_index()
+                            else {
+                                continue;
+                            };
+                            let amount = account_match.received as i64 - account_match.sent as i64;
+                            let addresses: Vec<Address> = account_match
+                                .account_type_match
+                                .all_involved_addresses()
+                                .into_iter()
+                                .map(|info| info.address)
+                                .collect();
+
+                            let event = WalletEvent::TransactionReceived {
+                                wallet_id,
+                                status: context,
+                                account_index,
+                                txid: tx.txid(),
+                                amount,
+                                addresses,
+                            };
+                            let _ = self.event_sender.send(event);
+                        }
+                    } else if check_result.status_changed {
+                        // Known transaction whose confirmation status actually changed.
+                        let event = WalletEvent::TransactionStatusChanged {
                             txid: tx.txid(),
-                            amount,
-                            addresses,
+                            status: context,
                         };
                         let _ = self.event_sender.send(event);
                     }
@@ -1015,6 +1042,16 @@ impl<T: WalletInfoInterface> WalletManager<T> {
         }
         addresses
     }
+
+    /// Get all outpoints from wallet UTXOs across all managed wallets.
+    /// Used for bloom filter construction to detect spends of our UTXOs.
+    pub fn watched_outpoints(&self) -> Vec<dashcore::OutPoint> {
+        let mut outpoints = Vec::new();
+        for info in self.wallet_infos.values() {
+            outpoints.extend(info.utxos().into_iter().map(|u| u.outpoint));
+        }
+        outpoints
+    }
 }
 
 /// Wallet manager errors
@@ -1091,6 +1128,9 @@ fn current_timestamp() -> u64 {
 
 #[cfg(feature = "std")]
 impl std::error::Error for WalletError {}
+
+#[cfg(test)]
+mod event_tests;
 
 /// Conversion from key_wallet::Error to WalletError
 impl From<key_wallet::Error> for WalletError {

@@ -90,6 +90,15 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// Update chain state and process any matured transactions
     /// This should be called when the chain tip advances to a new height
     fn update_synced_height(&mut self, current_height: u32);
+
+    /// Returns whether a transaction has been marked as chainlocked.
+    fn is_transaction_chainlocked(&self, txid: &Txid) -> bool;
+
+    /// Mark a transaction as chainlocked. Returns true if it was newly marked.
+    fn mark_transaction_chainlocked(&mut self, txid: Txid) -> bool;
+
+    /// Mark UTXOs for a transaction as InstantSend-locked across all accounts.
+    fn mark_instant_send_utxos(&mut self, txid: &Txid);
 }
 
 /// Default implementation for ManagedWalletInfo
@@ -227,5 +236,19 @@ impl WalletInfoInterface for ManagedWalletInfo {
         self.metadata.synced_height = current_height;
         // Update cached balance
         self.update_balance();
+    }
+
+    fn is_transaction_chainlocked(&self, txid: &Txid) -> bool {
+        self.chainlocked_transactions.contains(txid)
+    }
+
+    fn mark_transaction_chainlocked(&mut self, txid: Txid) -> bool {
+        self.chainlocked_transactions.insert(txid)
+    }
+
+    fn mark_instant_send_utxos(&mut self, txid: &Txid) {
+        for account in self.accounts.all_accounts_mut() {
+            account.mark_utxos_instant_send(txid);
+        }
     }
 }
