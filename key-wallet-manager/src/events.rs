@@ -7,6 +7,7 @@ use crate::wallet_manager::WalletId;
 use alloc::string::String;
 use alloc::vec::Vec;
 use dashcore::{Address, Txid};
+use key_wallet::transaction_checking::TransactionContext;
 
 /// Events emitted by the wallet manager.
 ///
@@ -14,10 +15,12 @@ use dashcore::{Address, Txid};
 /// may want to react to.
 #[derive(Debug, Clone)]
 pub enum WalletEvent {
-    /// A transaction relevant to the wallet was received.
+    /// A transaction relevant to the wallet was received for the first time.
     TransactionReceived {
         /// ID of the affected wallet.
         wallet_id: WalletId,
+        /// Context at the time the transaction was first seen.
+        status: TransactionContext,
         /// Account index within the wallet.
         account_index: u32,
         /// Transaction ID.
@@ -26,6 +29,13 @@ pub enum WalletEvent {
         amount: i64,
         /// Addresses involved in the transaction.
         addresses: Vec<Address>,
+    },
+    /// The confirmation status of a previously seen transaction has changed.
+    TransactionStatusChanged {
+        /// Transaction ID.
+        txid: Txid,
+        /// New transaction context.
+        status: TransactionContext,
     },
     /// The wallet balance has changed.
     BalanceUpdated {
@@ -49,9 +59,16 @@ impl WalletEvent {
             WalletEvent::TransactionReceived {
                 txid,
                 amount,
+                status,
                 ..
             } => {
-                format!("TransactionReceived(txid={}, amount={})", txid, amount)
+                format!("TransactionReceived(txid={}, amount={}, status={})", txid, amount, status)
+            }
+            WalletEvent::TransactionStatusChanged {
+                txid,
+                status,
+            } => {
+                format!("TransactionStatusChanged(txid={}, status={})", txid, status)
             }
             WalletEvent::BalanceUpdated {
                 spendable,

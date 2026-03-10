@@ -39,6 +39,8 @@ pub struct BlocksManager<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterf
     pub(super) pipeline: BlocksPipeline,
     /// Whether FiltersSyncComplete has been received.
     pub(super) filters_sync_complete: bool,
+    /// Best known chainlock height for context-aware block processing.
+    pub(super) best_chainlock_height: Option<u32>,
 }
 
 impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H, B, W> {
@@ -60,6 +62,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             wallet,
             pipeline: BlocksPipeline::new(),
             filters_sync_complete: false,
+            best_chainlock_height: None,
         }
     }
 
@@ -84,7 +87,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
 
             // Process block through wallet
             let mut wallet = self.wallet.write().await;
-            let result = wallet.process_block(&block, height).await;
+            let result = wallet.process_block(&block, height, self.best_chainlock_height).await;
             drop(wallet);
 
             let total_relevant = result.relevant_tx_count();
@@ -99,6 +102,8 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
                     result.new_addresses.len()
                 );
             }
+
+            let confirmed_txids: Vec<_> = result.relevant_txids().cloned().collect();
 
             // Collect new addresses for gap limit rescanning
             let new_addresses: Vec<_> = result.new_addresses.into_iter().collect();
@@ -122,6 +127,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
                 block_hash: hash,
                 height,
                 new_addresses,
+                confirmed_txids,
             });
         }
 
@@ -222,5 +228,50 @@ mod tests {
         // Should queue the block
         assert_eq!(manager.state(), SyncState::Syncing);
         assert!(events.is_empty());
+    }
+
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
+    use dashcore::hashes::Hash;
+
+    fn make_chainlock(height: u32) -> ChainLock {
+        ChainLock {
+            block_height: height,
+            block_hash: dashcore::BlockHash::all_zeros(),
+            signature: [0u8; 96].into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chainlock_received_updates_height() {
+        let mut manager = create_test_manager().await;
+        let network = MockNetworkManager::new();
+        let requests = network.request_sender();
+
+        assert!(manager.best_chainlock_height.is_none());
+
+        let event = SyncEvent::ChainLockReceived {
+            chain_lock: make_chainlock(500),
+            validated: true,
+        };
+
+        manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert_eq!(manager.best_chainlock_height, Some(500));
+    }
+
+    #[tokio::test]
+    async fn test_chainlock_lower_height_ignored() {
+        let mut manager = create_test_manager().await;
+        let network = MockNetworkManager::new();
+        let requests = network.request_sender();
+
+        manager.best_chainlock_height = Some(500);
+
+        let event = SyncEvent::ChainLockReceived {
+            chain_lock: make_chainlock(300),
+            validated: true,
+        };
+
+        manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert_eq!(manager.best_chainlock_height, Some(500));
     }
 }

@@ -159,6 +159,18 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
             return self.process_buffered_blocks().await;
         }
 
+        // Track chainlock height for context-aware block processing
+        if let SyncEvent::ChainLockReceived {
+            chain_lock,
+            ..
+        } = event
+        {
+            let new_height = chain_lock.block_height;
+            if self.best_chainlock_height.map_or(true, |h| new_height > h) {
+                self.best_chainlock_height = Some(new_height);
+            }
+        }
+
         // React to FiltersSyncComplete - filters are done, no more BlocksNeeded events coming
         if let SyncEvent::FiltersSyncComplete {
             ..

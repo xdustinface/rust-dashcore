@@ -15,6 +15,7 @@ use key_wallet::wallet::initialization::WalletAccountCreationOptions;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet_manager::wallet_manager::{WalletId, WalletManager};
+use key_wallet_manager::WalletEvent;
 use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -256,6 +257,8 @@ pub(super) struct ClientHandle {
     pub(super) sync_event_receiver: broadcast::Receiver<SyncEvent>,
     /// A channel for receiving network events.
     pub(super) network_event_receiver: broadcast::Receiver<NetworkEvent>,
+    /// A channel for receiving wallet events.
+    pub(super) wallet_event_receiver: broadcast::Receiver<WalletEvent>,
     /// A cancellation token for the client's run loop.
     pub(super) cancel_token: CancellationToken,
 }
@@ -289,6 +292,10 @@ pub(super) async fn create_and_start_client(
     let progress_receiver = client.subscribe_progress().await;
     let sync_event_receiver = client.subscribe_sync_events().await;
     let network_event_receiver = client.subscribe_network_events().await;
+    let wallet_event_receiver = {
+        let w = client.wallet().read().await;
+        w.subscribe_events()
+    };
     let cancel_token = CancellationToken::new();
     let run_token = cancel_token.clone();
 
@@ -301,6 +308,7 @@ pub(super) async fn create_and_start_client(
         progress_receiver,
         sync_event_receiver,
         network_event_receiver,
+        wallet_event_receiver,
         cancel_token,
     }
 }

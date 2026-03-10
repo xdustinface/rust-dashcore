@@ -1,6 +1,11 @@
-use crate::{wallet_interface::WalletInterface, BlockProcessingResult, WalletEvent};
+use crate::{
+    wallet_interface::WalletInterface, BlockProcessingResult, MempoolTransactionResult, WalletEvent,
+};
+use dashcore::address::NetworkUnchecked;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Address, Block, Transaction, Txid};
+use dashcore::{Address, Block, OutPoint, Transaction, Txid};
+use key_wallet::transaction_checking::TransactionContext;
+use std::str::FromStr;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 
@@ -14,12 +19,18 @@ pub struct MockWallet {
     effects: TransactionEffectsMap,
     synced_height: CoreBlockHeight,
     event_sender: broadcast::Sender<WalletEvent>,
-}
-
-impl Default for MockWallet {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// When true, process_mempool_transaction returns is_relevant=true.
+    mempool_relevant: bool,
+    /// Addresses returned by monitored_addresses.
+    addresses: Vec<Address>,
+    /// Outpoints returned by watched_outpoints.
+    outpoints: Vec<OutPoint>,
+    /// New addresses returned by process_mempool_transaction.
+    mempool_new_addresses: Vec<Address>,
+    /// Recorded status change notifications for test assertions.
+    status_changes: Arc<Mutex<Vec<(Txid, TransactionContext)>>>,
+    /// Recorded chainlock notification heights for test assertions.
+    chainlock_notifications: Arc<Mutex<Vec<u32>>>,
 }
 
 impl MockWallet {
@@ -31,7 +42,33 @@ impl MockWallet {
             effects: Arc::new(Mutex::new(BTreeMap::new())),
             synced_height: 0,
             event_sender,
+            mempool_relevant: false,
+            addresses: Vec::new(),
+            outpoints: Vec::new(),
+            mempool_new_addresses: Vec::new(),
+            status_changes: Arc::new(Mutex::new(Vec::new())),
+            chainlock_notifications: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Configure whether mempool transactions are reported as relevant.
+    pub fn set_mempool_relevant(&mut self, relevant: bool) {
+        self.mempool_relevant = relevant;
+    }
+
+    /// Set the addresses returned by monitored_addresses.
+    pub fn set_addresses(&mut self, addresses: Vec<Address>) {
+        self.addresses = addresses;
+    }
+
+    /// Set the outpoints returned by watched_outpoints.
+    pub fn set_outpoints(&mut self, outpoints: Vec<OutPoint>) {
+        self.outpoints = outpoints;
+    }
+
+    /// Set new addresses returned by process_mempool_transaction.
+    pub fn set_mempool_new_addresses(&mut self, addresses: Vec<Address>) {
+        self.mempool_new_addresses = addresses;
     }
 
     pub async fn set_effect(&self, txid: dashcore::Txid, net: i64, addresses: Vec<String>) {
@@ -46,11 +83,30 @@ impl MockWallet {
     pub fn processed_transactions(&self) -> Arc<Mutex<Vec<dashcore::Txid>>> {
         self.processed_transactions.clone()
     }
+
+    pub fn status_changes(&self) -> Arc<Mutex<Vec<(Txid, TransactionContext)>>> {
+        self.status_changes.clone()
+    }
+
+    pub fn chainlock_notifications(&self) -> Arc<Mutex<Vec<u32>>> {
+        self.chainlock_notifications.clone()
+    }
+}
+
+impl Default for MockWallet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl WalletInterface for MockWallet {
-    async fn process_block(&mut self, block: &Block, height: u32) -> BlockProcessingResult {
+    async fn process_block(
+        &mut self,
+        block: &Block,
+        height: u32,
+        _best_chainlock_height: Option<u32>,
+    ) -> BlockProcessingResult {
         let mut processed = self.processed_blocks.lock().await;
         processed.push((block.block_hash(), height));
 
@@ -61,9 +117,38 @@ impl WalletInterface for MockWallet {
         }
     }
 
-    async fn process_mempool_transaction(&mut self, tx: &Transaction) {
+    async fn process_mempool_transaction(
+        &mut self,
+        tx: &Transaction,
+        _is_instant_send: bool,
+    ) -> MempoolTransactionResult {
         let mut processed = self.processed_transactions.lock().await;
         processed.push(tx.txid());
+
+        if !self.mempool_relevant {
+            return MempoolTransactionResult::default();
+        }
+
+        let effects = self.effects.lock().await;
+        let (net_amount, addresses) = if let Some((net, addr_strs)) = effects.get(&tx.txid()) {
+            let addrs = addr_strs
+                .iter()
+                .filter_map(|s| {
+                    Address::<NetworkUnchecked>::from_str(s).ok().map(|a| a.assume_checked())
+                })
+                .collect();
+            (*net, addrs)
+        } else {
+            (0, Vec::new())
+        };
+
+        MempoolTransactionResult {
+            is_relevant: true,
+            net_amount,
+            is_outgoing: net_amount < 0,
+            addresses,
+            new_addresses: self.mempool_new_addresses.clone(),
+        }
     }
 
     async fn describe(&self) -> String {
@@ -76,7 +161,11 @@ impl WalletInterface for MockWallet {
     }
 
     fn monitored_addresses(&self) -> Vec<Address> {
-        Vec::new()
+        self.addresses.clone()
+    }
+
+    fn watched_outpoints(&self) -> Vec<OutPoint> {
+        self.outpoints.clone()
     }
 
     fn synced_height(&self) -> CoreBlockHeight {
@@ -89,6 +178,22 @@ impl WalletInterface for MockWallet {
 
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
+    }
+
+    fn notify_transaction_status_changed(&self, txid: Txid, status: TransactionContext) {
+        if let Ok(mut changes) = self.status_changes.try_lock() {
+            changes.push((txid, status));
+        }
+    }
+
+    fn process_instant_send_lock(&mut self, txid: Txid) {
+        self.notify_transaction_status_changed(txid, TransactionContext::InstantSend);
+    }
+
+    fn process_chainlock(&mut self, height: u32) {
+        if let Ok(mut notifications) = self.chainlock_notifications.try_lock() {
+            notifications.push(height);
+        }
     }
 }
 
@@ -116,11 +221,22 @@ impl NonMatchingMockWallet {
 
 #[async_trait::async_trait]
 impl WalletInterface for NonMatchingMockWallet {
-    async fn process_block(&mut self, _block: &Block, _height: u32) -> BlockProcessingResult {
+    async fn process_block(
+        &mut self,
+        _block: &Block,
+        _height: u32,
+        _best_chainlock_height: Option<u32>,
+    ) -> BlockProcessingResult {
         BlockProcessingResult::default()
     }
 
-    async fn process_mempool_transaction(&mut self, _tx: &Transaction) {}
+    async fn process_mempool_transaction(
+        &mut self,
+        _tx: &Transaction,
+        _is_instant_send: bool,
+    ) -> MempoolTransactionResult {
+        MempoolTransactionResult::default()
+    }
 
     fn monitored_addresses(&self) -> Vec<Address> {
         Vec::new()

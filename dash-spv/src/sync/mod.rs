@@ -10,6 +10,7 @@ mod filters;
 mod identifier;
 mod instantsend;
 mod masternodes;
+mod mempool;
 mod progress;
 mod sync_coordinator;
 mod sync_manager;
@@ -21,6 +22,7 @@ pub use filter_headers::{FilterHeadersManager, FilterHeadersProgress};
 pub use filters::{FiltersManager, FiltersProgress};
 pub use instantsend::{InstantSendManager, InstantSendProgress};
 pub use masternodes::{MasternodesManager, MasternodesProgress};
+pub use mempool::{MempoolManager, MempoolProgress};
 
 pub use events::SyncEvent;
 pub use identifier::ManagerIdentifier;

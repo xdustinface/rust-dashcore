@@ -1,9 +1,12 @@
 use dash_spv::network::NetworkEvent;
 use dash_spv::sync::{ProgressPercentage, SyncEvent, SyncProgress};
 use dash_spv::test_utils::DashCoreNode;
+use dashcore::Txid;
+use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet_manager::wallet_manager::{WalletId, WalletManager};
+use key_wallet_manager::WalletEvent;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,6 +123,39 @@ pub(super) async fn wait_for_network_event(
                 }
             }
         }
+    }
+}
+
+/// Wait for a wallet `TransactionReceived` event with mempool status within the given timeout.
+/// Returns `Some(txid)` if received, `None` on timeout.
+pub(super) async fn wait_for_mempool_tx(
+    receiver: &mut broadcast::Receiver<WalletEvent>,
+    max_wait: Duration,
+) -> Option<Txid> {
+    let timeout = tokio::time::sleep(max_wait);
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return None,
+            result = receiver.recv() => {
+                match result {
+                    Ok(WalletEvent::TransactionReceived { txid, status: TransactionContext::Mempool, .. }) => return Some(txid),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+}
+
+/// Assert that no mempool `TransactionReceived` event arrives within the given duration.
+pub(super) async fn assert_no_mempool_tx(
+    receiver: &mut broadcast::Receiver<WalletEvent>,
+    wait: Duration,
+) {
+    if let Some(txid) = wait_for_mempool_tx(receiver, wait).await {
+        panic!("Unexpected mempool TransactionReceived event with txid: {}", txid);
     }
 }
 

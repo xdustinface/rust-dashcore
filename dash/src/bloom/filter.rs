@@ -362,7 +362,8 @@ mod tests {
                 .try_into()
                 .unwrap();
         let secret_key = secp256k1::SecretKey::from_byte_array(&privkey_bytes).unwrap();
-        let privkey = PrivateKey::new_uncompressed(secret_key, crate::network::constants::Network::Mainnet);
+        let privkey =
+            PrivateKey::new_uncompressed(secret_key, crate::network::constants::Network::Mainnet);
         let pubkey = privkey.public_key(&secp);
 
         let mut filter = BloomFilter::new(2, 0.001, 0, BloomFlags::All).unwrap();
@@ -379,7 +380,10 @@ mod tests {
         filter.consensus_encode(&mut encoded).unwrap();
 
         let expected = hex::decode("038fc16b080000000000000001").unwrap();
-        assert_eq!(encoded, expected, "Serialized bloom filter must match Dash Core bloom_create_insert_key test vector");
+        assert_eq!(
+            encoded, expected,
+            "Serialized bloom filter must match Dash Core bloom_create_insert_key test vector"
+        );
     }
 
     /// Verify with tweak = 2147483649 (from Dash Core bloom_create_insert_serialize_with_tweak).
