@@ -264,6 +264,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_mempool_tracking(mempool_strategy);
     }
 
+    let mempool_strategy = *matches
+        .get_one::<MempoolStrategy>("mempool-strategy")
+        .expect("mempool-strategy has default value");
+    config = config.with_mempool_tracking(mempool_strategy);
+
     // Set start height if specified
     if let Some(start_height_str) = matches.get_one::<String>("start-height") {
         if start_height_str == "now" {
