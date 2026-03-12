@@ -57,8 +57,6 @@ pub struct PeerNetworkManager {
     tasks: Arc<Mutex<JoinSet<()>>>,
     /// Initial peer addresses
     initial_peers: Vec<SocketAddr>,
-    /// Current sync peer (sticky during sync operations)
-    current_sync_peer: Arc<Mutex<Option<SocketAddr>>>,
     /// Data directory for storage
     data_dir: PathBuf,
     /// Mempool strategy from config
@@ -113,7 +111,6 @@ impl PeerNetworkManager {
             shutdown_token: CancellationToken::new(),
             tasks: Arc::new(Mutex::new(JoinSet::new())),
             initial_peers: config.peers.clone(),
-            current_sync_peer: Arc::new(Mutex::new(None)),
             data_dir,
             mempool_strategy: config.mempool_strategy,
             user_agent: config.user_agent.clone(),
@@ -962,7 +959,7 @@ impl PeerNetworkManager {
         });
     }
 
-    /// Send a message to a single peer (using sticky peer selection for sync consistency)
+    /// Send a message to a single peer selected by message type requirements.
     async fn send_to_single_peer(&self, message: NetworkMessage) -> NetworkResult<()> {
         let peers = self.pool.get_all_peers().await;
 
@@ -970,104 +967,33 @@ impl PeerNetworkManager {
             return Err(NetworkError::ConnectionFailed("No connected peers".to_string()));
         }
 
-        // For filter-related messages, we need a peer that supports compact filters
-        let requires_compact_filters =
-            matches!(&message, NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFilters(_));
-        let check_headers2 =
-            matches!(&message, NetworkMessage::GetHeaders(_) | NetworkMessage::GetHeaders2(_));
-
-        let selected_peer = if requires_compact_filters {
-            // Find a peer that supports compact filters
-            let mut filter_peer = None;
-            for (addr, peer) in &peers {
-                let peer_guard = peer.read().await;
-
-                if peer_guard.supports_compact_filters() {
-                    filter_peer = Some(*addr);
-                    break;
-                }
+        let preferred_service = match &message {
+            NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFilters(_) => {
+                Some((ServiceFlags::COMPACT_FILTERS, true))
             }
-
-            match filter_peer {
-                Some(addr) => {
-                    log::debug!("Selected peer {} for compact filter request", addr);
-                    addr
-                }
-                None => {
-                    log::warn!("No peers support compact filters, cannot send {}", message.cmd());
-                    return Err(NetworkError::ProtocolError(
-                        "No peers support compact filters".to_string(),
-                    ));
-                }
+            NetworkMessage::GetHeaders(_) | NetworkMessage::GetHeaders2(_) => {
+                Some((ServiceFlags::NODE_HEADERS_COMPRESSED, false))
             }
-        } else if check_headers2 {
-            // Prefer a peer that advertises headers2 support
-            let mut current_sync_peer = self.current_sync_peer.lock().await;
-            let mut selected: Option<SocketAddr> = None;
-
-            if let Some(current_addr) = *current_sync_peer {
-                if let Some((_, peer)) = peers.iter().find(|(addr, _)| *addr == current_addr) {
-                    let peer_guard = peer.read().await;
-                    if peer_guard.supports_headers2() {
-                        selected = Some(current_addr);
-                    }
-                }
-            }
-
-            if selected.is_none() {
-                for (addr, peer) in &peers {
-                    let peer_guard = peer.read().await;
-                    if peer_guard.supports_headers2() {
-                        selected = Some(*addr);
-                        break;
-                    }
-                }
-            }
-
-            let chosen = selected.unwrap_or(peers[0].0);
-            if Some(chosen) != *current_sync_peer {
-                log::info!("Sync peer selected for Headers2: {}", chosen);
-                *current_sync_peer = Some(chosen);
-            }
-            drop(current_sync_peer);
-            chosen
-        } else {
-            // For non-filter messages, use the sticky sync peer
-            let mut current_sync_peer = self.current_sync_peer.lock().await;
-            let selected = if let Some(current_addr) = *current_sync_peer {
-                // Check if current sync peer is still connected
-                if peers.iter().any(|(addr, _)| *addr == current_addr) {
-                    // Keep using the same peer for sync consistency
-                    current_addr
-                } else {
-                    // Current sync peer disconnected, pick a new one
-                    let new_addr = peers[0].0;
-                    log::info!(
-                        "Sync peer switched from {} to {} (previous peer disconnected)",
-                        current_addr,
-                        new_addr
-                    );
-                    *current_sync_peer = Some(new_addr);
-                    new_addr
-                }
-            } else {
-                // No current sync peer, pick the first available
-                let new_addr = peers[0].0;
-                log::info!("Sync peer selected: {}", new_addr);
-                *current_sync_peer = Some(new_addr);
-                new_addr
-            };
-            drop(current_sync_peer);
-            selected
+            _ => None,
         };
 
-        // Find the peer for the selected address
-        let (addr, peer) = peers
-            .iter()
-            .find(|(a, _)| *a == selected_peer)
-            .ok_or_else(|| NetworkError::ConnectionFailed("Selected peer not found".to_string()))?;
+        let (addr, peer) = if let Some((flags, required)) = preferred_service {
+            match self.pool.peer_with_service(flags).await {
+                Some((address, peer)) => {
+                    log::debug!("Selected peer {} with {} for {}", address, flags, message.cmd());
+                    (address, peer)
+                }
+                None if required => {
+                    log::warn!("No peers support {}, cannot send {}", flags, message.cmd());
+                    return Err(NetworkError::ProtocolError(format!("No peers support {}", flags)));
+                }
+                None => self.next_peer(&peers),
+            }
+        } else {
+            self.next_peer(&peers)
+        };
 
-        self.send_message_to_peer(addr, peer, message).await
+        self.send_message_to_peer(&addr, &peer, message).await
     }
 
     /// Send a message distributed across connected peers using round-robin selection.
@@ -1086,33 +1012,17 @@ impl PeerNetworkManager {
         // Select eligible peers based on message type
         let (selected_peers, require_capability) = match &message {
             NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFilters(_) => {
-                // Filter requests require compact filter support
-                let filter_peers: Vec<_> = {
-                    let mut result = Vec::new();
-                    for (addr, peer) in &peers {
-                        let peer_guard = peer.read().await;
-                        if peer_guard.supports_compact_filters() {
-                            result.push((*addr, peer.clone()));
-                        }
-                    }
-                    result
-                };
+                let filter_peers =
+                    self.pool.peers_with_service(ServiceFlags::COMPACT_FILTERS).await;
                 (filter_peers, true)
             }
             NetworkMessage::GetHeaders(_) | NetworkMessage::GetHeaders2(_) => {
-                // Prefer headers2 peers, fall back to all
-                let headers2_peers: Vec<_> = {
-                    let mut result = Vec::new();
-                    for (addr, peer) in &peers {
-                        let peer_guard = peer.read().await;
-                        if peer_guard.supports_headers2()
-                            && !self.headers2_disabled.lock().await.contains(addr)
-                        {
-                            result.push((*addr, peer.clone()));
-                        }
-                    }
-                    result
-                };
+                // Prefer headers2 peers (excluding disabled), fall back to all
+                let disabled = self.headers2_disabled.lock().await;
+                let mut headers2_peers =
+                    self.pool.peers_with_service(ServiceFlags::NODE_HEADERS_COMPRESSED).await;
+                headers2_peers.retain(|(addr, _)| !disabled.contains(addr));
+                drop(disabled);
                 if headers2_peers.is_empty() {
                     (peers.clone(), false)
                 } else {
@@ -1133,18 +1043,20 @@ impl PeerNetworkManager {
             };
         }
 
-        // Round-robin selection
-        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % selected_peers.len();
-        let (addr, peer) = &selected_peers[idx];
+        let (addr, peer) = self.next_peer(&selected_peers);
 
-        log::debug!(
-            "Distributing {} request to peer {} (round-robin idx {})",
-            message.cmd(),
-            addr,
-            idx
-        );
+        log::debug!("Distributing {} request to peer {}", message.cmd(), addr);
 
-        self.send_message_to_peer(addr, peer, message).await
+        self.send_message_to_peer(&addr, &peer, message).await
+    }
+
+    /// Pick the next peer from `peers` using round-robin rotation.
+    fn next_peer(
+        &self,
+        peers: &[(SocketAddr, Arc<RwLock<Peer>>)],
+    ) -> (SocketAddr, Arc<RwLock<Peer>>) {
+        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % peers.len();
+        (peers[idx].0, peers[idx].1.clone())
     }
 
     /// Send a message to the given peer.
@@ -1307,7 +1219,6 @@ impl Clone for PeerNetworkManager {
             shutdown_token: self.shutdown_token.clone(),
             tasks: self.tasks.clone(),
             initial_peers: self.initial_peers.clone(),
-            current_sync_peer: self.current_sync_peer.clone(),
             data_dir: self.data_dir.clone(),
             mempool_strategy: self.mempool_strategy,
             user_agent: self.user_agent.clone(),
