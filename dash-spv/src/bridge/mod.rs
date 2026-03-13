@@ -769,6 +769,45 @@ impl SpvClient {
     }
 }
 
+// ============ Transaction history methods ============
+
+#[uniffi::export]
+impl SpvClient {
+    /// Returns a paginated list of transactions from the wallet's transaction history.
+    ///
+    /// Transaction history sync is not yet implemented in the SPV client, so this
+    /// method always returns an empty `Vec`.  It is exported so foreign-language
+    /// bindings can be generated and call-sites can be wired up in advance.
+    ///
+    /// # Parameters
+    ///
+    /// * `limit`  – maximum number of transactions to return.
+    /// * `offset` – number of transactions to skip before returning results.
+    pub async fn get_transactions(&self, limit: u32, offset: u32) -> Vec<TransactionInfo> {
+        let _ = (limit, offset);
+        vec![]
+    }
+
+    /// Looks up a single transaction by its transaction ID.
+    ///
+    /// Transaction history sync is not yet implemented in the SPV client, so this
+    /// method always returns `None`.  It is exported so foreign-language bindings
+    /// can be generated and call-sites can be wired up in advance.
+    pub async fn get_transaction(&self, txid: String) -> Option<TransactionInfo> {
+        let _ = txid;
+        None
+    }
+
+    /// Returns the total number of transactions in the wallet's transaction history.
+    ///
+    /// Transaction history sync is not yet implemented in the SPV client, so this
+    /// method always returns `0`.  It is exported so foreign-language bindings can
+    /// be generated and call-sites can be wired up in advance.
+    pub async fn get_transaction_count(&self) -> u32 {
+        0
+    }
+}
+
 // ============ Stub functions ============
 
 /// Returns a greeting string (sanity-check export).
@@ -1588,6 +1627,59 @@ mod tests {
         assert!(
             client.get_governance_proposal("deadbeef".to_string()).await.is_none(),
             "get_governance_proposal should return None (stub)"
+        );
+    }
+
+    // ---- get_transactions / get_transaction / get_transaction_count stub tests ----
+
+    /// `get_transaction_count` always returns 0 (transaction history not yet implemented).
+    #[tokio::test]
+    async fn test_get_transaction_count_returns_zero() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert_eq!(
+            client.get_transaction_count().await,
+            0,
+            "get_transaction_count should return 0 (stub)"
+        );
+    }
+
+    /// `get_transactions` always returns an empty vec (transaction history not yet implemented).
+    #[tokio::test]
+    async fn test_get_transactions_returns_empty() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_transactions(10, 0).await.is_empty(),
+            "get_transactions should return empty vec (stub)"
+        );
+    }
+
+    /// `get_transactions` with various limit/offset values always returns empty (stub).
+    #[tokio::test]
+    async fn test_get_transactions_with_limit_and_offset() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(client.get_transactions(0, 0).await.is_empty());
+        assert!(client.get_transactions(100, 50).await.is_empty());
+    }
+
+    /// `get_transaction` always returns `None` (transaction history not yet implemented).
+    #[tokio::test]
+    async fn test_get_transaction_returns_none() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_transaction("abcd1234".to_string()).await.is_none(),
+            "get_transaction should return None (stub)"
         );
     }
 }
