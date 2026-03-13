@@ -150,6 +150,28 @@ pub(super) async fn wait_for_mempool_tx(
     }
 }
 
+/// Wait for a `MempoolActivated` sync event within a timeout.
+/// Returns `Some(peer)` if received, `None` on timeout.
+pub(super) async fn wait_for_mempool_activated(
+    receiver: &mut broadcast::Receiver<SyncEvent>,
+) -> Option<std::net::SocketAddr> {
+    let timeout = sleep(Duration::from_secs(30));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => return None,
+            result = receiver.recv() => {
+                match result {
+                    Ok(SyncEvent::MempoolActivated { peer }) => return Some(peer),
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+}
+
 /// Assert that no mempool `TransactionReceived` event arrives within the given duration.
 pub(super) async fn assert_no_mempool_tx(
     receiver: &mut broadcast::Receiver<WalletEvent>,

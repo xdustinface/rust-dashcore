@@ -344,6 +344,30 @@ impl DashCoreNode {
         txid
     }
 
+    /// Connect this dashd node to another dashd node via P2P and wait for the
+    /// connection to be established.
+    pub async fn connect_to_node(&self, addr: SocketAddr) {
+        let client = self.rpc_client();
+        client.onetry_node(&addr.to_string()).expect("failed to connect to node");
+
+        for _ in 0..30 {
+            let peers = client.get_peer_info().expect("failed to get peer info");
+            if peers.iter().any(|p| p.addr.to_string().starts_with(&addr.ip().to_string())) {
+                tracing::info!("Connected to node {}", addr);
+                return;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        panic!("Timed out waiting for connection to {}", addr);
+    }
+
+    /// Disconnect a specific peer by address.
+    pub fn disconnect_peer(&self, addr: SocketAddr) {
+        let client = self.rpc_client();
+        client.disconnect_node(&addr.to_string()).expect("failed to disconnect peer");
+        tracing::info!("Disconnected peer {}", addr);
+    }
+
     /// Disconnect all currently connected peers.
     pub fn disconnect_all_peers(&self) {
         let client = self.rpc_client();

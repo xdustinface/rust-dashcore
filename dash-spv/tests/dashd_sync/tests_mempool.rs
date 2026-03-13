@@ -3,9 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dash_spv::client::config::MempoolStrategy;
+use dash_spv::network::NetworkEvent;
+use dash_spv::test_utils::DashdTestContext;
 use dashcore::Amount;
 
-use super::helpers::{assert_no_mempool_tx, wait_for_mempool_tx, wait_for_sync};
+use super::helpers::{
+    assert_no_mempool_tx, wait_for_mempool_activated, wait_for_mempool_tx, wait_for_network_event,
+    wait_for_sync,
+};
 use super::setup::{create_and_start_client, TestContext};
 
 const MEMPOOL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -363,4 +368,142 @@ async fn test_mempool_bloom_filter_incoming_and_outgoing_tx() {
 
     client_handle.stop().await;
     tracing::info!("test_mempool_bloom_filter_incoming_and_outgoing_tx passed");
+}
+
+/// Verify mempool handles peer disconnection and reactivation across multiple scenarios.
+///
+/// Uses two dashd nodes connected to each other. The SPV client connects to both peers and
+/// exercises these scenarios in sequence:
+/// 1. Mempool activates after sync — verify tx detection works
+/// 2. Disconnect the mempool peer — verify reactivation on the other peer, then tx detection
+/// 3. Disconnect both peers, reconnect one — verify mempool recovers and detects a tx
+#[tokio::test]
+async fn test_mempool_peer_disconnect_reactivation() {
+    let Some(ctx) = TestContext::new().await else {
+        return;
+    };
+    if !ctx.dashd.supports_mining {
+        eprintln!("Skipping test (dashd RPC miner not available)");
+        return;
+    }
+
+    let Some(dashd2) = DashdTestContext::new().await else {
+        eprintln!("Skipping test (could not create second dashd node)");
+        return;
+    };
+
+    // Connect the two dashd nodes so mempool transactions propagate between them
+    ctx.dashd.node.connect_to_node(dashd2.addr).await;
+
+    // Configure SPV client with both peers and sync
+    let mut config = ctx.client_config.clone();
+    config.add_peer(dashd2.addr);
+
+    let mut client_handle = create_and_start_client(&config, Arc::clone(&ctx.wallet)).await;
+    wait_for_sync(&mut client_handle.progress_receiver, ctx.dashd.initial_height).await;
+
+    // Identify which peer was chosen for mempool relay.
+    // Brief sleep lets the MemPool/FilterClear messages reach the peer before we send txs.
+    let mempool_peer = wait_for_mempool_activated(&mut client_handle.sync_event_receiver)
+        .await
+        .expect("Expected MempoolActivated event after sync");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tracing::info!("Mempool activated on peer {}", mempool_peer);
+
+    let (mempool_node, other_node, other_addr) = if mempool_peer == ctx.dashd.addr {
+        (&ctx.dashd.node, &dashd2.node, dashd2.addr)
+    } else {
+        (&dashd2.node, &ctx.dashd.node, ctx.dashd.addr)
+    };
+
+    // --- Scenario 1: baseline mempool detection with both peers ---
+    // Send from the mempool peer's node directly so the tx is immediately in its mempool
+    // and relayed to SPV without needing inter-node propagation.
+    let receive_address = ctx.receive_address().await;
+    let txid1 = mempool_node.send_to_address(&receive_address, Amount::from_sat(50_000_000));
+    tracing::info!("[scenario 1] sent tx {} from mempool peer", txid1);
+
+    let detected = wait_for_mempool_tx(&mut client_handle.wallet_event_receiver, MEMPOOL_TIMEOUT)
+        .await
+        .expect("Scenario 1: expected mempool tx detection");
+    assert_eq!(detected, txid1);
+
+    let mempool_count = client_handle.client.get_mempool_transaction_count().await;
+    assert_eq!(mempool_count, 1, "Scenario 1: expected 1 mempool tx");
+
+    // --- Scenario 2: disconnect the mempool peer, verify reactivation on the other ---
+    mempool_node.disconnect_all_peers();
+
+    let saw_disconnect = wait_for_network_event(
+        &mut client_handle.network_event_receiver,
+        |e| matches!(e, NetworkEvent::PeerDisconnected { address } if *address == mempool_peer),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(saw_disconnect, "SPV should observe PeerDisconnected for mempool peer");
+
+    let new_mempool_peer = wait_for_mempool_activated(&mut client_handle.sync_event_receiver)
+        .await
+        .expect("Expected MempoolActivated after mempool peer disconnect");
+    assert_eq!(new_mempool_peer, other_addr, "Mempool should reactivate on the remaining peer");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tracing::info!("[scenario 2] mempool reactivated on {}", new_mempool_peer);
+
+    let txid2 = other_node.send_to_address(&receive_address, Amount::from_sat(60_000_000));
+    tracing::info!("[scenario 2] sent tx {} from reactivated mempool peer", txid2);
+
+    let detected = wait_for_mempool_tx(&mut client_handle.wallet_event_receiver, MEMPOOL_TIMEOUT)
+        .await
+        .expect("Scenario 2: expected mempool tx detection after reactivation");
+    assert_eq!(detected, txid2);
+
+    let mempool_count = client_handle.client.get_mempool_transaction_count().await;
+    assert_eq!(mempool_count, 2, "Scenario 2: expected 2 mempool txs (cumulative)");
+
+    // --- Scenario 3: disconnect both peers, verify recovery ---
+    // Reconnect dashd nodes so SPV can reach either after full disconnect.
+    mempool_node.connect_to_node(other_addr).await;
+    other_node.disconnect_all_peers();
+
+    let saw_disconnect = wait_for_network_event(
+        &mut client_handle.network_event_receiver,
+        |e| matches!(e, NetworkEvent::PeerDisconnected { address } if *address == other_addr),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(saw_disconnect, "SPV should observe PeerDisconnected for other peer");
+
+    // SPV has no peers. Wait for reconnection and mempool reactivation.
+    let saw_reconnect = wait_for_network_event(
+        &mut client_handle.network_event_receiver,
+        |e| matches!(e, NetworkEvent::PeerConnected { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(saw_reconnect, "SPV should reconnect to a peer");
+
+    let recovered_peer = wait_for_mempool_activated(&mut client_handle.sync_event_receiver)
+        .await
+        .expect("Expected MempoolActivated after full disconnect recovery");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tracing::info!("[scenario 3] mempool recovered on peer {}", recovered_peer);
+
+    let recovered_node = if recovered_peer == ctx.dashd.addr {
+        &ctx.dashd.node
+    } else {
+        &dashd2.node
+    };
+    let txid3 = recovered_node.send_to_address(&receive_address, Amount::from_sat(70_000_000));
+    tracing::info!("[scenario 3] sent tx {} from recovered mempool peer", txid3);
+
+    let detected = wait_for_mempool_tx(&mut client_handle.wallet_event_receiver, MEMPOOL_TIMEOUT)
+        .await
+        .expect("Scenario 3: expected mempool tx detection after full disconnect recovery");
+    assert_eq!(detected, txid3);
+
+    let mempool_count = client_handle.client.get_mempool_transaction_count().await;
+    assert_eq!(mempool_count, 3, "Scenario 3: expected 3 mempool txs (cumulative)");
+
+    client_handle.stop().await;
+    tracing::info!("test_mempool_peer_disconnect_reactivation passed");
 }

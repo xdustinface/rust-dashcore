@@ -99,7 +99,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Activate mempool monitoring on a specific peer after sync is complete.
+    /// Activate mempool monitoring after sync is complete.
     ///
     /// Since we connect with `relay=false`, peers won't send transaction INVs
     /// until we explicitly enable relay:
@@ -307,9 +307,6 @@ impl<W: WalletInterface> MempoolManager<W> {
                 available -= 1;
             }
         }
-
-        // Remove empty queues
-        self.queued.retain(|_, q| !q.is_empty());
 
         let total_queued: usize = self.queued.values().map(|q| q.len()).sum();
         for (peer, inventory) in per_peer {

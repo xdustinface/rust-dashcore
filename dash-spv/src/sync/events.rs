@@ -4,6 +4,7 @@ use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::{Address, BlockHash, Txid};
 use key_wallet_manager::wallet_manager::FilterMatchKey;
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 
 /// Events that managers can emit and subscribe to.
 ///
@@ -145,6 +146,15 @@ pub enum SyncEvent {
         validated: bool,
     },
 
+    /// Mempool relay activated on a peer.
+    ///
+    /// Emitted by: `MempoolManager`
+    /// Consumed by: External listeners
+    MempoolActivated {
+        /// The peer that mempool relay was activated on.
+        peer: SocketAddr,
+    },
+
     /// Sync has reached the chain tip (all managers idle).
     ///
     /// Emitted on every not-synced to synced transition. Cycle 0 is the
@@ -241,6 +251,11 @@ impl SyncEvent {
                 validated,
             } => {
                 format!("InstantLockReceived(txid={}, validated={})", instant_lock.txid, validated)
+            }
+            SyncEvent::MempoolActivated {
+                peer,
+            } => {
+                format!("MempoolActivated(peer={})", peer)
             }
             SyncEvent::SyncComplete {
                 header_tip,
