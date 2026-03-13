@@ -3,6 +3,7 @@
 //! This provides utilities for managing a dashd instance and loading test wallet data.
 
 use dashcore::{Address, Amount, BlockHash, Transaction, Txid};
+use std::collections::HashMap;
 use dashcore_rpc::json as rpc_json;
 use dashcore_rpc::{Auth, Client, RpcApi};
 use serde::Deserialize;
@@ -318,7 +319,7 @@ impl DashCoreNode {
             sequence: None,
         }];
         let send_amount = input_amount.checked_sub(fee).expect("fee exceeds input amount");
-        let mut outputs = std::collections::HashMap::new();
+        let mut outputs = HashMap::new();
         outputs.insert(destination.to_string(), send_amount);
 
         let raw_tx: Transaction = client

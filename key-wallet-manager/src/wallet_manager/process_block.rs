@@ -321,7 +321,9 @@ mod tests {
     use super::*;
     use crate::wallet_manager::WalletId;
     use dashcore::hashes::Hash;
-    use dashcore::{Network, ScriptBuf, TxOut, Witness};
+    use dashcore::block::{Header, Version};
+    use dashcore::pow::CompactTarget;
+    use dashcore::{BlockHash, Network, OutPoint, ScriptBuf, TxIn, Txid, TxMerkleNode, TxOut, Witness};
     use key_wallet::wallet::initialization::WalletAccountCreationOptions;
     use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
@@ -349,9 +351,9 @@ mod tests {
         Transaction {
             version: 2,
             lock_time: 0,
-            input: vec![dashcore::TxIn {
-                previous_output: dashcore::OutPoint {
-                    txid: dashcore::Txid::from_byte_array([input_seed; 32]),
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([input_seed; 32]),
                     vout: 0,
                 },
                 script_sig: ScriptBuf::new(),
@@ -368,12 +370,12 @@ mod tests {
 
     fn make_block(txdata: Vec<Transaction>) -> Block {
         Block {
-            header: dashcore::block::Header {
-                version: dashcore::block::Version::ONE,
-                prev_blockhash: dashcore::BlockHash::from_byte_array([0; 32]),
-                merkle_root: dashcore::TxMerkleNode::from_byte_array([0; 32]),
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::from_byte_array([0; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
                 time: 1000,
-                bits: dashcore::CompactTarget::from_consensus(0x1d00ffff),
+                bits: CompactTarget::from_consensus(0x1d00ffff),
                 nonce: 0,
             },
             txdata,

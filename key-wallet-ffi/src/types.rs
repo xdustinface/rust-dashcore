@@ -1,5 +1,7 @@
 //! Common types for FFI interface
 
+use dashcore::hashes::Hash;
+use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::{Network, Wallet};
 use std::os::raw::{c_char, c_uint};
 use std::sync::Arc;
@@ -720,21 +722,15 @@ pub enum FFITransactionContext {
     InChainLockedBlock = 3,
 }
 
-impl From<key_wallet::transaction_checking::TransactionContext> for FFITransactionContext {
-    fn from(ctx: key_wallet::transaction_checking::TransactionContext) -> Self {
+impl From<TransactionContext> for FFITransactionContext {
+    fn from(ctx: TransactionContext) -> Self {
         match ctx {
-            key_wallet::transaction_checking::TransactionContext::Mempool => {
-                FFITransactionContext::Mempool
+            TransactionContext::Mempool => FFITransactionContext::Mempool,
+            TransactionContext::InstantSend => FFITransactionContext::InstantSend,
+            TransactionContext::InBlock { .. } => FFITransactionContext::InBlock,
+            TransactionContext::InChainLockedBlock { .. } => {
+                FFITransactionContext::InChainLockedBlock
             }
-            key_wallet::transaction_checking::TransactionContext::InstantSend => {
-                FFITransactionContext::InstantSend
-            }
-            key_wallet::transaction_checking::TransactionContext::InBlock {
-                ..
-            } => FFITransactionContext::InBlock,
-            key_wallet::transaction_checking::TransactionContext::InChainLockedBlock {
-                ..
-            } => FFITransactionContext::InChainLockedBlock,
         }
     }
 }
@@ -785,9 +781,7 @@ impl FFITransactionContextDetails {
     }
 
     /// Convert to the native TransactionContext
-    pub fn to_transaction_context(&self) -> key_wallet::transaction_checking::TransactionContext {
-        use key_wallet::transaction_checking::TransactionContext;
-
+    pub fn to_transaction_context(&self) -> TransactionContext {
         match self.context_type {
             FFITransactionContext::Mempool => TransactionContext::Mempool,
             FFITransactionContext::InBlock => {
@@ -799,7 +793,6 @@ impl FFITransactionContextDetails {
                     unsafe {
                         std::ptr::copy_nonoverlapping(self.block_hash, hash_bytes.as_mut_ptr(), 32);
                     }
-                    use dashcore::hashes::Hash;
                     Some(dashcore::BlockHash::from_byte_array(hash_bytes))
                 };
 
@@ -822,7 +815,6 @@ impl FFITransactionContextDetails {
                     unsafe {
                         std::ptr::copy_nonoverlapping(self.block_hash, hash_bytes.as_mut_ptr(), 32);
                     }
-                    use dashcore::hashes::Hash;
                     Some(dashcore::BlockHash::from_byte_array(hash_bytes))
                 };
 

@@ -5,12 +5,13 @@
 //! transactions from the mempool.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashcore::network::message_blockdata::Inventory;
-use dashcore::Txid;
+use dashcore::{Amount, Transaction, Txid};
 use rand::seq::IteratorRandom;
 use tokio::sync::RwLock;
 
@@ -95,8 +96,10 @@ impl<W: WalletInterface> MempoolManager<W> {
 
     /// Activate mempool monitoring after sync is complete.
     ///
-    /// For BloomFilter strategy: builds and sends a bloom filter, then sends `mempool`.
-    /// For FetchAll strategy: just sends `mempool`.
+    /// Since we connect with `relay=false`, peers won't send transaction INVs
+    /// until we explicitly enable relay:
+    /// - BloomFilter strategy: sends `filterload` (which enables filtered relay) + `mempool`
+    /// - FetchAll strategy: sends `mempool` + `filterclear` (which enables unfiltered relay)
     ///
     /// Sets `activated_at` so that `needs_activation_retry()` can detect
     /// activation failures if no inventory response arrives within the timeout.
@@ -109,6 +112,11 @@ impl<W: WalletInterface> MempoolManager<W> {
 
         // Request current mempool inventory
         requests.request_mempool()?;
+
+        if self.strategy == MempoolStrategy::FetchAll {
+            // Enable unfiltered transaction relay going forward
+            requests.send_filter_clear()?;
+        }
 
         self.activated_at = Some(Instant::now());
         Ok(())
@@ -299,7 +307,7 @@ impl<W: WalletInterface> MempoolManager<W> {
     /// Handle a received transaction.
     pub(super) async fn handle_tx(
         &mut self,
-        tx: dashcore::Transaction,
+        tx: Transaction,
     ) -> SyncResult<Vec<SyncEvent>> {
         let txid = tx.txid();
         self.pending_requests.remove(&txid);
@@ -324,7 +332,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         // The wallet already confirmed relevance, so we store unconditionally.
         let unconfirmed_tx = UnconfirmedTransaction::new(
             tx,
-            dashcore::Amount::ZERO,
+            Amount::ZERO,
             is_locked,
             result.is_outgoing,
             result.addresses,
@@ -480,8 +488,8 @@ impl<W: WalletInterface> MempoolManager<W> {
     }
 }
 
-impl<W: WalletInterface> std::fmt::Debug for MempoolManager<W> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<W: WalletInterface> fmt::Debug for MempoolManager<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MempoolManager")
             .field("progress", &self.progress)
             .field("strategy", &self.strategy)
@@ -498,7 +506,7 @@ mod tests {
     use crate::network::NetworkRequest;
     use dashcore::hashes::Hash;
     use dashcore::network::message::NetworkMessage;
-    use dashcore::{Address, Network, OutPoint, ScriptBuf, Transaction};
+    use dashcore::{Address, BlockHash, Network, OutPoint, ScriptBuf, Transaction};
     use key_wallet::transaction_checking::TransactionContext;
     use key_wallet_manager::test_utils::MockWallet;
 
@@ -589,7 +597,7 @@ mod tests {
                 };
                 state.add_transaction(UnconfirmedTransaction::new(
                     tx,
-                    dashcore::Amount::from_sat(0),
+                    Amount::from_sat(0),
                     false,
                     false,
                     Vec::new(),
@@ -693,7 +701,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -724,7 +732,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -743,7 +751,7 @@ mod tests {
         let (mut manager, requests, _rx) = create_test_manager();
 
         let inv = vec![
-            Inventory::Block(dashcore::BlockHash::all_zeros()),
+            Inventory::Block(BlockHash::all_zeros()),
             Inventory::Transaction(Txid::from_byte_array([1u8; 32])),
         ];
 
@@ -769,7 +777,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -856,7 +864,7 @@ mod tests {
     ) -> (
         MempoolManager<MockWallet>,
         RequestSender,
-        tokio::sync::mpsc::UnboundedReceiver<NetworkRequest>,
+        mpsc::UnboundedReceiver<NetworkRequest>,
     ) {
         let mut mock = MockWallet::new();
         mock.set_addresses(addresses);
@@ -994,7 +1002,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -1050,7 +1058,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -1161,7 +1169,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -1319,7 +1327,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             let mut utx = UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),

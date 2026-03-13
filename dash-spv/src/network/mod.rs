@@ -24,6 +24,7 @@ use crate::error::NetworkResult;
 use crate::NetworkError;
 use dashcore::network::message::NetworkMessage;
 use dashcore::network::message_blockdata::{GetHeadersMessage, Inventory};
+use dashcore::network::message_bloom::FilterLoad;
 use dashcore::network::message_filter::{GetCFHeaders, GetCFilters};
 use dashcore::network::message_qrinfo::GetQRInfo;
 use dashcore::network::message_sml::GetMnListDiff;
@@ -149,7 +150,7 @@ impl RequestSender {
     /// Send a filterload message to the peer.
     pub fn send_filter_load(
         &self,
-        filter_load: dashcore::network::message_bloom::FilterLoad,
+        filter_load: FilterLoad,
     ) -> NetworkResult<()> {
         self.send_message(NetworkMessage::FilterLoad(filter_load))
     }

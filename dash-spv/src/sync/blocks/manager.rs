@@ -165,6 +165,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> std::fmt::Debug
 mod tests {
     use super::*;
     use crate::network::{MessageType, NetworkManager};
+    use dashcore::BlockHash;
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentBlockStorage, StorageManager,
     };
@@ -236,7 +237,7 @@ mod tests {
     fn make_chainlock(height: u32) -> ChainLock {
         ChainLock {
             block_height: height,
-            block_hash: dashcore::BlockHash::all_zeros(),
+            block_hash: BlockHash::all_zeros(),
             signature: [0u8; 96].into(),
         }
     }
