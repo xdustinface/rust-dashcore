@@ -50,7 +50,6 @@ mod tests {
     use crate::storage::DiskStorageManager;
     use crate::{test_utils::MockNetworkManager, types::UnconfirmedTransaction};
     use dashcore::sml::masternode_list::MasternodeList;
-    use dashcore::sml::masternode_list_engine::MasternodeListEngine;
     use dashcore::sml::masternode_list_entry::{
         qualified_masternode_list_entry::QualifiedMasternodeListEntry, EntryMasternodeType,
         MasternodeListEntry,
