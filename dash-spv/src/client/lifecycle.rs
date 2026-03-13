@@ -129,7 +129,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                 wallet.clone(),
                 mempool_state.clone(),
                 config.mempool_strategy,
-                config.max_mempool_transactions,
+                config.max_mempool_transactions as usize,
             ));
         }
 
@@ -159,7 +159,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             if config.enable_mempool_tracking {
                 let filter = Arc::new(MempoolFilter::new(
                     config.mempool_strategy,
-                    config.max_mempool_transactions,
+                    config.max_mempool_transactions as usize,
                     client.mempool_state.clone(),
                     HashSet::new(), // TODO: populate from wallet's monitored addresses
                     config.network,
@@ -186,7 +186,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     }
 
     /// Start the SPV client: spawn sync tasks and connect to the network.
-    pub(super) async fn start(&self) -> Result<()> {
+    pub async fn start(&self) -> Result<()> {
         {
             let running = self.running.read().await;
             if *running {

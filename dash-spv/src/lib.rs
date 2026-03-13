@@ -56,6 +56,12 @@
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
+
+#[cfg(feature = "uniffi")]
+pub mod bridge;
+
 pub mod chain;
 pub mod client;
 pub mod error;

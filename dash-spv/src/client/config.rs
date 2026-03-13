@@ -11,6 +11,7 @@ use crate::types::ValidationMode;
 
 /// Strategy for handling mempool (unconfirmed) transactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum MempoolStrategy {
     /// Fetch all announced transactions (high bandwidth, sees all transactions).
     FetchAll,
@@ -21,6 +22,7 @@ pub enum MempoolStrategy {
 /// Configuration for the Dash SPV client.
 #[derive(Debug, Clone)]
 #[repr(C)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ClientConfig {
     /// Network to connect to.
     pub network: Network,
@@ -62,7 +64,7 @@ pub struct ClientConfig {
     pub mempool_strategy: MempoolStrategy,
 
     /// Maximum number of unconfirmed transactions to track.
-    pub max_mempool_transactions: usize,
+    pub max_mempool_transactions: u64,
 
     /// Whether to fetch transactions from INV messages immediately.
     pub fetch_mempool_transactions: bool,
@@ -175,7 +177,7 @@ impl ClientConfig {
     }
 
     /// Set maximum number of mempool transactions to track.
-    pub fn with_max_mempool_transactions(mut self, max: usize) -> Self {
+    pub fn with_max_mempool_transactions(mut self, max: u64) -> Self {
         self.max_mempool_transactions = max;
         self
     }

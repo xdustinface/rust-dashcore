@@ -159,6 +159,7 @@ impl std::fmt::Display for PeerId {
 
 /// Validation mode for the SPV client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ValidationMode {
     /// Validate only basic structure and signatures.
     Basic,
