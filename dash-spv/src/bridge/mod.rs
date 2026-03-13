@@ -192,8 +192,9 @@ pub async fn get_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Mutex;
+
+    use super::*;
 
     #[test]
     fn test_hello() {
