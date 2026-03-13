@@ -48,36 +48,53 @@ uniffi::custom_type!(PathBuf, String, {
 #[derive(Debug, uniffi::Error, thiserror::Error)]
 pub enum SpvClientError {
     #[error("Configuration error: {message}")]
-    Config { message: String },
+    Config {
+        message: String,
+    },
     #[error("Network error: {message}")]
-    Network { message: String },
+    Network {
+        message: String,
+    },
     #[error("Storage error: {message}")]
-    Storage { message: String },
+    Storage {
+        message: String,
+    },
     #[error("Sync error: {message}")]
-    Sync { message: String },
+    Sync {
+        message: String,
+    },
     #[error("General error: {message}")]
-    General { message: String },
+    General {
+        message: String,
+    },
 }
 
 impl From<SpvError> for SpvClientError {
     fn from(err: SpvError) -> Self {
         match err {
-            SpvError::Config(msg) => SpvClientError::Config { message: msg },
-            SpvError::Network(e) => SpvClientError::Network { message: e.to_string() },
-            SpvError::Storage(e) => SpvClientError::Storage { message: e.to_string() },
-            SpvError::Sync(e) => SpvClientError::Sync { message: e.to_string() },
-            other => SpvClientError::General { message: other.to_string() },
+            SpvError::Config(msg) => SpvClientError::Config {
+                message: msg,
+            },
+            SpvError::Network(e) => SpvClientError::Network {
+                message: e.to_string(),
+            },
+            SpvError::Storage(e) => SpvClientError::Storage {
+                message: e.to_string(),
+            },
+            SpvError::Sync(e) => SpvClientError::Sync {
+                message: e.to_string(),
+            },
+            other => SpvClientError::General {
+                message: other.to_string(),
+            },
         }
     }
 }
 
 // ============ Concrete type alias ============
 
-type ConcreteClient = DashSpvClient<
-    WalletManager<ManagedWalletInfo>,
-    PeerNetworkManager,
-    DiskStorageManager,
->;
+type ConcreteClient =
+    DashSpvClient<WalletManager<ManagedWalletInfo>, PeerNetworkManager, DiskStorageManager>;
 
 // ============ SpvClient wrapper ============
 
@@ -100,17 +117,19 @@ impl SpvClient {
     #[uniffi::constructor]
     pub async fn new(config: ClientConfig) -> Result<Arc<Self>, SpvClientError> {
         let network = PeerNetworkManager::new(&config).await.map_err(SpvClientError::from)?;
-        let storage = DiskStorageManager::new(&config)
-            .await
-            .map_err(|e| SpvClientError::Storage { message: e.to_string() })?;
-        let wallet =
-            Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
+        let storage =
+            DiskStorageManager::new(&config).await.map_err(|e| SpvClientError::Storage {
+                message: e.to_string(),
+            })?;
+        let wallet = Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
 
         let inner = DashSpvClient::new(config, network, storage, wallet)
             .await
             .map_err(SpvClientError::from)?;
 
-        Ok(Arc::new(Self { inner }))
+        Ok(Arc::new(Self {
+            inner,
+        }))
     }
 
     /// Start the client — connect to the network and begin syncing.
