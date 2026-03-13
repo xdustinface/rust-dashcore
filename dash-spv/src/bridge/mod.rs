@@ -9,8 +9,6 @@
 
 use std::sync::Arc;
 
-uniffi::setup_scaffolding!();
-
 /// A simple sync function that returns a greeting string.
 #[uniffi::export]
 pub fn hello() -> String {
@@ -24,7 +22,7 @@ pub async fn get_version() -> String {
 }
 
 /// Callback interface for receiving SPV sync progress events.
-#[uniffi::export(callback_interface)]
+#[uniffi::export(with_foreign)]
 pub trait SpvEventListener: Send + Sync {
     /// Called when sync progress changes.
     fn on_sync_progress(&self, percentage: f64);
