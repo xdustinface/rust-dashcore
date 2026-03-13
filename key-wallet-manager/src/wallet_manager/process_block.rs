@@ -320,10 +320,12 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 mod tests {
     use super::*;
     use crate::wallet_manager::WalletId;
-    use dashcore::hashes::Hash;
     use dashcore::block::{Header, Version};
+    use dashcore::hashes::Hash;
     use dashcore::pow::CompactTarget;
-    use dashcore::{BlockHash, Network, OutPoint, ScriptBuf, TxIn, Txid, TxMerkleNode, TxOut, Witness};
+    use dashcore::{
+        BlockHash, Network, OutPoint, ScriptBuf, TxIn, TxMerkleNode, TxOut, Txid, Witness,
+    };
     use key_wallet::wallet::initialization::WalletAccountCreationOptions;
     use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;

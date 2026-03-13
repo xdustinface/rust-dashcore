@@ -148,11 +148,7 @@ impl RequestSender {
     }
 
     /// Send a filterload message to a specific peer.
-    pub fn send_filter_load(
-        &self,
-        filter_load: FilterLoad,
-        peer: SocketAddr,
-    ) -> NetworkResult<()> {
+    pub fn send_filter_load(&self, filter_load: FilterLoad, peer: SocketAddr) -> NetworkResult<()> {
         self.send_message_to_peer(NetworkMessage::FilterLoad(filter_load), peer)
     }
 
