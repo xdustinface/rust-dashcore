@@ -55,6 +55,7 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                         self.activate(peer, requests).await?;
                         self.set_state(SyncState::Synced);
                         tracing::info!("Mempool manager activated on peer {}", peer);
+                        return Ok(vec![SyncEvent::MempoolActivated { peer }]);
                     } else {
                         tracing::warn!("Sync complete but no peers available for mempool activation");
                     }
@@ -113,6 +114,7 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                     if let Some(new_peer) = self.pick_peer() {
                         self.activate(new_peer, requests).await?;
                         tracing::info!("Re-activated mempool on peer {}", new_peer);
+                        return Ok(vec![SyncEvent::MempoolActivated { peer: new_peer }]);
                     } else {
                         tracing::warn!("Mempool peer lost and no peers available for re-activation");
                     }
@@ -247,7 +249,8 @@ mod tests {
         };
 
         let events = manager.handle_sync_event(&event, &requests).await.unwrap();
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], SyncEvent::MempoolActivated { peer: p } if *p == peer));
         assert_eq!(manager.state(), SyncState::Synced);
         assert_eq!(manager.mempool_peer, Some(peer));
     }
@@ -454,7 +457,8 @@ mod tests {
             header_tip: 1000,
             cycle: 0,
         };
-        manager.handle_sync_event(&event, &requests).await.unwrap();
+        let events = manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert!(matches!(&events[0], SyncEvent::MempoolActivated { .. }));
         assert_eq!(manager.state(), SyncState::Synced);
 
         // Simulate disconnect by resetting state
@@ -465,7 +469,8 @@ mod tests {
             header_tip: 1001,
             cycle: 1,
         };
-        manager.handle_sync_event(&event, &requests).await.unwrap();
+        let events = manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert!(matches!(&events[0], SyncEvent::MempoolActivated { .. }));
         assert_eq!(manager.state(), SyncState::Synced);
     }
 
