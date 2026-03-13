@@ -49,9 +49,18 @@ mod tests {
     use crate::client::config::MempoolStrategy;
     use crate::storage::DiskStorageManager;
     use crate::{test_utils::MockNetworkManager, types::UnconfirmedTransaction};
-    use dashcore::{Address, Amount, Transaction, TxOut};
+    use dashcore::sml::masternode_list::MasternodeList;
+    use dashcore::sml::masternode_list_entry::{
+        qualified_masternode_list_entry::QualifiedMasternodeListEntry, EntryMasternodeType,
+        MasternodeListEntry,
+    };
+    use dashcore::{Address, Amount, BlockHash, ProTxHash, Transaction, TxOut};
+    use dashcore_hashes::Hash;
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
     use key_wallet_manager::wallet_manager::WalletManager;
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -169,5 +178,104 @@ mod tests {
             Amount::from_sat(1_000_000_000),
             "InstantSend balance should be 10 Dash"
         );
+    }
+
+    // ============ masternode_engine() accessor tests ============
+
+    /// `masternode_engine()` returns `None` when masternodes are disabled.
+    #[tokio::test]
+    async fn test_masternode_engine_none_when_disabled() {
+        let config = ClientConfig::testnet()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(TempDir::new().unwrap().path());
+
+        let network_manager = MockNetworkManager::new();
+        let storage = DiskStorageManager::new(&config).await.expect("storage");
+        let wallet = Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
+
+        let client = DashSpvClient::new(config, network_manager, storage, wallet)
+            .await
+            .expect("client construction must succeed");
+
+        assert!(
+            client.masternode_engine().await.is_none(),
+            "masternode_engine() should be None when masternodes are disabled"
+        );
+    }
+
+    /// `masternode_engine()` returns `Some` when masternodes are enabled.
+    #[tokio::test]
+    async fn test_masternode_engine_some_when_enabled() {
+        let config = ClientConfig::testnet()
+            .without_filters()
+            .with_storage_path(TempDir::new().unwrap().path());
+
+        let network_manager = MockNetworkManager::new();
+        let storage = DiskStorageManager::new(&config).await.expect("storage");
+        let wallet = Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
+
+        let client = DashSpvClient::new(config, network_manager, storage, wallet)
+            .await
+            .expect("client construction must succeed");
+
+        assert!(
+            client.masternode_engine().await.is_some(),
+            "masternode_engine() should be Some when masternodes are enabled"
+        );
+    }
+
+    /// Verifies that after manually inserting a masternode list into the engine
+    /// the count and entries are visible via the engine handle.
+    #[tokio::test]
+    async fn test_masternode_engine_populated_reflects_entries() {
+        let config = ClientConfig::testnet()
+            .without_filters()
+            .with_storage_path(TempDir::new().unwrap().path());
+        let network = config.network;
+
+        let network_manager = MockNetworkManager::new();
+        let storage = DiskStorageManager::new(&config).await.expect("storage");
+        let wallet = Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(network)));
+
+        let client = DashSpvClient::new(config, network_manager, storage, wallet)
+            .await
+            .expect("client construction must succeed");
+
+        let engine_arc = client.masternode_engine().await.expect("engine should be Some");
+
+        // Build a minimal MasternodeListEntry for testing.
+        let pro_reg_tx_hash = ProTxHash::all_zeros();
+        let entry = MasternodeListEntry {
+            version: 1,
+            pro_reg_tx_hash,
+            confirmed_hash: None,
+            service_address: SocketAddr::from_str("1.2.3.4:9999").unwrap(),
+            operator_public_key: dashcore::bls_sig_utils::BLSPublicKey::from([0u8; 48]),
+            key_id_voting: dashcore::PubkeyHash::all_zeros(),
+            is_valid: true,
+            mn_type: EntryMasternodeType::Regular,
+        };
+        let qualified: QualifiedMasternodeListEntry = entry.into();
+
+        // Insert the entry into a MasternodeList and load it into the engine.
+        let block_hash = BlockHash::all_zeros();
+        let masternodes = BTreeMap::from([(pro_reg_tx_hash, qualified)]);
+        let list = MasternodeList::build(masternodes, BTreeMap::new(), block_hash, 100).build();
+
+        {
+            let mut engine = engine_arc.write().await;
+            engine.masternode_lists.insert(100, list);
+        }
+
+        // Now read back via the accessor.
+        let engine_arc2 = client.masternode_engine().await.expect("engine should still be Some");
+        let engine = engine_arc2.read().await;
+        let latest = engine.latest_masternode_list().expect("list should be present");
+
+        assert_eq!(latest.masternodes.len(), 1, "should have 1 masternode");
+        let mn = latest.masternodes.values().next().unwrap();
+        assert!(mn.masternode_list_entry.is_valid, "masternode should be valid (Enabled)");
+        assert_eq!(mn.masternode_list_entry.service_address.to_string(), "1.2.3.4:9999");
     }
 }

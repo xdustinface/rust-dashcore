@@ -610,20 +610,62 @@ pub struct GovernanceProposal {
 impl SpvClient {
     /// Returns the number of masternodes in the current masternode list.
     ///
-    /// TODO: wire up to `MasternodeListEngine` once the engine is accessible
-    /// from `DashSpvClient`.
+    /// Reads the latest masternode list from the engine and returns its entry
+    /// count.  Returns `0` when masternodes are disabled or no list has been
+    /// received yet.
     pub async fn get_masternode_count(&self) -> u32 {
-        // TODO: return self.inner.masternode_list_engine()?.read().await.count()
-        0
+        let Some(engine) = self.inner.masternode_engine().await else {
+            return 0;
+        };
+        let guard = engine.read().await;
+        guard.latest_masternode_list().map(|list| list.masternodes.len() as u32).unwrap_or(0)
     }
 
     /// Returns all masternodes from the current masternode list.
     ///
-    /// TODO: wire up to `MasternodeListEngine` once the engine is accessible
-    /// from `DashSpvClient`.
+    /// Iterates the latest masternode list from the engine and maps each
+    /// [`dashcore::sml::masternode_list_entry::MasternodeListEntry`] to a
+    /// [`MasternodeInfo`] record.  Returns an empty `Vec` when masternodes are
+    /// disabled or no list has been received yet.
+    ///
+    /// # Field mapping
+    ///
+    /// | `MasternodeListEntry` field | `MasternodeInfo` field |
+    /// |---|---|
+    /// | `pro_reg_tx_hash` | `pro_tx_hash` |
+    /// | `service_address` | `address` |
+    /// | `is_valid` | `status` (`"Enabled"` / `"PoSeBanned"`) |
+    /// | — | `pose_penalty` (always `0`; not in SML diff) |
+    /// | — | `last_paid_height` (always `0`; not in SML diff) |
+    /// | — | `registered_height` (always `0`; not in SML diff) |
     pub async fn get_masternodes(&self) -> Vec<MasternodeInfo> {
-        // TODO: map MasternodeListEntry fields to MasternodeInfo
-        vec![]
+        let Some(engine) = self.inner.masternode_engine().await else {
+            return vec![];
+        };
+        let guard = engine.read().await;
+        let Some(list) = guard.latest_masternode_list() else {
+            return vec![];
+        };
+        list.masternodes
+            .values()
+            .map(|entry| {
+                let mn = &entry.masternode_list_entry;
+                MasternodeInfo {
+                    pro_tx_hash: mn.pro_reg_tx_hash.to_string(),
+                    address: mn.service_address.to_string(),
+                    status: if mn.is_valid {
+                        "Enabled".to_string()
+                    } else {
+                        "PoSeBanned".to_string()
+                    },
+                    // The SML diff does not carry PoSe penalty, last-paid height, or
+                    // registered height — default to 0 until richer data sources are wired up.
+                    pose_penalty: 0,
+                    last_paid_height: 0,
+                    registered_height: 0,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1237,8 +1279,9 @@ mod tests {
         assert_eq!(proposal.abstain_count, 1);
     }
 
+    /// `get_masternode_count` returns 0 when masternodes are disabled (no engine).
     #[tokio::test]
-    async fn test_get_masternode_count_stub() {
+    async fn test_get_masternode_count_no_engine() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = ClientConfig::regtest()
             .without_filters()
@@ -1246,11 +1289,12 @@ mod tests {
             .with_storage_path(temp_dir.path());
 
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
-        assert_eq!(client.get_masternode_count().await, 0, "stub should return 0");
+        assert_eq!(client.get_masternode_count().await, 0, "should return 0 when engine is None");
     }
 
+    /// `get_masternodes` returns an empty vec when masternodes are disabled (no engine).
     #[tokio::test]
-    async fn test_get_masternodes_stub() {
+    async fn test_get_masternodes_no_engine() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = ClientConfig::regtest()
             .without_filters()
@@ -1258,7 +1302,39 @@ mod tests {
             .with_storage_path(temp_dir.path());
 
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
-        let masternodes = client.get_masternodes().await;
-        assert!(masternodes.is_empty(), "stub should return empty vec");
+        assert!(
+            client.get_masternodes().await.is_empty(),
+            "should return empty vec when engine is None"
+        );
+    }
+
+    /// `get_masternode_count` returns 0 when masternodes are enabled but no list
+    /// has been received yet (engine is Some but empty).
+    #[tokio::test]
+    async fn test_get_masternode_count_empty_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        // Default regtest config has enable_masternodes = true
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert_eq!(
+            client.get_masternode_count().await,
+            0,
+            "should return 0 when engine has no list yet"
+        );
+    }
+
+    /// `get_masternodes` returns an empty vec when masternodes are enabled but no
+    /// list has been received yet (engine is Some but empty).
+    #[tokio::test]
+    async fn test_get_masternodes_empty_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_masternodes().await.is_empty(),
+            "should return empty vec when engine has no list yet"
+        );
     }
 }
