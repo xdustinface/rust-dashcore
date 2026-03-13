@@ -747,6 +747,28 @@ impl SpvClient {
     }
 }
 
+#[uniffi::export]
+impl SpvClient {
+    /// Returns all governance proposals known to the SPV client.
+    ///
+    /// Governance sync is not yet implemented in the SPV client, so this method
+    /// always returns an empty `Vec`.  It is exported so foreign-language
+    /// bindings can be generated and call-sites can be wired up in advance.
+    pub async fn get_governance_proposals(&self) -> Vec<GovernanceProposal> {
+        vec![]
+    }
+
+    /// Looks up a single governance proposal by its hash.
+    ///
+    /// Governance sync is not yet implemented in the SPV client, so this method
+    /// always returns `None`.  It is exported so foreign-language bindings can
+    /// be generated and call-sites can be wired up in advance.
+    pub async fn get_governance_proposal(&self, hash: String) -> Option<GovernanceProposal> {
+        let _ = hash;
+        None
+    }
+}
+
 // ============ Stub functions ============
 
 /// Returns a greeting string (sanity-check export).
@@ -1538,6 +1560,34 @@ mod tests {
         assert!(
             client.get_active_quorums().await.is_empty(),
             "should return empty vec when engine has no list yet"
+        );
+    }
+
+    // ---- get_governance_proposals / get_governance_proposal stub tests ----
+
+    /// `get_governance_proposals` always returns an empty vec (governance not yet implemented).
+    #[tokio::test]
+    async fn test_get_governance_proposals_returns_empty() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_governance_proposals().await.is_empty(),
+            "get_governance_proposals should return empty vec (stub)"
+        );
+    }
+
+    /// `get_governance_proposal` always returns `None` (governance not yet implemented).
+    #[tokio::test]
+    async fn test_get_governance_proposal_returns_none() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_governance_proposal("deadbeef".to_string()).await.is_none(),
+            "get_governance_proposal should return None (stub)"
         );
     }
 }
