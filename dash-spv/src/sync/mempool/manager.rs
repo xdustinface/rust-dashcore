@@ -438,8 +438,9 @@ impl<W: WalletInterface> MempoolManager<W> {
         // Prune pending IS locks whose transaction never arrived
         let before = self.pending_is_locks.len();
         let now = Instant::now();
-        self.pending_is_locks
-            .retain(|_, inserted_at| now.checked_duration_since(*inserted_at).unwrap_or_default() < MEMPOOL_TX_EXPIRY);
+        self.pending_is_locks.retain(|_, inserted_at| {
+            now.checked_duration_since(*inserted_at).unwrap_or_default() < MEMPOOL_TX_EXPIRY
+        });
         let expired = before - self.pending_is_locks.len();
         if expired > 0 {
             tracing::debug!("Pruned {} expired pending IS locks", expired);

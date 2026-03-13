@@ -339,8 +339,9 @@ impl MempoolState {
 
         // Also prune old recent sends
         let now = Instant::now();
-        self.recent_sends
-            .retain(|_, &mut timestamp| now.checked_duration_since(timestamp).unwrap_or_default() <= timeout);
+        self.recent_sends.retain(|_, &mut timestamp| {
+            now.checked_duration_since(timestamp).unwrap_or_default() <= timeout
+        });
 
         expired
     }
