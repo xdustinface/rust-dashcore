@@ -37,6 +37,23 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_NETWORK_EVENT_CAPACITY: usize = 10000;
 
+/// Point-in-time snapshot of a single connected peer's state.
+///
+/// Returned by [`PeerNetworkManager::get_peers_snapshot`].
+#[derive(Debug, Clone)]
+pub struct PeerSnapshot {
+    /// Remote socket address of the peer.
+    pub address: SocketAddr,
+    /// User-agent string reported during the handshake (empty if not yet received).
+    pub user_agent: String,
+    /// Best block height reported by the peer (0 if not yet received).
+    pub best_height: u32,
+    /// Unix timestamp (seconds) of when the peer connected (0 if unknown).
+    pub connected_since: u64,
+    /// Raw services bitmask advertised by the peer (0 if not yet received).
+    pub services: u64,
+}
+
 /// Peer network manager
 pub struct PeerNetworkManager {
     /// Peer pool
@@ -1171,6 +1188,31 @@ impl PeerNetworkManager {
         .await;
 
         Ok(())
+    }
+
+    /// Return a point-in-time snapshot of all currently connected peers.
+    ///
+    /// Each entry captures the address, user-agent, best height, connection
+    /// timestamp, and services bitmask as they were at the moment of the call.
+    pub async fn get_peers_snapshot(&self) -> Vec<PeerSnapshot> {
+        let peers = self.pool.get_all_peers().await;
+        let mut result = Vec::with_capacity(peers.len());
+        for (addr, peer_lock) in peers {
+            let peer = peer_lock.read().await;
+            let connected_since = peer
+                .connected_since()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            result.push(PeerSnapshot {
+                address: addr,
+                user_agent: peer.user_agent().unwrap_or("").to_owned(),
+                best_height: peer.best_height().unwrap_or(0),
+                connected_since,
+                services: peer.services_bits().unwrap_or(0),
+            });
+        }
+        result
     }
 
     /// Get reputation information for all peers

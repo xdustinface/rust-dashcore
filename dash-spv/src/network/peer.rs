@@ -133,6 +133,21 @@ impl Peer {
         self.best_height
     }
 
+    /// Get the user-agent string reported by this peer during the handshake.
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    /// Get the `SystemTime` at which this peer connected.
+    pub fn connected_since(&self) -> Option<std::time::SystemTime> {
+        self.connected_at
+    }
+
+    /// Get the raw services bitmask advertised by this peer.
+    pub fn services_bits(&self) -> Option<u64> {
+        self.services
+    }
+
     /// Check if peer supports compact filters (BIP 157/158).
     pub fn supports_compact_filters(&self) -> bool {
         self.has_service(ServiceFlags::COMPACT_FILTERS)

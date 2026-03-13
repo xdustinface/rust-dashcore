@@ -208,8 +208,6 @@ pub struct NetworkInfo {
     /// Number of currently connected peers.
     pub peer_count: u32,
     /// Details for each connected peer.
-    ///
-    /// TODO: populate with real peer data from `PeerNetworkManager`.
     pub peers: Vec<PeerInfo>,
 }
 
@@ -548,18 +546,26 @@ impl SpvClient {
 
     /// Returns network and peer information.
     ///
-    /// Currently returns a stub with the network name, peer count, and an empty
-    /// peer list.  Peer details will be wired up once `PeerNetworkManager`
-    /// exposes per-peer metadata.
-    ///
-    /// TODO: populate `peers` with real data from `PeerNetworkManager`.
+    /// Queries `PeerNetworkManager` for a snapshot of all currently connected
+    /// peers and maps each entry to a [`PeerInfo`] record.
     pub async fn get_network_info(&self) -> NetworkInfo {
         let network = self.inner.network().await;
-        let peer_count = self.inner.peer_count().await as u32;
+        let snapshots = self.inner.peers_snapshot().await;
+        let peer_count = snapshots.len() as u32;
+        let peers = snapshots
+            .into_iter()
+            .map(|s| PeerInfo {
+                address: s.address.to_string(),
+                user_agent: s.user_agent,
+                best_height: s.best_height,
+                connected_since: s.connected_since,
+                services: s.services,
+            })
+            .collect();
         NetworkInfo {
             network: network.to_string(),
             peer_count,
-            peers: vec![], // TODO: populate with real peer data
+            peers,
         }
     }
 }
@@ -1261,10 +1267,10 @@ mod tests {
         assert_eq!(info.peers[1].best_height, 501);
     }
 
-    /// Verify that `get_network_info` returns a stub with the correct network
-    /// name and zero peers before the client is started.
+    /// Verify that `get_network_info` returns the correct network name and an
+    /// empty peer list when the client has not been started (no connections).
     #[tokio::test]
-    async fn test_get_network_info_stub() {
+    async fn test_get_network_info_no_peers_when_not_started() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = ClientConfig::regtest()
             .without_filters()
@@ -1276,7 +1282,8 @@ mod tests {
 
         assert_eq!(info.network, "regtest", "network name should be 'regtest'");
         assert_eq!(info.peer_count, 0, "peer count should be 0 before start");
-        assert!(info.peers.is_empty(), "peers should be empty in stub implementation");
+        assert!(info.peers.is_empty(), "peers list should be empty when no peers are connected");
+        assert_eq!(info.peer_count as usize, info.peers.len(), "peer_count must equal peers.len()");
     }
 
     // ---- MasternodeInfo / GovernanceProposal record tests ----
