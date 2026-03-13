@@ -5,13 +5,42 @@
 //!
 //! Compiled only when the `uniffi` feature is enabled.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use dashcore::Network;
+use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
+use key_wallet_manager::wallet_manager::WalletManager;
+use tokio::sync::RwLock;
+
+use crate::client::{ClientConfig, DashSpvClient};
+use crate::error::SpvError;
+use crate::network::PeerNetworkManager;
+use crate::storage::DiskStorageManager;
+use crate::sync::SyncState;
+
+// ============ custom_type! mappings ============
 
 uniffi::custom_type!(Network, String, {
     remote,
     lower: |n| n.to_string(),
     try_lift: |s| s.parse().map_err(|e: String| uniffi::deps::anyhow::anyhow!(e)),
 });
+
+uniffi::custom_type!(SocketAddr, String, {
+    remote,
+    lower: |a| a.to_string(),
+    try_lift: |s| s.parse::<SocketAddr>().map_err(|e| uniffi::deps::anyhow::anyhow!(e)),
+});
+
+uniffi::custom_type!(PathBuf, String, {
+    remote,
+    lower: |p| p.to_string_lossy().into_owned(),
+    try_lift: |s| Ok::<PathBuf, uniffi::deps::anyhow::Error>(PathBuf::from(s)),
+});
+
+// ============ Event types ============
 
 /// UniFFI-compatible representation of a sync event.
 ///
@@ -178,6 +207,144 @@ pub trait SpvEventListener: Send + Sync {
     fn on_sync_progress(&self, percentage: f64, current_height: u32, target_height: u32);
 }
 
+// ============ Error type ============
+
+/// Error type for the UniFFI SpvClient wrapper.
+#[derive(Debug, uniffi::Error, thiserror::Error)]
+pub enum SpvClientError {
+    #[error("Configuration error: {message}")]
+    Config {
+        message: String,
+    },
+    #[error("Network error: {message}")]
+    Network {
+        message: String,
+    },
+    #[error("Storage error: {message}")]
+    Storage {
+        message: String,
+    },
+    #[error("Sync error: {message}")]
+    Sync {
+        message: String,
+    },
+    #[error("General error: {message}")]
+    General {
+        message: String,
+    },
+}
+
+impl From<SpvError> for SpvClientError {
+    fn from(err: SpvError) -> Self {
+        match err {
+            SpvError::Config(msg) => SpvClientError::Config {
+                message: msg,
+            },
+            SpvError::Network(e) => SpvClientError::Network {
+                message: e.to_string(),
+            },
+            SpvError::Storage(e) => SpvClientError::Storage {
+                message: e.to_string(),
+            },
+            SpvError::Sync(e) => SpvClientError::Sync {
+                message: e.to_string(),
+            },
+            other => SpvClientError::General {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+// ============ Concrete type alias ============
+
+type ConcreteClient =
+    DashSpvClient<WalletManager<ManagedWalletInfo>, PeerNetworkManager, DiskStorageManager>;
+
+// ============ SpvClient wrapper ============
+
+/// Concrete UniFFI-compatible wrapper for the Dash SPV client.
+///
+/// `DashSpvClient` is generic and cannot be exported via UniFFI directly.
+/// This wrapper fixes the type parameters to the standard production
+/// implementations and exposes lifecycle and state-query methods.
+#[derive(uniffi::Object)]
+pub struct SpvClient {
+    inner: ConcreteClient,
+}
+
+#[uniffi::export]
+impl SpvClient {
+    /// Create a new `SpvClient` from the given configuration.
+    ///
+    /// Constructs the network manager, storage manager, and wallet, then
+    /// hands them to `DashSpvClient::new`.
+    #[uniffi::constructor]
+    pub async fn new(config: ClientConfig) -> Result<Arc<Self>, SpvClientError> {
+        let network = PeerNetworkManager::new(&config).await.map_err(SpvClientError::from)?;
+        let storage =
+            DiskStorageManager::new(&config).await.map_err(|e| SpvClientError::Storage {
+                message: e.to_string(),
+            })?;
+        let wallet = Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
+
+        let inner = DashSpvClient::new(config, network, storage, wallet)
+            .await
+            .map_err(SpvClientError::from)?;
+
+        Ok(Arc::new(Self {
+            inner,
+        }))
+    }
+
+    /// Start the client — connect to the network and begin syncing.
+    pub async fn start(&self) -> Result<(), SpvClientError> {
+        self.inner.start().await.map_err(SpvClientError::from)
+    }
+
+    /// Stop the client — disconnect from the network and flush storage.
+    pub async fn stop(&self) -> Result<(), SpvClientError> {
+        self.inner.stop().await.map_err(SpvClientError::from)
+    }
+
+    /// Shutdown the client (alias for `stop`).
+    pub async fn shutdown(&self) -> Result<(), SpvClientError> {
+        self.inner.shutdown().await.map_err(SpvClientError::from)
+    }
+
+    /// Returns `true` if the client is currently running.
+    pub async fn is_running(&self) -> bool {
+        self.inner.is_running().await
+    }
+
+    /// Returns the current chain tip height (0 if no headers yet).
+    pub async fn tip_height(&self) -> u32 {
+        self.inner.tip_height().await
+    }
+
+    /// Returns the current chain tip hash as a hex string, or `None` if unavailable.
+    pub async fn tip_hash(&self) -> Option<String> {
+        self.inner.tip_hash().await.map(|h| h.to_string())
+    }
+
+    /// Returns the number of connected peers.
+    pub async fn peer_count(&self) -> u64 {
+        self.inner.peer_count().await as u64
+    }
+
+    /// Returns the overall sync completion percentage in the range `[0.0, 1.0]`.
+    pub async fn sync_progress(&self) -> f64 {
+        self.inner.sync_progress().await.percentage()
+    }
+
+    /// Returns `true` when the client is actively downloading and processing blocks.
+    pub async fn is_syncing(&self) -> bool {
+        matches!(self.inner.sync_progress().await.state(), SyncState::Syncing)
+    }
+}
+
+// ============ Stub functions ============
+
 /// Returns a greeting string (sanity-check export).
 #[uniffi::export]
 pub fn hello() -> String {
@@ -193,6 +360,8 @@ pub async fn get_version() -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -278,7 +447,6 @@ mod tests {
 
     #[test]
     fn test_sync_event_variants() {
-        // Verify all variants can be constructed and cloned.
         let events: Vec<SyncEvent> = vec![
             SyncEvent::SyncStart {
                 identifier: "BlockHeader".to_string(),
@@ -332,7 +500,6 @@ mod tests {
                 cycle: 0,
             },
         ];
-        // Clone succeeds for all variants.
         let _cloned: Vec<SyncEvent> = events.to_vec();
         assert_eq!(events.len(), 14);
     }
@@ -359,5 +526,43 @@ mod tests {
         ];
         let _cloned: Vec<NetworkEvent> = events.to_vec();
         assert_eq!(events.len(), 4);
+    }
+
+    /// Verify that `SpvClient` can be constructed from a minimal regtest config.
+    #[tokio::test]
+    async fn test_spv_client_construction() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await;
+        assert!(client.is_ok(), "SpvClient construction should succeed");
+
+        let client = client.unwrap();
+        assert!(!client.is_running().await, "Client should not be running after construction");
+        assert_eq!(client.tip_height().await, 0, "Tip height should start at 0 (genesis)");
+        assert_eq!(client.peer_count().await, 0, "Peer count should be 0 before start");
+    }
+
+    /// Verify that `sync_progress` and `is_syncing` return sensible defaults.
+    #[tokio::test]
+    async fn test_spv_client_state_queries() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        let progress = client.sync_progress().await;
+        assert!(
+            (0.0..=1.0).contains(&progress),
+            "sync_progress should be in [0.0, 1.0], got {progress}"
+        );
+
+        assert!(!client.is_syncing().await, "Client should not be syncing before start()");
     }
 }
