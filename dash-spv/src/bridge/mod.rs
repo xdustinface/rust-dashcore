@@ -285,9 +285,16 @@ impl From<&SyncProgress> for SyncProgressInfo {
             .map(|b| {
                 let current = b.processed();
                 let target = b.requested();
-                let percentage =
-                    if target > 0 { (current as f64 / target as f64).min(1.0) } else { 0.0 };
-                PhaseProgress { current, target, percentage }
+                let percentage = if target > 0 {
+                    (current as f64 / target as f64).min(1.0)
+                } else {
+                    0.0
+                };
+                PhaseProgress {
+                    current,
+                    target,
+                    percentage,
+                }
             })
             .unwrap_or_else(|_| PhaseProgress::zero());
 
@@ -296,9 +303,16 @@ impl From<&SyncProgress> for SyncProgressInfo {
             .map(|m| {
                 let current = m.current_height();
                 let target = m.target_height();
-                let percentage =
-                    if target > 0 { (current as f64 / target as f64).min(1.0) } else { 0.0 };
-                PhaseProgress { current, target, percentage }
+                let percentage = if target > 0 {
+                    (current as f64 / target as f64).min(1.0)
+                } else {
+                    0.0
+                };
+                PhaseProgress {
+                    current,
+                    target,
+                    percentage,
+                }
             })
             .unwrap_or_else(|_| PhaseProgress::zero());
 
@@ -848,13 +862,8 @@ mod tests {
         // Before start() the client should not be fully synced.
         assert!(!info.is_synced);
         // The state must be one of the known variant strings.
-        let valid_states =
-            ["WaitForEvents", "WaitingForConnections", "Syncing", "Synced", "Error"];
-        assert!(
-            valid_states.contains(&info.state.as_str()),
-            "unexpected state: {}",
-            info.state
-        );
+        let valid_states = ["WaitForEvents", "WaitingForConnections", "Syncing", "Synced", "Error"];
+        assert!(valid_states.contains(&info.state.as_str()), "unexpected state: {}", info.state);
         assert!(
             (0.0..=1.0).contains(&info.overall_percentage),
             "overall_percentage out of range: {}",
