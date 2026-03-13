@@ -34,9 +34,8 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     /// manager is not a `PeerNetworkManager`.
     pub async fn peers_snapshot(&self) -> Vec<crate::network::manager::PeerSnapshot> {
         let network_guard = self.network.lock().await;
-        if let Some(network) = network_guard
-            .as_any()
-            .downcast_ref::<crate::network::manager::PeerNetworkManager>()
+        if let Some(network) =
+            network_guard.as_any().downcast_ref::<crate::network::manager::PeerNetworkManager>()
         {
             network.get_peers_snapshot().await
         } else {

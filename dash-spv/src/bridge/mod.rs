@@ -1199,11 +1199,7 @@ mod tests {
         assert_eq!(info.network, "regtest", "network name should be 'regtest'");
         assert_eq!(info.peer_count, 0, "peer count should be 0 before start");
         assert!(info.peers.is_empty(), "peers list should be empty when no peers are connected");
-        assert_eq!(
-            info.peer_count as usize,
-            info.peers.len(),
-            "peer_count must equal peers.len()"
-        );
+        assert_eq!(info.peer_count as usize, info.peers.len(), "peer_count must equal peers.len()");
     }
 
     // ---- MasternodeInfo / GovernanceProposal record tests ----
