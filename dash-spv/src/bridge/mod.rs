@@ -287,3 +287,4 @@ mod tests {
         assert!(!client.is_syncing().await, "Client should not be syncing before start()");
     }
 }
+
