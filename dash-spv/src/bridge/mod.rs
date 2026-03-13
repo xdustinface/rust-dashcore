@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-uniffi::custom_type!(dashcore::Network, String, {
+use dashcore::Network;
+
+uniffi::custom_type!(Network, String, {
     remote,
     lower: |n| n.to_string(),
     try_lift: |s| s.parse().map_err(Into::into),
