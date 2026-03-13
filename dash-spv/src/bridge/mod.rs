@@ -18,7 +18,7 @@ use crate::client::{ClientConfig, DashSpvClient};
 use crate::error::SpvError;
 use crate::network::PeerNetworkManager;
 use crate::storage::DiskStorageManager;
-use crate::sync::SyncState;
+use crate::sync::{ProgressPercentage, SyncProgress, SyncState};
 
 // ============ custom_type! mappings ============
 
@@ -207,6 +207,114 @@ pub trait SpvEventListener: Send + Sync {
     fn on_sync_progress(&self, percentage: f64, current_height: u32, target_height: u32);
 }
 
+// ============ Sync progress types ============
+
+/// Per-phase progress snapshot exposed over the UniFFI boundary.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct PhaseProgress {
+    /// Current block height or item count for this phase.
+    pub current: u32,
+    /// Target block height or item count for this phase.
+    pub target: u32,
+    /// Completion ratio in `[0.0, 1.0]`.
+    pub percentage: f64,
+}
+
+impl PhaseProgress {
+    fn zero() -> Self {
+        Self {
+            current: 0,
+            target: 0,
+            percentage: 0.0,
+        }
+    }
+}
+
+/// Full sync progress snapshot for all phases, exposed over the UniFFI boundary.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct SyncProgressInfo {
+    /// Overall sync state: `"WaitForEvents"`, `"WaitingForConnections"`, `"Syncing"`, `"Synced"`, or `"Error"`.
+    pub state: String,
+    /// Whether all sync phases have completed successfully.
+    pub is_synced: bool,
+    /// Overall completion ratio in `[0.0, 1.0]`.
+    pub overall_percentage: f64,
+    /// Block header synchronization progress.
+    pub headers: PhaseProgress,
+    /// Compact filter-header synchronization progress.
+    pub filter_headers: PhaseProgress,
+    /// Compact filter synchronization progress.
+    pub filters: PhaseProgress,
+    /// Block download and wallet-processing progress.
+    pub blocks: PhaseProgress,
+    /// Masternode list synchronization progress.
+    pub masternodes: PhaseProgress,
+}
+
+impl From<&SyncProgress> for SyncProgressInfo {
+    fn from(p: &SyncProgress) -> Self {
+        let headers = p
+            .headers()
+            .map(|h| PhaseProgress {
+                current: h.current_height(),
+                target: h.target_height(),
+                percentage: h.percentage(),
+            })
+            .unwrap_or_else(|_| PhaseProgress::zero());
+
+        let filter_headers = p
+            .filter_headers()
+            .map(|fh| PhaseProgress {
+                current: fh.current_height(),
+                target: fh.target_height(),
+                percentage: fh.percentage(),
+            })
+            .unwrap_or_else(|_| PhaseProgress::zero());
+
+        let filters = p
+            .filters()
+            .map(|f| PhaseProgress {
+                current: f.current_height(),
+                target: f.target_height(),
+                percentage: f.percentage(),
+            })
+            .unwrap_or_else(|_| PhaseProgress::zero());
+
+        let blocks = p
+            .blocks()
+            .map(|b| {
+                let current = b.processed();
+                let target = b.requested();
+                let percentage =
+                    if target > 0 { (current as f64 / target as f64).min(1.0) } else { 0.0 };
+                PhaseProgress { current, target, percentage }
+            })
+            .unwrap_or_else(|_| PhaseProgress::zero());
+
+        let masternodes = p
+            .masternodes()
+            .map(|m| {
+                let current = m.current_height();
+                let target = m.target_height();
+                let percentage =
+                    if target > 0 { (current as f64 / target as f64).min(1.0) } else { 0.0 };
+                PhaseProgress { current, target, percentage }
+            })
+            .unwrap_or_else(|_| PhaseProgress::zero());
+
+        SyncProgressInfo {
+            state: format!("{:?}", p.state()),
+            is_synced: p.is_synced(),
+            overall_percentage: p.percentage(),
+            headers,
+            filter_headers,
+            filters,
+            blocks,
+            masternodes,
+        }
+    }
+}
+
 // ============ Error type ============
 
 /// Error type for the UniFFI SpvClient wrapper.
@@ -335,6 +443,11 @@ impl SpvClient {
     /// Returns the overall sync completion percentage in the range `[0.0, 1.0]`.
     pub async fn sync_progress(&self) -> f64 {
         self.inner.sync_progress().await.percentage()
+    }
+
+    /// Returns a detailed snapshot of sync progress for all phases.
+    pub async fn get_sync_progress(&self) -> SyncProgressInfo {
+        SyncProgressInfo::from(&self.inner.sync_progress().await)
     }
 
     /// Returns `true` when the client is actively downloading and processing blocks.
@@ -564,5 +677,188 @@ mod tests {
         );
 
         assert!(!client.is_syncing().await, "Client should not be syncing before start()");
+    }
+
+    // ============ PhaseProgress tests ============
+
+    #[test]
+    fn test_phase_progress_zero() {
+        let p = PhaseProgress::zero();
+        assert_eq!(p.current, 0);
+        assert_eq!(p.target, 0);
+        assert_eq!(p.percentage, 0.0);
+    }
+
+    #[test]
+    fn test_phase_progress_fields() {
+        let p = PhaseProgress {
+            current: 500,
+            target: 1000,
+            percentage: 0.5,
+        };
+        assert_eq!(p.current, 500);
+        assert_eq!(p.target, 1000);
+        assert_eq!(p.percentage, 0.5);
+    }
+
+    // ============ SyncProgressInfo mapping tests ============
+
+    #[test]
+    fn test_sync_progress_info_default_sync_progress() {
+        use crate::sync::SyncProgress;
+
+        let progress = SyncProgress::default();
+        let info = SyncProgressInfo::from(&progress);
+
+        assert_eq!(info.state, "WaitForEvents");
+        assert!(!info.is_synced);
+        assert_eq!(info.overall_percentage, 0.0);
+
+        // All phases should be zero when no managers have started.
+        assert_eq!(info.headers, PhaseProgress::zero());
+        assert_eq!(info.filter_headers, PhaseProgress::zero());
+        assert_eq!(info.filters, PhaseProgress::zero());
+        assert_eq!(info.blocks, PhaseProgress::zero());
+        assert_eq!(info.masternodes, PhaseProgress::zero());
+    }
+
+    #[test]
+    fn test_sync_progress_info_state_strings() {
+        use crate::sync::{BlockHeadersProgress, SyncProgress, SyncState};
+
+        // Build a SyncProgress with a headers entry in the Syncing state so the
+        // aggregate state is Syncing.
+        let mut headers = BlockHeadersProgress::default();
+        headers.set_state(SyncState::Syncing);
+        headers.update_target_height(1000);
+        headers.update_tip_height(500);
+
+        let mut progress = SyncProgress::default();
+        progress.update_headers(headers);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.state, "Syncing");
+        assert!(!info.is_synced);
+    }
+
+    #[test]
+    fn test_sync_progress_info_headers_phase() {
+        use crate::sync::{BlockHeadersProgress, SyncProgress, SyncState};
+
+        let mut headers = BlockHeadersProgress::default();
+        headers.set_state(SyncState::Syncing);
+        headers.update_target_height(1000);
+        headers.update_tip_height(750);
+
+        let mut progress = SyncProgress::default();
+        progress.update_headers(headers);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.headers.current, 750);
+        assert_eq!(info.headers.target, 1000);
+        assert!(
+            (info.headers.percentage - 0.75).abs() < 1e-9,
+            "expected 0.75, got {}",
+            info.headers.percentage
+        );
+    }
+
+    #[test]
+    fn test_sync_progress_info_blocks_phase() {
+        use crate::sync::{BlocksProgress, SyncProgress};
+
+        let mut blocks = BlocksProgress::default();
+        blocks.add_requested(100);
+        blocks.add_processed(60);
+
+        let mut progress = SyncProgress::default();
+        progress.update_blocks(blocks);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.blocks.current, 60);
+        assert_eq!(info.blocks.target, 100);
+        assert!(
+            (info.blocks.percentage - 0.6).abs() < 1e-9,
+            "expected 0.6, got {}",
+            info.blocks.percentage
+        );
+    }
+
+    #[test]
+    fn test_sync_progress_info_blocks_zero_requested() {
+        use crate::sync::{BlocksProgress, SyncProgress};
+
+        let blocks = BlocksProgress::default(); // requested = 0
+        let mut progress = SyncProgress::default();
+        progress.update_blocks(blocks);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.blocks.percentage, 0.0);
+    }
+
+    #[test]
+    fn test_sync_progress_info_masternodes_phase() {
+        use crate::sync::{MasternodesProgress, SyncProgress};
+
+        let mut masternodes = MasternodesProgress::default();
+        masternodes.update_target_height(2000);
+        masternodes.update_current_height(1000);
+
+        let mut progress = SyncProgress::default();
+        progress.update_masternodes(masternodes);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.masternodes.current, 1000);
+        assert_eq!(info.masternodes.target, 2000);
+        assert!(
+            (info.masternodes.percentage - 0.5).abs() < 1e-9,
+            "expected 0.5, got {}",
+            info.masternodes.percentage
+        );
+    }
+
+    #[test]
+    fn test_sync_progress_info_percentage_clamped() {
+        use crate::sync::{MasternodesProgress, SyncProgress};
+
+        // current > target should clamp to 1.0
+        let mut masternodes = MasternodesProgress::default();
+        masternodes.update_target_height(100);
+        masternodes.update_current_height(200);
+
+        let mut progress = SyncProgress::default();
+        progress.update_masternodes(masternodes);
+
+        let info = SyncProgressInfo::from(&progress);
+        assert_eq!(info.masternodes.percentage, 1.0);
+    }
+
+    /// Verify `get_sync_progress()` on a freshly-constructed client.
+    #[tokio::test]
+    async fn test_get_sync_progress_initial_state() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let info = client.get_sync_progress().await;
+
+        // Before start() the client should not be fully synced.
+        assert!(!info.is_synced);
+        // The state must be one of the known variant strings.
+        let valid_states =
+            ["WaitForEvents", "WaitingForConnections", "Syncing", "Synced", "Error"];
+        assert!(
+            valid_states.contains(&info.state.as_str()),
+            "unexpected state: {}",
+            info.state
+        );
+        assert!(
+            (0.0..=1.0).contains(&info.overall_percentage),
+            "overall_percentage out of range: {}",
+            info.overall_percentage
+        );
     }
 }
