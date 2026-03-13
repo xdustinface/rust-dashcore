@@ -56,7 +56,7 @@ tempfile = { version = "3.0", optional = true }
 dashcore-rpc = { path = "../rpc-client", optional = true }
 
 # UniFFI (optional, for mobile bridge validation)
-uniffi = { version = "0.28", optional = true }
+uniffi = { version = "0.31.0", optional = true }
 
 # DNS (trust-dns-resolver was renamed to hickory_resolver)
 hickory-resolver = "0.25"
