@@ -129,7 +129,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                 wallet.clone(),
                 mempool_state.clone(),
                 config.mempool_strategy,
-                config.max_mempool_transactions,
+                config.max_mempool_transactions as usize,
             ));
         }
 
