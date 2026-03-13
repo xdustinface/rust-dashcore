@@ -299,7 +299,7 @@ mod tests {
             SyncEvent::SyncComplete { header_tip: 1000, cycle: 0 },
         ];
         // Clone succeeds for all variants.
-        let _cloned: Vec<SyncEvent> = events.iter().cloned().collect();
+        let _cloned: Vec<SyncEvent> = events.to_vec();
         assert_eq!(events.len(), 14);
     }
 
@@ -319,7 +319,7 @@ mod tests {
                 best_height: None,
             },
         ];
-        let _cloned: Vec<NetworkEvent> = events.iter().cloned().collect();
+        let _cloned: Vec<NetworkEvent> = events.to_vec();
         assert_eq!(events.len(), 4);
     }
 }
