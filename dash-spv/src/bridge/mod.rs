@@ -33,9 +33,7 @@ uniffi::custom_type!(Network, String, {
 uniffi::custom_type!(SocketAddr, String, {
     remote,
     lower: |a| a.to_string(),
-    try_lift: |s| {
-        s.parse::<SocketAddr>().map_err(|e| uniffi::deps::anyhow::anyhow!(e))
-    },
+    try_lift: |s| s.parse::<SocketAddr>().map_err(|e| uniffi::deps::anyhow::anyhow!(e)),
 });
 
 uniffi::custom_type!(PathBuf, String, {
@@ -101,13 +99,10 @@ impl SpvClient {
     /// hands them to `DashSpvClient::new`.
     #[uniffi::constructor]
     pub async fn new(config: ClientConfig) -> Result<Arc<Self>, SpvClientError> {
-        let network =
-            PeerNetworkManager::new(&config).await.map_err(SpvError::Network).map_err(|e| {
-                SpvClientError::from(e)
-            })?;
-        let storage = DiskStorageManager::new(&config).await.map_err(SpvError::Storage).map_err(
-            |e| SpvClientError::from(e),
-        )?;
+        let network = PeerNetworkManager::new(&config).await.map_err(SpvClientError::from)?;
+        let storage = DiskStorageManager::new(&config)
+            .await
+            .map_err(|e| SpvClientError::Storage { message: e.to_string() })?;
         let wallet =
             Arc::new(RwLock::new(WalletManager::<ManagedWalletInfo>::new(config.network)));
 
