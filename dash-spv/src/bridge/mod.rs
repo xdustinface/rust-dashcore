@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::Network;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet_manager::wallet_manager::WalletManager;
@@ -674,6 +675,73 @@ impl SpvClient {
                     last_paid_height: 0,
                     registered_height: 0,
                 }
+            })
+            .collect()
+    }
+}
+
+/// UniFFI-compatible record representing a single quorum (LLMQ) entry.
+///
+/// Fields are mapped from the `QualifiedQuorumEntry` and its inner `QuorumEntry`.
+/// All hashes are represented as hex `String` values for cross-language convenience.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct QuorumInfo {
+    /// Quorum hash that identifies this quorum instance.
+    pub quorum_hash: String,
+    /// Quorum type string (e.g. `"1_50/60"`, `"100_Test"`).
+    pub quorum_type: String,
+    /// Number of members (signers slots) in this quorum.
+    pub members_count: u32,
+    /// `true` when the quorum signature has been successfully verified.
+    pub active: bool,
+}
+
+#[uniffi::export]
+impl SpvClient {
+    /// Looks up a single masternode by its ProRegTx hash.
+    ///
+    /// Scans the current masternode list for an entry whose `pro_tx_hash` matches
+    /// the provided string.  Returns `None` when masternodes are disabled, no list
+    /// has been received yet, or no entry with that hash exists.
+    pub async fn get_masternode(&self, pro_tx_hash: String) -> Option<MasternodeInfo> {
+        self.get_masternodes().await.into_iter().find(|mn| mn.pro_tx_hash == pro_tx_hash)
+    }
+
+    /// Returns all quorums from the current masternode list.
+    ///
+    /// Iterates the `quorums` map of the latest masternode list and maps each
+    /// [`dashcore::sml::quorum_entry::qualified_quorum_entry::QualifiedQuorumEntry`]
+    /// to a [`QuorumInfo`] record.  Returns an empty `Vec` when masternodes are
+    /// disabled, no list has been received yet, or no quorums are present.
+    ///
+    /// # Field mapping
+    ///
+    /// | Source field | `QuorumInfo` field |
+    /// |---|---|
+    /// | `quorum_entry.quorum_hash` | `quorum_hash` |
+    /// | `LLMQType` (map key) | `quorum_type` |
+    /// | `quorum_entry.signers.len()` | `members_count` |
+    /// | `verified == Verified` | `active` |
+    pub async fn get_active_quorums(&self) -> Vec<QuorumInfo> {
+        let Some(engine) = self.inner.masternode_engine().await else {
+            return vec![];
+        };
+        let guard = engine.read().await;
+        let Some(list) = guard.latest_masternode_list() else {
+            return vec![];
+        };
+        list.quorums
+            .iter()
+            .flat_map(|(llmq_type, quorums_by_hash)| {
+                quorums_by_hash.values().map(|entry| {
+                    let qe = &entry.quorum_entry;
+                    QuorumInfo {
+                        quorum_hash: qe.quorum_hash.to_string(),
+                        quorum_type: llmq_type.to_string(),
+                        members_count: qe.signers.len() as u32,
+                        active: entry.verified == LLMQEntryVerificationStatus::Verified,
+                    }
+                })
             })
             .collect()
     }
@@ -1383,6 +1451,92 @@ mod tests {
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
         assert!(
             client.get_masternodes().await.is_empty(),
+            "should return empty vec when engine has no list yet"
+        );
+    }
+
+    // ---- QuorumInfo record tests ----
+
+    #[test]
+    fn test_quorum_info_fields() {
+        let info = QuorumInfo {
+            quorum_hash: "deadbeef".to_string(),
+            quorum_type: "100_Test".to_string(),
+            members_count: 4,
+            active: true,
+        };
+        assert_eq!(info.quorum_hash, "deadbeef");
+        assert_eq!(info.quorum_type, "100_Test");
+        assert_eq!(info.members_count, 4);
+        assert!(info.active);
+    }
+
+    #[test]
+    fn test_quorum_info_inactive() {
+        let info = QuorumInfo {
+            quorum_hash: "aabbccdd".to_string(),
+            quorum_type: "1_50/60".to_string(),
+            members_count: 50,
+            active: false,
+        };
+        assert!(!info.active);
+        assert_eq!(info.members_count, 50);
+    }
+
+    /// `get_masternode` returns `None` when masternodes are disabled (no engine).
+    #[tokio::test]
+    async fn test_get_masternode_no_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_masternode("abc123".to_string()).await.is_none(),
+            "should return None when engine is None"
+        );
+    }
+
+    /// `get_masternode` returns `None` when masternodes are enabled but no list has been received.
+    #[tokio::test]
+    async fn test_get_masternode_empty_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_masternode("abc123".to_string()).await.is_none(),
+            "should return None when engine has no list yet"
+        );
+    }
+
+    /// `get_active_quorums` returns an empty vec when masternodes are disabled (no engine).
+    #[tokio::test]
+    async fn test_get_active_quorums_no_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_active_quorums().await.is_empty(),
+            "should return empty vec when engine is None"
+        );
+    }
+
+    /// `get_active_quorums` returns an empty vec when masternodes are enabled but no list received.
+    #[tokio::test]
+    async fn test_get_active_quorums_empty_engine() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert!(
+            client.get_active_quorums().await.is_empty(),
             "should return empty vec when engine has no list yet"
         );
     }
