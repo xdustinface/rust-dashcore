@@ -55,6 +55,9 @@ rayon = "1.11"
 tempfile = { version = "3.0", optional = true }
 dashcore-rpc = { path = "../rpc-client", optional = true }
 
+# UniFFI (optional, for mobile bridge validation)
+uniffi = { version = "0.28", optional = true }
+
 # DNS (trust-dns-resolver was renamed to hickory_resolver)
 hickory-resolver = "0.25"
 
@@ -86,3 +89,4 @@ path = "src/lib.rs"
 
 [features]
 test-utils = ["dashcore/test-utils", "dep:tempfile", "dep:dashcore-rpc"]
+uniffi = ["dep:uniffi"]

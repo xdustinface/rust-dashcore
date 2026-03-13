@@ -56,6 +56,9 @@
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+#[cfg(feature = "uniffi")]
+pub mod uniffi;
+
 pub mod chain;
 pub mod client;
 pub mod error;
