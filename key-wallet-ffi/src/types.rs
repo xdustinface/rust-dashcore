@@ -727,10 +727,12 @@ impl From<TransactionContext> for FFITransactionContext {
         match ctx {
             TransactionContext::Mempool => FFITransactionContext::Mempool,
             TransactionContext::InstantSend => FFITransactionContext::InstantSend,
-            TransactionContext::InBlock { .. } => FFITransactionContext::InBlock,
-            TransactionContext::InChainLockedBlock { .. } => {
-                FFITransactionContext::InChainLockedBlock
-            }
+            TransactionContext::InBlock {
+                ..
+            } => FFITransactionContext::InBlock,
+            TransactionContext::InChainLockedBlock {
+                ..
+            } => FFITransactionContext::InChainLockedBlock,
         }
     }
 }

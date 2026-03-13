@@ -165,12 +165,12 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> std::fmt::Debug
 mod tests {
     use super::*;
     use crate::network::{MessageType, NetworkManager};
-    use dashcore::BlockHash;
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentBlockStorage, StorageManager,
     };
     use crate::sync::{ManagerIdentifier, SyncEvent, SyncManagerProgress};
     use crate::test_utils::MockNetworkManager;
+    use dashcore::BlockHash;
     use key_wallet_manager::test_utils::MockWallet;
     use key_wallet_manager::wallet_manager::FilterMatchKey;
     use std::collections::BTreeSet;

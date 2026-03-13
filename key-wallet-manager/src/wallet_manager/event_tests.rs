@@ -1,7 +1,7 @@
 use super::*;
 use crate::wallet_interface::WalletInterface;
 use dashcore::hashes::Hash;
-use dashcore::{BlockHash, OutPoint, ScriptBuf, TxIn, Txid, TxOut, Witness};
+use dashcore::{BlockHash, OutPoint, ScriptBuf, TxIn, TxOut, Txid, Witness};
 use key_wallet::wallet::initialization::WalletAccountCreationOptions;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
