@@ -234,10 +234,7 @@ mod tests {
         }
 
         fn on_sync_progress(&self, percentage: f64, current_height: u32, target_height: u32) {
-            self.progress_events
-                .lock()
-                .unwrap()
-                .push((percentage, current_height, target_height));
+            self.progress_events.lock().unwrap().push((percentage, current_height, target_height));
         }
     }
 
@@ -250,7 +247,13 @@ mod tests {
         });
         let events = listener.sync_events.lock().unwrap();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], SyncEvent::SyncComplete { header_tip: 100, cycle: 0 }));
+        assert!(matches!(
+            events[0],
+            SyncEvent::SyncComplete {
+                header_tip: 100,
+                cycle: 0
+            }
+        ));
     }
 
     #[test]
@@ -277,27 +280,57 @@ mod tests {
     fn test_sync_event_variants() {
         // Verify all variants can be constructed and cloned.
         let events: Vec<SyncEvent> = vec![
-            SyncEvent::SyncStart { identifier: "BlockHeader".to_string() },
-            SyncEvent::BlockHeadersStored { tip_height: 1000 },
-            SyncEvent::BlockHeaderSyncComplete { tip_height: 1000 },
-            SyncEvent::FilterHeadersStored { start_height: 0, end_height: 999, tip_height: 1000 },
-            SyncEvent::FilterHeadersSyncComplete { tip_height: 1000 },
-            SyncEvent::FiltersStored { start_height: 0, end_height: 999 },
-            SyncEvent::FiltersSyncComplete { tip_height: 1000 },
-            SyncEvent::BlocksNeeded { block_count: 5 },
+            SyncEvent::SyncStart {
+                identifier: "BlockHeader".to_string(),
+            },
+            SyncEvent::BlockHeadersStored {
+                tip_height: 1000,
+            },
+            SyncEvent::BlockHeaderSyncComplete {
+                tip_height: 1000,
+            },
+            SyncEvent::FilterHeadersStored {
+                start_height: 0,
+                end_height: 999,
+                tip_height: 1000,
+            },
+            SyncEvent::FilterHeadersSyncComplete {
+                tip_height: 1000,
+            },
+            SyncEvent::FiltersStored {
+                start_height: 0,
+                end_height: 999,
+            },
+            SyncEvent::FiltersSyncComplete {
+                tip_height: 1000,
+            },
+            SyncEvent::BlocksNeeded {
+                block_count: 5,
+            },
             SyncEvent::BlockProcessed {
                 block_hash: "deadbeef".to_string(),
                 height: 500,
                 new_address_count: 2,
             },
-            SyncEvent::MasternodeStateUpdated { height: 1000 },
+            SyncEvent::MasternodeStateUpdated {
+                height: 1000,
+            },
             SyncEvent::ManagerError {
                 manager: "Filter".to_string(),
                 error: "timeout".to_string(),
             },
-            SyncEvent::ChainLockReceived { block_height: 1000, validated: true },
-            SyncEvent::InstantLockReceived { txid: "abcd1234".to_string(), validated: false },
-            SyncEvent::SyncComplete { header_tip: 1000, cycle: 0 },
+            SyncEvent::ChainLockReceived {
+                block_height: 1000,
+                validated: true,
+            },
+            SyncEvent::InstantLockReceived {
+                txid: "abcd1234".to_string(),
+                validated: false,
+            },
+            SyncEvent::SyncComplete {
+                header_tip: 1000,
+                cycle: 0,
+            },
         ];
         // Clone succeeds for all variants.
         let _cloned: Vec<SyncEvent> = events.to_vec();
@@ -307,8 +340,12 @@ mod tests {
     #[test]
     fn test_network_event_variants() {
         let events: Vec<NetworkEvent> = vec![
-            NetworkEvent::PeerConnected { address: "127.0.0.1:9999".to_string() },
-            NetworkEvent::PeerDisconnected { address: "127.0.0.1:9999".to_string() },
+            NetworkEvent::PeerConnected {
+                address: "127.0.0.1:9999".to_string(),
+            },
+            NetworkEvent::PeerDisconnected {
+                address: "127.0.0.1:9999".to_string(),
+            },
             NetworkEvent::PeersUpdated {
                 connected_count: 3,
                 addresses: vec!["127.0.0.1:9999".to_string()],
