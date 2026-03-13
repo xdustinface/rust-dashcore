@@ -343,6 +343,75 @@ impl SpvClient {
     }
 }
 
+// ============ Masternode and Governance types ============
+
+/// UniFFI-compatible record representing a single masternode entry.
+///
+/// Fields are mapped from `MasternodeListEntry` internals. All hashes and
+/// addresses are represented as `String` values for cross-language convenience.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct MasternodeInfo {
+    /// ProRegTx hash that uniquely identifies this masternode.
+    pub pro_tx_hash: String,
+    /// Service address of the masternode (IP:port).
+    pub address: String,
+    /// Status of the masternode (e.g. "Enabled", "PoSeBanned").
+    pub status: String,
+    /// Proof-of-Service penalty score.
+    pub pose_penalty: u32,
+    /// Height at which this masternode was last paid.
+    pub last_paid_height: u32,
+    /// Block height at which the masternode was registered.
+    pub registered_height: u32,
+}
+
+/// UniFFI-compatible record representing a governance proposal.
+///
+/// These fields are stubs — governance sync is not yet implemented. The type
+/// is exported so foreign-language bindings can be generated in advance.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct GovernanceProposal {
+    /// Hash of the governance proposal object.
+    pub hash: String,
+    /// Human-readable name of the proposal.
+    pub name: String,
+    /// URL linking to the proposal details.
+    pub url: String,
+    /// Dash address that will receive the payment if the proposal passes.
+    pub payment_address: String,
+    /// Requested payment amount in duffs.
+    pub payment_amount: u64,
+    /// Number of "yes" votes cast for this proposal.
+    pub yes_count: u32,
+    /// Number of "no" votes cast against this proposal.
+    pub no_count: u32,
+    /// Number of "abstain" votes cast for this proposal.
+    pub abstain_count: u32,
+}
+
+#[uniffi::export]
+impl SpvClient {
+    /// Returns the number of masternodes in the current masternode list.
+    ///
+    /// # TODO
+    /// Wire up to `MasternodeListEngine` once the engine is accessible from
+    /// `DashSpvClient`. Requires `enable_masternodes: true` in `ClientConfig`.
+    pub async fn get_masternode_count(&self) -> u32 {
+        // TODO: return self.inner.masternode_list_engine()?.read().await.count()
+        0
+    }
+
+    /// Returns all masternodes from the current masternode list.
+    ///
+    /// # TODO
+    /// Wire up to `MasternodeListEngine` once the engine is accessible from
+    /// `DashSpvClient`. Requires `enable_masternodes: true` in `ClientConfig`.
+    pub async fn get_masternodes(&self) -> Vec<MasternodeInfo> {
+        // TODO: map MasternodeListEntry fields to MasternodeInfo
+        vec![]
+    }
+}
+
 // ============ Stub functions ============
 
 /// Returns a greeting string (sanity-check export).
@@ -544,6 +613,71 @@ mod tests {
         assert!(!client.is_running().await, "Client should not be running after construction");
         assert_eq!(client.tip_height().await, 0, "Tip height should start at 0 (genesis)");
         assert_eq!(client.peer_count().await, 0, "Peer count should be 0 before start");
+    }
+
+    #[test]
+    fn test_masternode_info_fields() {
+        let info = MasternodeInfo {
+            pro_tx_hash: "abcd1234".to_string(),
+            address: "1.2.3.4:9999".to_string(),
+            status: "Enabled".to_string(),
+            pose_penalty: 0,
+            last_paid_height: 500,
+            registered_height: 100,
+        };
+        assert_eq!(info.pro_tx_hash, "abcd1234");
+        assert_eq!(info.address, "1.2.3.4:9999");
+        assert_eq!(info.status, "Enabled");
+        assert_eq!(info.pose_penalty, 0);
+        assert_eq!(info.last_paid_height, 500);
+        assert_eq!(info.registered_height, 100);
+    }
+
+    #[test]
+    fn test_governance_proposal_fields() {
+        let proposal = GovernanceProposal {
+            hash: "deadbeef".to_string(),
+            name: "Test Proposal".to_string(),
+            url: "https://example.com".to_string(),
+            payment_address: "XtestAddr".to_string(),
+            payment_amount: 100_000_000,
+            yes_count: 10,
+            no_count: 2,
+            abstain_count: 1,
+        };
+        assert_eq!(proposal.hash, "deadbeef");
+        assert_eq!(proposal.name, "Test Proposal");
+        assert_eq!(proposal.url, "https://example.com");
+        assert_eq!(proposal.payment_address, "XtestAddr");
+        assert_eq!(proposal.payment_amount, 100_000_000);
+        assert_eq!(proposal.yes_count, 10);
+        assert_eq!(proposal.no_count, 2);
+        assert_eq!(proposal.abstain_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_masternode_count_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert_eq!(client.get_masternode_count().await, 0, "stub should return 0");
+    }
+
+    #[tokio::test]
+    async fn test_get_masternodes_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let masternodes = client.get_masternodes().await;
+        assert!(masternodes.is_empty(), "stub should return empty vec");
     }
 
     /// Verify that `sync_progress` and `is_syncing` return sensible defaults.
