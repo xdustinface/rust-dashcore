@@ -256,6 +256,38 @@ impl From<SpvError> for SpvClientError {
     }
 }
 
+// ============ Wallet record types ============
+
+/// UniFFI-compatible wallet balance record.
+///
+/// All amounts are in duffs (1 DASH = 100,000,000 duffs).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct WalletBalance {
+    /// Confirmed spendable balance, in duffs.
+    pub confirmed: u64,
+    /// Unconfirmed (pending) balance, in duffs.
+    pub unconfirmed: u64,
+    /// Immature coinbase balance not yet spendable, in duffs.
+    pub immature: u64,
+}
+
+/// UniFFI-compatible transaction summary record.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct TransactionInfo {
+    /// Transaction ID as a hex string.
+    pub txid: String,
+    /// Net amount in duffs — positive for incoming, negative for outgoing.
+    pub amount: i64,
+    /// Fee paid in duffs.
+    pub fee: u64,
+    /// Number of confirmations (0 = unconfirmed).
+    pub confirmations: u32,
+    /// Unix timestamp of when the transaction was first seen.
+    pub timestamp: u64,
+    /// `true` if the transaction added funds to this wallet.
+    pub is_incoming: bool,
+}
+
 // ============ Concrete type alias ============
 
 type ConcreteClient =
@@ -340,6 +372,17 @@ impl SpvClient {
     /// Returns `true` when the client is actively downloading and processing blocks.
     pub async fn is_syncing(&self) -> bool {
         matches!(self.inner.sync_progress().await.state(), SyncState::Syncing)
+    }
+
+    /// Returns the wallet balance.
+    ///
+    /// TODO: delegate to `self.inner.wallet()` once wallet integration is complete.
+    pub async fn get_balance(&self) -> WalletBalance {
+        WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+            immature: 0,
+        }
     }
 }
 
@@ -564,5 +607,83 @@ mod tests {
         );
 
         assert!(!client.is_syncing().await, "Client should not be syncing before start()");
+    }
+
+    // ---- WalletBalance record tests ----
+
+    #[test]
+    fn test_wallet_balance_fields() {
+        let balance = WalletBalance {
+            confirmed: 100_000_000,
+            unconfirmed: 50_000,
+            immature: 0,
+        };
+        assert_eq!(balance.confirmed, 100_000_000);
+        assert_eq!(balance.unconfirmed, 50_000);
+        assert_eq!(balance.immature, 0);
+    }
+
+    #[test]
+    fn test_wallet_balance_zero() {
+        let balance = WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+            immature: 0,
+        };
+        assert_eq!(balance, WalletBalance { confirmed: 0, unconfirmed: 0, immature: 0 });
+    }
+
+    // ---- TransactionInfo record tests ----
+
+    #[test]
+    fn test_transaction_info_incoming() {
+        let tx = TransactionInfo {
+            txid: "abcd1234".to_string(),
+            amount: 500_000_000,
+            fee: 1_000,
+            confirmations: 6,
+            timestamp: 1_700_000_000,
+            is_incoming: true,
+        };
+        assert_eq!(tx.txid, "abcd1234");
+        assert_eq!(tx.amount, 500_000_000);
+        assert_eq!(tx.fee, 1_000);
+        assert_eq!(tx.confirmations, 6);
+        assert_eq!(tx.timestamp, 1_700_000_000);
+        assert!(tx.is_incoming);
+    }
+
+    #[test]
+    fn test_transaction_info_outgoing() {
+        let tx = TransactionInfo {
+            txid: "deadbeef".to_string(),
+            amount: -200_000_000,
+            fee: 2_000,
+            confirmations: 0,
+            timestamp: 1_700_001_000,
+            is_incoming: false,
+        };
+        assert!(tx.amount < 0);
+        assert!(!tx.is_incoming);
+        assert_eq!(tx.confirmations, 0);
+    }
+
+    // ---- SpvClient::get_balance stub test ----
+
+    #[tokio::test]
+    async fn test_get_balance_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let balance = client.get_balance().await;
+        assert_eq!(
+            balance,
+            WalletBalance { confirmed: 0, unconfirmed: 0, immature: 0 },
+            "stub get_balance should return all-zero balance"
+        );
     }
 }
