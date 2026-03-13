@@ -11,11 +11,19 @@ use std::sync::Arc;
 
 use dashcore::Network;
 
-uniffi::custom_type!(Network, String, {
-    remote,
-    lower: |n| n.to_string(),
-    try_lift: |s| s.parse().map_err(Into::into),
-});
+uniffi::custom_type!(Network, String);
+
+impl uniffi::UniffiCustomTypeConverter for Network {
+    type Builtin = String;
+
+    fn into_custom(val: Self::Builtin) -> uniffi::Result<Self> {
+        val.parse().map_err(|e| anyhow::anyhow!("Invalid network: {e}").into())
+    }
+
+    fn from_custom(obj: Self) -> Self::Builtin {
+        obj.to_string()
+    }
+}
 
 /// A simple sync function that returns a greeting string.
 #[uniffi::export]
