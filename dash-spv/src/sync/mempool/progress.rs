@@ -1,6 +1,6 @@
 use crate::sync::SyncState;
 use std::fmt;
-use std::time::Instant;
+use tokio::time::Instant;
 
 /// Progress tracking for mempool transaction monitoring.
 #[derive(Debug, Clone, PartialEq)]
