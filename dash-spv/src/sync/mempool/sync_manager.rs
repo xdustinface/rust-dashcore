@@ -51,10 +51,13 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                 ..
             } => {
                 if self.state() != SyncState::Synced {
-                    // Activate (or re-activate after reconnect) mempool monitoring
-                    self.activate(requests).await?;
-                    self.set_state(SyncState::Synced);
-                    tracing::info!("Mempool manager activated after sync complete");
+                    if let Some(peer) = self.pick_peer() {
+                        self.activate(peer, requests).await?;
+                        self.set_state(SyncState::Synced);
+                        tracing::info!("Mempool manager activated on peer {}", peer);
+                    } else {
+                        tracing::warn!("Sync complete but no peers available for mempool activation");
+                    }
                 }
                 Ok(vec![])
             }
@@ -105,7 +108,15 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
             NetworkEvent::PeerDisconnected {
                 address,
             } => {
-                self.handle_peer_disconnected(*address);
+                let needs_reactivation = self.handle_peer_disconnected(*address);
+                if needs_reactivation && self.state() == SyncState::Synced {
+                    if let Some(new_peer) = self.pick_peer() {
+                        self.activate(new_peer, requests).await?;
+                        tracing::info!("Re-activated mempool on peer {}", new_peer);
+                    } else {
+                        tracing::warn!("Mempool peer lost and no peers available for re-activation");
+                    }
+                }
             }
             NetworkEvent::PeersUpdated {
                 connected_count,
@@ -132,8 +143,10 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
 
         // Retry activation if no inventory response arrived within the timeout
         if self.needs_activation_retry() {
-            tracing::debug!("Retrying mempool activation (no response within timeout)");
-            self.activate(requests).await?;
+            if let Some(peer) = self.pick_peer() {
+                tracing::debug!("Retrying mempool activation on peer {}", peer);
+                self.activate(peer, requests).await?;
+            }
         }
 
         // Prune expired transactions periodically
@@ -225,6 +238,8 @@ mod tests {
     #[tokio::test]
     async fn test_handle_sync_complete_activates() {
         let (mut manager, requests, _rx) = create_test_manager();
+        let peer = crate::test_utils::test_socket_address(1);
+        manager.handle_peer_connected(peer);
 
         let event = SyncEvent::SyncComplete {
             header_tip: 1000,
@@ -234,11 +249,13 @@ mod tests {
         let events = manager.handle_sync_event(&event, &requests).await.unwrap();
         assert!(events.is_empty());
         assert_eq!(manager.state(), SyncState::Synced);
+        assert_eq!(manager.mempool_peer, Some(peer));
     }
 
     #[tokio::test]
     async fn test_handle_sync_complete_subsequent_cycles() {
         let (mut manager, requests, _rx) = create_test_manager();
+        manager.handle_peer_connected(crate::test_utils::test_socket_address(1));
 
         // Activate first
         let event0 = SyncEvent::SyncComplete {
@@ -429,6 +446,8 @@ mod tests {
     #[tokio::test]
     async fn test_reactivation_after_disconnect() {
         let (mut manager, requests, _rx) = create_test_manager();
+        let peer = test_socket_address(1);
+        manager.handle_peer_connected(peer);
 
         // Initial activation
         let event = SyncEvent::SyncComplete {
