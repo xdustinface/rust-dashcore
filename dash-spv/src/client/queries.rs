@@ -52,6 +52,11 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         }
     }
 
+    /// Returns a clone of the masternode engine handle, or `None` if masternodes are disabled.
+    pub async fn masternode_engine(&self) -> Option<Arc<RwLock<MasternodeListEngine>>> {
+        self.masternode_engine.clone()
+    }
+
     /// Get a quorum entry by type and hash at a specific block height.
     /// Returns `SpvError::QuorumLookupError` if the quorum is not found.
     pub async fn get_quorum_at_height(
