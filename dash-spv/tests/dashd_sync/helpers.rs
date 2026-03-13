@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch, RwLock};
+use tokio::time::sleep;
 
 use dash_spv::test_utils::SYNC_TIMEOUT;
 
@@ -21,7 +22,7 @@ pub(super) async fn wait_for_sync(
     progress_receiver: &mut watch::Receiver<SyncProgress>,
     target_height: u32,
 ) {
-    let timeout = tokio::time::sleep(SYNC_TIMEOUT);
+    let timeout = sleep(SYNC_TIMEOUT);
     tokio::pin!(timeout);
 
     loop {
@@ -109,7 +110,7 @@ pub(super) async fn wait_for_network_event(
     predicate: impl Fn(&NetworkEvent) -> bool,
     max_wait: Duration,
 ) -> bool {
-    let deadline = tokio::time::sleep(max_wait);
+    let deadline = sleep(max_wait);
     tokio::pin!(deadline);
 
     loop {
@@ -132,7 +133,7 @@ pub(super) async fn wait_for_mempool_tx(
     receiver: &mut broadcast::Receiver<WalletEvent>,
     max_wait: Duration,
 ) -> Option<Txid> {
-    let timeout = tokio::time::sleep(max_wait);
+    let timeout = sleep(max_wait);
     tokio::pin!(timeout);
 
     loop {
@@ -173,7 +174,7 @@ pub(super) async fn run_disconnect_loop(
     let mut disconnect_count = 0;
     let mut events_since_disconnect = 0;
 
-    let timeout = tokio::time::sleep(SYNC_TIMEOUT * 2);
+    let timeout = sleep(SYNC_TIMEOUT * 2);
     tokio::pin!(timeout);
 
     loop {

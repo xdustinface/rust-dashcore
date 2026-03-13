@@ -1,7 +1,7 @@
 use super::*;
 use crate::wallet_interface::WalletInterface;
 use dashcore::hashes::Hash;
-use dashcore::{BlockHash, ScriptBuf, TxOut, Witness};
+use dashcore::{BlockHash, OutPoint, ScriptBuf, TxIn, Txid, TxOut, Witness};
 use key_wallet::wallet::initialization::WalletAccountCreationOptions;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
@@ -27,9 +27,9 @@ fn create_tx_paying_to(addr: &Address, input_seed: u8) -> Transaction {
     Transaction {
         version: 2,
         lock_time: 0,
-        input: vec![dashcore::TxIn {
-            previous_output: dashcore::OutPoint {
-                txid: dashcore::Txid::from_byte_array([input_seed; 32]),
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([input_seed; 32]),
                 vout: 0,
             },
             script_sig: ScriptBuf::new(),

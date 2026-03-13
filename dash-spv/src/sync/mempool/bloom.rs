@@ -2,6 +2,7 @@
 //!
 //! Builds BIP37 bloom filters from wallet data for peer-side transaction filtering.
 
+use dashcore::address::Payload;
 use dashcore::bloom::{BloomError, BloomFilter};
 use dashcore::consensus::Encodable;
 use dashcore::network::message_bloom::{BloomFlags, FilterLoad};
@@ -10,9 +11,9 @@ use dashcore::{Address, OutPoint};
 /// Extract the raw hash payload bytes from an address for bloom filter insertion.
 fn address_payload_bytes(addr: &Address) -> Option<Vec<u8>> {
     match addr.payload() {
-        dashcore::address::Payload::PubkeyHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
-        dashcore::address::Payload::ScriptHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
-        dashcore::address::Payload::WitnessProgram(prog) => {
+        Payload::PubkeyHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
+        Payload::ScriptHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
+        Payload::WitnessProgram(prog) => {
             Some(prog.program().as_bytes().to_vec())
         }
         _ => {
@@ -62,6 +63,8 @@ pub(super) fn build_wallet_bloom_filter(
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use dashcore::hashes::Hash;
     use dashcore::{Network, Txid};
@@ -70,7 +73,7 @@ mod tests {
     fn test_build_filter_from_addresses() {
         let addr = Address::dummy(Network::Testnet, 0);
         let filter_load =
-            build_wallet_bloom_filter(std::slice::from_ref(&addr), &[], 0.0005, 0).unwrap();
+            build_wallet_bloom_filter(slice::from_ref(&addr), &[], 0.0005, 0).unwrap();
 
         let filter = filter_load.to_bloom_filter().unwrap();
         assert!(filter.contains(&address_payload_bytes(&addr).unwrap()));
@@ -99,7 +102,7 @@ mod tests {
         };
 
         let filter_load =
-            build_wallet_bloom_filter(std::slice::from_ref(&addr), &[outpoint], 0.0005, 42)
+            build_wallet_bloom_filter(slice::from_ref(&addr), &[outpoint], 0.0005, 42)
                 .unwrap();
         let filter = filter_load.to_bloom_filter().unwrap();
 
@@ -147,7 +150,7 @@ mod tests {
     #[test]
     fn test_build_filter_rejects_invalid_fp_rates() {
         let addr = Address::dummy(Network::Testnet, 0);
-        let addrs = std::slice::from_ref(&addr);
+        let addrs = slice::from_ref(&addr);
 
         assert!(build_wallet_bloom_filter(addrs, &[], 0.0, 0).is_err());
         assert!(build_wallet_bloom_filter(addrs, &[], -0.5, 0).is_err());
@@ -158,7 +161,7 @@ mod tests {
     #[test]
     fn test_build_filter_with_extreme_fp_rates() {
         let addr = Address::dummy(Network::Testnet, 0);
-        let addrs = std::slice::from_ref(&addr);
+        let addrs = slice::from_ref(&addr);
         let payload = address_payload_bytes(&addr).unwrap();
 
         // Very small rate: produces a larger filter but still works

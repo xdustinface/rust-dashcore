@@ -159,9 +159,13 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::config::MempoolStrategy;
     use crate::network::NetworkRequest;
-    use crate::types::UnconfirmedTransaction;
+    use crate::test_utils::test_socket_address;
+    use crate::types::{MempoolState, UnconfirmedTransaction};
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
     use dashcore::hashes::Hash;
+    use dashcore::{Amount, BlockHash, Transaction, Txid};
     use key_wallet_manager::test_utils::MockWallet;
     use std::sync::Arc;
     use tokio::sync::{mpsc, RwLock};
@@ -169,14 +173,14 @@ mod tests {
     fn create_test_manager(
     ) -> (MempoolManager<MockWallet>, RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
-        let mempool_state = Arc::new(RwLock::new(crate::types::MempoolState::default()));
+        let mempool_state = Arc::new(RwLock::new(MempoolState::default()));
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
         let manager = MempoolManager::new(
             wallet,
             mempool_state,
-            crate::client::config::MempoolStrategy::FetchAll,
+            MempoolStrategy::FetchAll,
             1000,
         );
 
@@ -266,14 +270,14 @@ mod tests {
         let (mut manager, requests, _rx) = create_test_manager();
 
         // Add two transactions to mempool state
-        let tx1 = dashcore::Transaction {
+        let tx1 = Transaction {
             version: 1,
             lock_time: 0,
             input: vec![],
             output: vec![],
             special_transaction_payload: None,
         };
-        let tx2 = dashcore::Transaction {
+        let tx2 = Transaction {
             version: 1,
             lock_time: 1,
             input: vec![],
@@ -286,7 +290,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx1,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -294,7 +298,7 @@ mod tests {
             ));
             state.add_transaction(UnconfirmedTransaction::new(
                 tx2,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -303,7 +307,7 @@ mod tests {
         }
 
         let event = SyncEvent::BlockProcessed {
-            block_hash: dashcore::BlockHash::all_zeros(),
+            block_hash: BlockHash::all_zeros(),
             height: 100,
             new_addresses: vec![],
             confirmed_txids: vec![txid1],
@@ -323,7 +327,7 @@ mod tests {
         let (mut manager, requests, _rx) = create_test_manager();
 
         // Add one transaction to mempool
-        let tx = dashcore::Transaction {
+        let tx = Transaction {
             version: 1,
             lock_time: 0,
             input: vec![],
@@ -331,12 +335,12 @@ mod tests {
             special_transaction_payload: None,
         };
         let txid = tx.txid();
-        let unknown_txid = dashcore::Txid::from_byte_array([0xaa; 32]);
+        let unknown_txid = Txid::from_byte_array([0xaa; 32]);
         {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -346,7 +350,7 @@ mod tests {
 
         // Confirm with a mix of known and unknown txids
         let event = SyncEvent::BlockProcessed {
-            block_hash: dashcore::BlockHash::all_zeros(),
+            block_hash: BlockHash::all_zeros(),
             height: 100,
             new_addresses: vec![],
             confirmed_txids: vec![unknown_txid, txid],
@@ -365,7 +369,7 @@ mod tests {
         let (mut manager, requests, _rx) = create_test_manager();
 
         // Add a transaction to mempool
-        let tx = dashcore::Transaction {
+        let tx = Transaction {
             version: 1,
             lock_time: 0,
             input: vec![],
@@ -376,7 +380,7 @@ mod tests {
             let mut state = manager.mempool_state.write().await;
             state.add_transaction(UnconfirmedTransaction::new(
                 tx,
-                dashcore::Amount::from_sat(0),
+                Amount::from_sat(0),
                 false,
                 false,
                 Vec::new(),
@@ -386,7 +390,7 @@ mod tests {
 
         // Empty confirmed_txids should not remove anything
         let event = SyncEvent::BlockProcessed {
-            block_hash: dashcore::BlockHash::all_zeros(),
+            block_hash: BlockHash::all_zeros(),
             height: 100,
             new_addresses: vec![],
             confirmed_txids: vec![],
@@ -401,14 +405,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_chainlock_received_notifies_wallet() {
-        use dashcore::ephemerealdata::chain_lock::ChainLock;
-
         let (mut manager, requests, _rx) = create_test_manager();
 
         let event = SyncEvent::ChainLockReceived {
             chain_lock: ChainLock {
                 block_height: 1000,
-                block_hash: dashcore::BlockHash::from_byte_array([0; 32]),
+                block_hash: BlockHash::from_byte_array([0; 32]),
                 signature: [0u8; 96].into(),
             },
             validated: true,
@@ -452,8 +454,8 @@ mod tests {
     async fn test_network_event_peer_connect_disconnect() {
         let (mut manager, requests, _rx) = create_test_manager();
 
-        let peer1 = crate::test_utils::test_socket_address(1);
-        let peer2 = crate::test_utils::test_socket_address(2);
+        let peer1 = test_socket_address(1);
+        let peer2 = test_socket_address(2);
 
         // Connect and disconnect should not error
         let connect1 = NetworkEvent::PeerConnected {
