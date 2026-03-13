@@ -14,7 +14,7 @@ use dashcore::Network;
 uniffi::custom_type!(Network, String, {
     remote,
     lower: |n| n.to_string(),
-    try_lift: |s| s.parse().map_err(|e| uniffi::deps::anyhow::anyhow!(e)),
+    try_lift: |s| s.parse().map_err(|e: String| uniffi::deps::anyhow::anyhow!(e)),
 });
 
 /// A simple sync function that returns a greeting string.
