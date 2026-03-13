@@ -183,6 +183,36 @@ pub enum NetworkEvent {
     },
 }
 
+// ============ Network info types ============
+
+/// UniFFI-compatible record describing a single connected peer.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PeerInfo {
+    /// Socket address of the peer, e.g. `"192.0.2.1:9999"`.
+    pub address: String,
+    /// User-agent string reported by the peer.
+    pub user_agent: String,
+    /// Best block height reported by the peer.
+    pub best_height: u32,
+    /// Unix timestamp (seconds) of when the peer connected.
+    pub connected_since: u64,
+    /// Services bitmask advertised by the peer.
+    pub services: u64,
+}
+
+/// UniFFI-compatible record describing the current network state.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct NetworkInfo {
+    /// Network name (e.g. `"mainnet"`, `"testnet"`, `"regtest"`).
+    pub network: String,
+    /// Number of currently connected peers.
+    pub peer_count: u32,
+    /// Details for each connected peer.
+    ///
+    /// TODO: populate with real peer data from `PeerNetworkManager`.
+    pub peers: Vec<PeerInfo>,
+}
+
 /// Callback interface for receiving SPV client events on the foreign side.
 ///
 /// Implement this trait in React Native / Swift and register it via
@@ -340,6 +370,23 @@ impl SpvClient {
     /// Returns `true` when the client is actively downloading and processing blocks.
     pub async fn is_syncing(&self) -> bool {
         matches!(self.inner.sync_progress().await.state(), SyncState::Syncing)
+    }
+
+    /// Returns network and peer information.
+    ///
+    /// Currently returns a stub with the network name, peer count, and an empty
+    /// peer list.  Peer details will be wired up once `PeerNetworkManager`
+    /// exposes per-peer metadata.
+    ///
+    /// TODO: populate `peers` with real data from `PeerNetworkManager`.
+    pub async fn get_network_info(&self) -> NetworkInfo {
+        let network = self.inner.network().await;
+        let peer_count = self.inner.peer_count().await as u32;
+        NetworkInfo {
+            network: network.to_string(),
+            peer_count,
+            peers: vec![], // TODO: populate with real peer data
+        }
     }
 }
 
@@ -544,6 +591,82 @@ mod tests {
         assert!(!client.is_running().await, "Client should not be running after construction");
         assert_eq!(client.tip_height().await, 0, "Tip height should start at 0 (genesis)");
         assert_eq!(client.peer_count().await, 0, "Peer count should be 0 before start");
+    }
+
+    #[test]
+    fn test_peer_info_record() {
+        let peer = PeerInfo {
+            address: "192.0.2.1:9999".to_string(),
+            user_agent: "/DashCore:0.18.0/".to_string(),
+            best_height: 1234,
+            connected_since: 1_700_000_000,
+            services: 0x40d,
+        };
+        assert_eq!(peer.address, "192.0.2.1:9999");
+        assert_eq!(peer.user_agent, "/DashCore:0.18.0/");
+        assert_eq!(peer.best_height, 1234);
+        assert_eq!(peer.connected_since, 1_700_000_000);
+        assert_eq!(peer.services, 0x40d);
+    }
+
+    #[test]
+    fn test_network_info_record_empty_peers() {
+        let info = NetworkInfo {
+            network: "mainnet".to_string(),
+            peer_count: 0,
+            peers: vec![],
+        };
+        assert_eq!(info.network, "mainnet");
+        assert_eq!(info.peer_count, 0);
+        assert!(info.peers.is_empty());
+    }
+
+    #[test]
+    fn test_network_info_record_with_peers() {
+        let peers = vec![
+            PeerInfo {
+                address: "10.0.0.1:9999".to_string(),
+                user_agent: "/DashCore:0.19.0/".to_string(),
+                best_height: 500,
+                connected_since: 1_600_000_000,
+                services: 1,
+            },
+            PeerInfo {
+                address: "10.0.0.2:9999".to_string(),
+                user_agent: "/DashCore:0.20.0/".to_string(),
+                best_height: 501,
+                connected_since: 1_600_000_001,
+                services: 5,
+            },
+        ];
+        let info = NetworkInfo {
+            network: "testnet".to_string(),
+            peer_count: 2,
+            peers: peers.clone(),
+        };
+        assert_eq!(info.network, "testnet");
+        assert_eq!(info.peer_count, 2);
+        assert_eq!(info.peers.len(), 2);
+        assert_eq!(info.peers[0].address, "10.0.0.1:9999");
+        assert_eq!(info.peers[1].best_height, 501);
+    }
+
+    /// Verify that `get_network_info` returns a stub with the correct network
+    /// name and zero peers before the client is started.
+    #[tokio::test]
+    async fn test_get_network_info_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let info = client.get_network_info().await;
+
+        assert_eq!(info.network, "regtest", "network name should be 'regtest'");
+        assert_eq!(info.peer_count, 0, "peer count should be 0 before start");
+        assert!(info.peers.is_empty(), "peers should be empty in stub implementation");
     }
 
     /// Verify that `sync_progress` and `is_syncing` return sensible defaults.
