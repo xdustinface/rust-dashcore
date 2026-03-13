@@ -13,9 +13,7 @@ fn address_payload_bytes(addr: &Address) -> Option<Vec<u8>> {
     match addr.payload() {
         Payload::PubkeyHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
         Payload::ScriptHash(hash) => Some(<[u8; 20]>::from(*hash).to_vec()),
-        Payload::WitnessProgram(prog) => {
-            Some(prog.program().as_bytes().to_vec())
-        }
+        Payload::WitnessProgram(prog) => Some(prog.program().as_bytes().to_vec()),
         _ => {
             tracing::warn!("skipping unknown address type for bloom filter: {:?}", addr);
             None
@@ -102,8 +100,7 @@ mod tests {
         };
 
         let filter_load =
-            build_wallet_bloom_filter(slice::from_ref(&addr), &[outpoint], 0.0005, 42)
-                .unwrap();
+            build_wallet_bloom_filter(slice::from_ref(&addr), &[outpoint], 0.0005, 42).unwrap();
         let filter = filter_load.to_bloom_filter().unwrap();
 
         assert!(filter.contains(&address_payload_bytes(&addr).unwrap()));

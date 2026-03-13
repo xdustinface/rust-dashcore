@@ -3,10 +3,10 @@
 //! This provides utilities for managing a dashd instance and loading test wallet data.
 
 use dashcore::{Address, Amount, BlockHash, Transaction, Txid};
-use std::collections::HashMap;
 use dashcore_rpc::json as rpc_json;
 use dashcore_rpc::{Auth, Client, RpcApi};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

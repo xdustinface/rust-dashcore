@@ -55,9 +55,13 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                         self.activate(peer, requests).await?;
                         self.set_state(SyncState::Synced);
                         tracing::info!("Mempool manager activated on peer {}", peer);
-                        return Ok(vec![SyncEvent::MempoolActivated { peer }]);
+                        return Ok(vec![SyncEvent::MempoolActivated {
+                            peer,
+                        }]);
                     } else {
-                        tracing::warn!("Sync complete but no peers available for mempool activation");
+                        tracing::warn!(
+                            "Sync complete but no peers available for mempool activation"
+                        );
                     }
                 }
                 Ok(vec![])
@@ -114,9 +118,13 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                     if let Some(new_peer) = self.pick_peer() {
                         self.activate(new_peer, requests).await?;
                         tracing::info!("Re-activated mempool on peer {}", new_peer);
-                        return Ok(vec![SyncEvent::MempoolActivated { peer: new_peer }]);
+                        return Ok(vec![SyncEvent::MempoolActivated {
+                            peer: new_peer,
+                        }]);
                     } else {
-                        tracing::warn!("Mempool peer lost and no peers available for re-activation");
+                        tracing::warn!(
+                            "Mempool peer lost and no peers available for re-activation"
+                        );
                     }
                 }
             }
@@ -192,12 +200,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let manager = MempoolManager::new(
-            wallet,
-            mempool_state,
-            MempoolStrategy::FetchAll,
-            1000,
-        );
+        let manager = MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 1000);
 
         (manager, requests, rx)
     }

@@ -325,10 +325,7 @@ impl<W: WalletInterface> MempoolManager<W> {
     }
 
     /// Handle a received transaction.
-    pub(super) async fn handle_tx(
-        &mut self,
-        tx: Transaction,
-    ) -> SyncResult<Vec<SyncEvent>> {
+    pub(super) async fn handle_tx(&mut self, tx: Transaction) -> SyncResult<Vec<SyncEvent>> {
         let txid = tx.txid();
         self.pending_requests.remove(&txid);
         self.progress.add_received(1);
@@ -437,8 +434,7 @@ impl<W: WalletInterface> MempoolManager<W> {
 
         // Prune pending IS locks whose transaction never arrived
         let before = self.pending_is_locks.len();
-        self.pending_is_locks
-            .retain(|_, inserted_at| inserted_at.elapsed() < MEMPOOL_TX_EXPIRY);
+        self.pending_is_locks.retain(|_, inserted_at| inserted_at.elapsed() < MEMPOOL_TX_EXPIRY);
         let expired = before - self.pending_is_locks.len();
         if expired > 0 {
             tracing::debug!("Pruned {} expired pending IS locks", expired);
@@ -477,9 +473,7 @@ impl<W: WalletInterface> MempoolManager<W> {
             // Non-mempool peer, remove its queue and redistribute txids
             if let Some(orphaned) = self.queued.remove(&peer) {
                 if !orphaned.is_empty() {
-                    if let Some(queue) =
-                        self.queued.values_mut().choose(&mut rand::thread_rng())
-                    {
+                    if let Some(queue) = self.queued.values_mut().choose(&mut rand::thread_rng()) {
                         queue.extend(orphaned);
                     }
                 }
@@ -600,9 +594,13 @@ mod tests {
 
         // FetchAll activation sends mempool then filterclear to the chosen peer
         let msg1 = rx.recv().await.unwrap();
-        assert!(matches!(msg1, NetworkRequest::SendMessageToPeer(NetworkMessage::MemPool, p) if p == peer));
+        assert!(
+            matches!(msg1, NetworkRequest::SendMessageToPeer(NetworkMessage::MemPool, p) if p == peer)
+        );
         let msg2 = rx.recv().await.unwrap();
-        assert!(matches!(msg2, NetworkRequest::SendMessageToPeer(NetworkMessage::FilterClear, p) if p == peer));
+        assert!(
+            matches!(msg2, NetworkRequest::SendMessageToPeer(NetworkMessage::FilterClear, p) if p == peer)
+        );
         assert_eq!(manager.mempool_peer, Some(peer));
     }
 
@@ -944,11 +942,7 @@ mod tests {
 
     fn create_bloom_manager_with_addresses(
         addresses: Vec<Address>,
-    ) -> (
-        MempoolManager<MockWallet>,
-        RequestSender,
-        mpsc::UnboundedReceiver<NetworkRequest>,
-    ) {
+    ) -> (MempoolManager<MockWallet>, RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
         let mut mock = MockWallet::new();
         mock.set_addresses(addresses);
         let wallet = Arc::new(RwLock::new(mock));
@@ -1276,9 +1270,7 @@ mod tests {
             .entry(test_socket_address(1))
             .or_default()
             .push_back(Txid::from_byte_array([2; 32]));
-        manager
-            .pending_is_locks
-            .insert(Txid::from_byte_array([3; 32]), Instant::now());
+        manager.pending_is_locks.insert(Txid::from_byte_array([3; 32]), Instant::now());
 
         manager.clear_pending();
 
@@ -1386,9 +1378,7 @@ mod tests {
 
         // A pending IS lock for a tx that hasn't arrived yet should survive pruning
         let pending_txid = Txid::from_byte_array([0xcc; 32]);
-        manager
-            .pending_is_locks
-            .insert(pending_txid, Instant::now());
+        manager.pending_is_locks.insert(pending_txid, Instant::now());
         manager.prune_expired().await;
         assert!(
             manager.pending_is_locks.contains_key(&pending_txid),
@@ -1412,14 +1402,8 @@ mod tests {
         // Add the tx with a timestamp far in the past so it expires
         {
             let mut state = manager.mempool_state.write().await;
-            let mut utx = UnconfirmedTransaction::new(
-                tx,
-                Amount::from_sat(0),
-                false,
-                false,
-                Vec::new(),
-                0,
-            );
+            let mut utx =
+                UnconfirmedTransaction::new(tx, Amount::from_sat(0), false, false, Vec::new(), 0);
             utx.first_seen = Instant::now() - MEMPOOL_TX_EXPIRY - Duration::from_secs(1);
             state.add_transaction(utx);
         }
@@ -1427,9 +1411,7 @@ mod tests {
         // Also store a pending IS lock for this txid and an unrelated one
         let unrelated_txid = Txid::from_byte_array([0xdd; 32]);
         manager.pending_is_locks.insert(txid, Instant::now());
-        manager
-            .pending_is_locks
-            .insert(unrelated_txid, Instant::now());
+        manager.pending_is_locks.insert(unrelated_txid, Instant::now());
 
         manager.prune_expired().await;
 
@@ -1457,9 +1439,7 @@ mod tests {
 
         // Insert a fresh pending IS lock
         let fresh_txid = Txid::from_byte_array([0xbb; 32]);
-        manager
-            .pending_is_locks
-            .insert(fresh_txid, Instant::now());
+        manager.pending_is_locks.insert(fresh_txid, Instant::now());
 
         manager.prune_expired().await;
 
