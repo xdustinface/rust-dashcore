@@ -136,7 +136,9 @@ impl<W: WalletInterface> MempoolManager<W> {
     /// Whether activation needs to be retried. Returns true if activation was
     /// attempted but no inventory response arrived within the timeout.
     pub(super) fn needs_activation_retry(&self) -> bool {
-        self.activated_at.is_some_and(|t| t.elapsed() >= ACTIVATION_TIMEOUT)
+        self.activated_at.is_some_and(|t| {
+            Instant::now().checked_duration_since(t).unwrap_or_default() >= ACTIVATION_TIMEOUT
+        })
     }
 
     /// Build and send a bloom filter to the mempool peer.
@@ -435,7 +437,9 @@ impl<W: WalletInterface> MempoolManager<W> {
 
         // Prune pending IS locks whose transaction never arrived
         let before = self.pending_is_locks.len();
-        self.pending_is_locks.retain(|_, inserted_at| inserted_at.elapsed() < MEMPOOL_TX_EXPIRY);
+        let now = Instant::now();
+        self.pending_is_locks
+            .retain(|_, inserted_at| now.checked_duration_since(*inserted_at).unwrap_or_default() < MEMPOOL_TX_EXPIRY);
         let expired = before - self.pending_is_locks.len();
         if expired > 0 {
             tracing::debug!("Pruned {} expired pending IS locks", expired);
@@ -497,7 +501,9 @@ impl<W: WalletInterface> MempoolManager<W> {
     pub(super) fn prune_pending_requests(&mut self) {
         let mut timed_out = Vec::new();
         self.pending_requests.retain(|txid, requested_at| {
-            if requested_at.elapsed() >= PENDING_REQUEST_TIMEOUT {
+            if Instant::now().checked_duration_since(*requested_at).unwrap_or_default()
+                >= PENDING_REQUEST_TIMEOUT
+            {
                 timed_out.push(*txid);
                 false
             } else {
@@ -718,8 +724,8 @@ mod tests {
         assert!(!manager.pending_requests.contains_key(&extra_txid));
     }
 
-    #[test]
-    fn test_prune_pending_requests_timeout() {
+    #[tokio::test(start_paused = true)]
+    async fn test_prune_pending_requests_timeout() {
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
         let mempool_state = Arc::new(RwLock::new(MempoolState::default()));
         let (tx, _rx) = mpsc::unbounded_channel::<NetworkRequest>();
@@ -728,13 +734,14 @@ mod tests {
         let mut manager =
             MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 1000);
 
-        let fresh_txid = Txid::from_byte_array([1; 32]);
         let stale_txid = Txid::from_byte_array([2; 32]);
+        manager.pending_requests.insert(stale_txid, Instant::now());
 
+        // Advance time past the timeout so stale_txid expires
+        tokio::time::advance(PENDING_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+
+        let fresh_txid = Txid::from_byte_array([1; 32]);
         manager.pending_requests.insert(fresh_txid, Instant::now());
-        manager
-            .pending_requests
-            .insert(stale_txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
 
         manager.prune_pending_requests();
 
@@ -1480,7 +1487,7 @@ mod tests {
         assert_eq!(manager.queued.values().map(|q| q.len()).sum::<usize>(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_activation_retry_on_timeout() {
         let (mut manager, requests, _rx) = create_test_manager();
         manager.activate(test_socket_address(1), &requests).await.unwrap();
@@ -1489,8 +1496,8 @@ mod tests {
         assert!(!manager.needs_activation_retry());
         assert!(manager.activated_at.is_some());
 
-        // Simulate timeout by backdating the activation timestamp
-        manager.activated_at = Some(Instant::now() - ACTIVATION_TIMEOUT);
+        // Simulate timeout by advancing time past the activation timeout
+        tokio::time::advance(ACTIVATION_TIMEOUT).await;
         assert!(manager.needs_activation_retry());
     }
 
@@ -1670,16 +1677,16 @@ mod tests {
         assert!(manager.queued.is_empty());
     }
 
-    #[test]
-    fn test_prune_pending_requeues_to_connected_peer() {
+    #[tokio::test(start_paused = true)]
+    async fn test_prune_pending_requeues_to_connected_peer() {
         let (mut manager, _requests, _rx) = create_test_manager();
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
 
         let txid = Txid::from_byte_array([1; 32]);
-        manager
-            .pending_requests
-            .insert(txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
+        manager.pending_requests.insert(txid, Instant::now());
+
+        tokio::time::advance(PENDING_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
 
         manager.prune_pending_requests();
 
@@ -1687,14 +1694,14 @@ mod tests {
         assert!(manager.queued[&peer].contains(&txid));
     }
 
-    #[test]
-    fn test_prune_pending_drops_when_no_peers() {
+    #[tokio::test(start_paused = true)]
+    async fn test_prune_pending_drops_when_no_peers() {
         let (mut manager, _requests, _rx) = create_test_manager();
 
         let txid = Txid::from_byte_array([1; 32]);
-        manager
-            .pending_requests
-            .insert(txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
+        manager.pending_requests.insert(txid, Instant::now());
+
+        tokio::time::advance(PENDING_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
 
         manager.prune_pending_requests();
 

@@ -267,7 +267,7 @@ impl UnconfirmedTransaction {
 
     /// Check if transaction has expired.
     pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.first_seen.elapsed() > timeout
+        Instant::now().checked_duration_since(self.first_seen).unwrap_or_default() > timeout
     }
 
     /// Get fee rate in satoshis per byte.
@@ -338,8 +338,9 @@ impl MempoolState {
         });
 
         // Also prune old recent sends
-        let cutoff = Instant::now() - timeout;
-        self.recent_sends.retain(|_, &mut timestamp| timestamp > cutoff);
+        let now = Instant::now();
+        self.recent_sends
+            .retain(|_, &mut timestamp| now.checked_duration_since(timestamp).unwrap_or_default() <= timeout);
 
         expired
     }
@@ -351,7 +352,11 @@ impl MempoolState {
 
     /// Check if a transaction was recently sent.
     pub fn is_recent_send(&self, txid: &Txid, window: Duration) -> bool {
-        self.recent_sends.get(txid).map(|&timestamp| timestamp.elapsed() < window).unwrap_or(false)
+        let now = Instant::now();
+        self.recent_sends
+            .get(txid)
+            .map(|&timestamp| now.checked_duration_since(timestamp).unwrap_or_default() < window)
+            .unwrap_or(false)
     }
 
     /// Get total pending balance (regular + InstantSend).
