@@ -1,6 +1,6 @@
 use crate::sync::SyncState;
 use std::fmt;
-use std::time::Instant;
+use tokio::time::Instant;
 
 /// Progress tracking for mempool transaction monitoring.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +97,7 @@ impl fmt::Display for MempoolProgress {
             self.relevant,
             self.tracked,
             self.removed,
-            self.last_activity.elapsed().as_secs()
+            Instant::now().checked_duration_since(self.last_activity).unwrap_or_default().as_secs()
         )
     }
 }
