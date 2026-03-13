@@ -20,7 +20,7 @@ use crate::client::config::MempoolStrategy;
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
 use crate::sync::mempool::MempoolProgress;
-use crate::sync::SyncEvent;
+use crate::sync::{SyncEvent, SyncState};
 use crate::types::{MempoolState, UnconfirmedTransaction};
 use key_wallet_manager::wallet_interface::WalletInterface;
 
@@ -205,6 +205,11 @@ impl<W: WalletInterface> MempoolManager<W> {
         peer: SocketAddr,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        // Ignore inventory announcements until sync is complete and we've activated
+        if self.progress.state() != SyncState::Synced {
+            return Ok(vec![]);
+        }
+
         // Inventory received, activation confirmed
         self.activated_at = None;
 
@@ -520,7 +525,9 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let manager = MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 1000);
+        let mut manager =
+            MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 1000);
+        manager.progress.set_state(SyncState::Synced);
 
         (manager, requests, rx)
     }
@@ -540,8 +547,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_activation_fetch_all() {
-        let (mut manager, requests, _rx) = create_test_manager();
+        let (mut manager, requests, mut rx) = create_test_manager();
         manager.activate(&requests).await.unwrap();
+
+        // FetchAll activation sends mempool then filterclear
+        let msg1 = rx.recv().await.unwrap();
+        assert!(matches!(msg1, NetworkRequest::SendMessage(NetworkMessage::MemPool)));
+        let msg2 = rx.recv().await.unwrap();
+        assert!(matches!(msg2, NetworkRequest::SendMessage(NetworkMessage::FilterClear)));
     }
 
     #[tokio::test]
@@ -550,6 +563,26 @@ mod tests {
         manager.activate(&requests).await.unwrap();
         // No addresses in mock wallet, so filter should not be loaded
         assert!(!manager.filter_loaded);
+    }
+
+    #[tokio::test]
+    async fn test_handle_inv_ignored_before_sync() {
+        let wallet = Arc::new(RwLock::new(MockWallet::new()));
+        let mempool_state = Arc::new(RwLock::new(MempoolState::default()));
+        let (tx, _rx) = mpsc::unbounded_channel::<NetworkRequest>();
+        let requests = RequestSender::new(tx);
+
+        // Manager starts in WaitForEvents, not Synced
+        let mut manager =
+            MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 1000);
+
+        let txid = Txid::from_byte_array([1u8; 32]);
+        let inv = vec![Inventory::Transaction(txid)];
+        manager.handle_inv(&inv, test_socket_address(1), &requests).unwrap();
+
+        // Should be ignored — nothing queued or pending
+        assert!(manager.pending_requests.is_empty());
+        assert!(manager.queued.is_empty());
     }
 
     #[tokio::test]
@@ -622,6 +655,7 @@ mod tests {
         let requests = RequestSender::new(tx);
 
         let mut manager = MempoolManager::new(wallet, mempool_state, MempoolStrategy::FetchAll, 2);
+        manager.progress.set_state(SyncState::Synced);
 
         // Fill pending requests to capacity
         let inv1: Vec<Inventory> =
