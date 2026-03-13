@@ -282,6 +282,15 @@ extern "C" fn on_manager_error(
     tracker.errors.lock().unwrap_or_else(|e| e.into_inner()).push(error_str);
 }
 
+extern "C" fn on_mempool_activated(peer: *const c_char, user_data: *mut c_void) {
+    let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
+        return;
+    };
+    let peer_str = unsafe { cstr_or_unknown(peer) };
+    tracing::info!("on_mempool_activated: peer={}", peer_str);
+    let _ = tracker;
+}
+
 extern "C" fn on_sync_complete(header_tip: u32, cycle: u32, user_data: *mut c_void) {
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
@@ -412,6 +421,7 @@ pub(super) fn create_sync_callbacks(tracker: &Arc<CallbackTracker>) -> FFISyncEv
         on_chainlock_received: Some(on_chainlock_received),
         on_instantlock_received: Some(on_instantlock_received),
         on_manager_error: Some(on_manager_error),
+        on_mempool_activated: Some(on_mempool_activated),
         on_sync_complete: Some(on_sync_complete),
         user_data: Arc::as_ptr(tracker) as *mut c_void,
     }
