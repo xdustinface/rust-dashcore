@@ -147,22 +147,23 @@ impl RequestSender {
         ))
     }
 
-    /// Send a filterload message to the peer.
+    /// Send a filterload message to a specific peer.
     pub fn send_filter_load(
         &self,
         filter_load: FilterLoad,
+        peer: SocketAddr,
     ) -> NetworkResult<()> {
-        self.send_message(NetworkMessage::FilterLoad(filter_load))
+        self.send_message_to_peer(NetworkMessage::FilterLoad(filter_load), peer)
     }
 
-    /// Send a filterclear message to the peer.
-    pub fn send_filter_clear(&self) -> NetworkResult<()> {
-        self.send_message(NetworkMessage::FilterClear)
+    /// Send a filterclear message to a specific peer.
+    pub fn send_filter_clear(&self, peer: SocketAddr) -> NetworkResult<()> {
+        self.send_message_to_peer(NetworkMessage::FilterClear, peer)
     }
 
-    /// Send a mempool message to request inventory of mempool transactions.
-    pub fn request_mempool(&self) -> NetworkResult<()> {
-        self.send_message(NetworkMessage::MemPool)
+    /// Send a mempool message to request inventory from a specific peer.
+    pub fn request_mempool(&self, peer: SocketAddr) -> NetworkResult<()> {
+        self.send_message_to_peer(NetworkMessage::MemPool, peer)
     }
 }
 
