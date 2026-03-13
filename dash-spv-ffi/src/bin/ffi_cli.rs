@@ -129,6 +129,11 @@ extern "C" fn on_manager_error(
     println!("[Sync] Manager error: {:?} - {}", manager_id, error_str);
 }
 
+extern "C" fn on_mempool_activated(peer: *const c_char, _user_data: *mut c_void) {
+    let peer_str = ffi_string_to_rust(peer);
+    println!("[Sync] Mempool activated on peer: {}", peer_str);
+}
+
 extern "C" fn on_sync_complete(header_tip: u32, cycle: u32, _user_data: *mut c_void) {
     println!("[Sync] Sync complete at height: {} (cycle {})", header_tip, cycle);
 }
@@ -435,6 +440,7 @@ fn main() {
             on_chainlock_received: Some(on_chainlock_received),
             on_instantlock_received: Some(on_instantlock_received),
             on_manager_error: Some(on_manager_error),
+            on_mempool_activated: Some(on_mempool_activated),
             on_sync_complete: Some(on_sync_complete),
             user_data: ptr::null_mut(),
         };

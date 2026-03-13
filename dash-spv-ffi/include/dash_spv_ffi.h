@@ -311,6 +311,14 @@ typedef void (*OnManagerErrorCallback)(enum FFIManagerId manager_id,
                                        void *user_data);
 
 /**
+ * Callback for SyncEvent::MempoolActivated
+ *
+ * The `peer` string pointer is borrowed and only valid for the duration
+ * of the callback. Callers must copy the string if they need to retain it.
+ */
+typedef void (*OnMempoolActivatedCallback)(const char *peer, void *user_data);
+
+/**
  * Callback for SyncEvent::SyncComplete
  */
 typedef void (*OnSyncCompleteCallback)(uint32_t header_tip, uint32_t cycle, void *user_data);
@@ -338,6 +346,7 @@ typedef struct FFISyncEventCallbacks {
   OnChainLockReceivedCallback on_chainlock_received;
   OnInstantLockReceivedCallback on_instantlock_received;
   OnManagerErrorCallback on_manager_error;
+  OnMempoolActivatedCallback on_mempool_activated;
   OnSyncCompleteCallback on_sync_complete;
   void *user_data;
 } FFISyncEventCallbacks;

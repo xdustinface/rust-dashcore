@@ -213,6 +213,13 @@ pub type OnInstantLockReceivedCallback = Option<
 pub type OnManagerErrorCallback =
     Option<extern "C" fn(manager_id: FFIManagerId, error: *const c_char, user_data: *mut c_void)>;
 
+/// Callback for SyncEvent::MempoolActivated
+///
+/// The `peer` string pointer is borrowed and only valid for the duration
+/// of the callback. Callers must copy the string if they need to retain it.
+pub type OnMempoolActivatedCallback =
+    Option<extern "C" fn(peer: *const c_char, user_data: *mut c_void)>;
+
 /// Callback for SyncEvent::SyncComplete
 pub type OnSyncCompleteCallback =
     Option<extern "C" fn(header_tip: u32, cycle: u32, user_data: *mut c_void)>;
@@ -240,6 +247,7 @@ pub struct FFISyncEventCallbacks {
     pub on_chainlock_received: OnChainLockReceivedCallback,
     pub on_instantlock_received: OnInstantLockReceivedCallback,
     pub on_manager_error: OnManagerErrorCallback,
+    pub on_mempool_activated: OnMempoolActivatedCallback,
     pub on_sync_complete: OnSyncCompleteCallback,
     pub user_data: *mut c_void,
 }
@@ -272,6 +280,7 @@ impl Default for FFISyncEventCallbacks {
             on_chainlock_received: None,
             on_instantlock_received: None,
             on_manager_error: None,
+            on_mempool_activated: None,
             on_sync_complete: None,
             user_data: std::ptr::null_mut(),
         }
@@ -416,6 +425,14 @@ impl FFISyncEventCallbacks {
                 if let Some(cb) = self.on_manager_error {
                     let c_error = CString::new(error.as_str()).unwrap_or_default();
                     cb((*manager).into(), c_error.as_ptr(), self.user_data);
+                }
+            }
+            SyncEvent::MempoolActivated {
+                peer,
+            } => {
+                if let Some(cb) = self.on_mempool_activated {
+                    let c_peer = CString::new(peer.to_string()).unwrap_or_default();
+                    cb(c_peer.as_ptr(), self.user_data);
                 }
             }
             SyncEvent::SyncComplete {
