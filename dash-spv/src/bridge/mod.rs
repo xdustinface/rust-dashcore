@@ -531,14 +531,18 @@ impl SpvClient {
         matches!(self.inner.sync_progress().await.state(), SyncState::Syncing)
     }
 
-    /// Returns the wallet balance.
+    /// Returns the wallet balance aggregated across all managed wallets.
     ///
-    /// TODO: delegate to `self.inner.wallet()` once wallet integration is complete.
+    /// Reads the wallet state under a shared lock and maps the internal
+    /// `WalletCoreBalance` breakdown to the UniFFI `WalletBalance` record.
+    /// All amounts are in duffs.
     pub async fn get_balance(&self) -> WalletBalance {
+        let wallet = self.inner.wallet().read().await;
+        let balance = wallet.get_aggregated_balance();
         WalletBalance {
-            confirmed: 0,
-            unconfirmed: 0,
-            immature: 0,
+            confirmed: balance.spendable(),
+            unconfirmed: balance.unconfirmed(),
+            immature: balance.immature(),
         }
     }
 
@@ -1093,6 +1097,44 @@ mod tests {
         };
         assert_eq!(
             balance,
+            WalletBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+                immature: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_wallet_balance_mapping_from_wallet_core_balance() {
+        use key_wallet::WalletCoreBalance;
+        // Verify: confirmed=spendable, unconfirmed=unconfirmed, immature=immature.
+        // The `locked` field in WalletCoreBalance is intentionally excluded from
+        // WalletBalance (locked funds are not part of the spendable/pending/immature view).
+        let core = WalletCoreBalance::new(1_000_000, 250_000, 50_000, 999);
+        let mapped = WalletBalance {
+            confirmed: core.spendable(),
+            unconfirmed: core.unconfirmed(),
+            immature: core.immature(),
+        };
+        assert_eq!(mapped.confirmed, 1_000_000);
+        assert_eq!(mapped.unconfirmed, 250_000);
+        assert_eq!(mapped.immature, 50_000);
+    }
+
+    #[test]
+    fn test_get_aggregated_balance_empty_manager() {
+        use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
+        use key_wallet_manager::wallet_manager::WalletManager;
+        let manager = WalletManager::<ManagedWalletInfo>::new(dashcore::Network::Testnet);
+        let balance = manager.get_aggregated_balance();
+        let wallet_balance = WalletBalance {
+            confirmed: balance.spendable(),
+            unconfirmed: balance.unconfirmed(),
+            immature: balance.immature(),
+        };
+        assert_eq!(
+            wallet_balance,
             WalletBalance {
                 confirmed: 0,
                 unconfirmed: 0,

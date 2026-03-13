@@ -984,6 +984,18 @@ impl<T: WalletInfoInterface> WalletManager<T> {
         self.wallet_infos.values().map(|info| info.balance().total()).sum()
     }
 
+    /// Get aggregated balance breakdown across all wallets.
+    ///
+    /// Returns the sum of confirmed (spendable), unconfirmed, and immature
+    /// balances across every managed wallet.
+    pub fn get_aggregated_balance(&self) -> WalletCoreBalance {
+        let mut total = WalletCoreBalance::default();
+        for info in self.wallet_infos.values() {
+            total += info.balance();
+        }
+        total
+    }
+
     /// Get balance for a specific wallet
     pub fn get_wallet_balance(
         &self,

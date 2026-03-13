@@ -705,3 +705,32 @@ async fn test_check_transaction_populates_totals() {
         "involved_addresses should contain the target address"
     );
 }
+
+// ============ get_aggregated_balance tests ============
+
+#[test]
+fn test_get_aggregated_balance_empty_manager() {
+    let manager = WalletManager::<ManagedWalletInfo>::new(Network::Testnet);
+    let balance = manager.get_aggregated_balance();
+    assert_eq!(balance.spendable(), 0);
+    assert_eq!(balance.unconfirmed(), 0);
+    assert_eq!(balance.immature(), 0);
+    assert_eq!(balance.total(), 0);
+}
+
+#[test]
+fn test_get_aggregated_balance_fresh_wallet_is_zero() {
+    let (manager, _wallet_id, _addr) = setup_manager_with_wallet();
+    let balance = manager.get_aggregated_balance();
+    assert_eq!(balance.spendable(), 0);
+    assert_eq!(balance.unconfirmed(), 0);
+    assert_eq!(balance.immature(), 0);
+    assert_eq!(balance.total(), 0);
+}
+
+#[test]
+fn test_get_aggregated_balance_matches_get_total_balance() {
+    let (manager, _wallet_id, _addr) = setup_manager_with_wallet();
+    let aggregated = manager.get_aggregated_balance();
+    assert_eq!(aggregated.total(), manager.get_total_balance());
+}
