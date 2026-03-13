@@ -31,7 +31,7 @@ use dashcore::network::message_sml::GetMnListDiff;
 use dashcore::BlockHash;
 use dashcore_hashes::Hash;
 pub use handshake::{HandshakeManager, HandshakeState};
-pub use manager::PeerNetworkManager;
+pub use manager::{PeerNetworkManager, PeerSnapshot};
 pub use message_dispatcher::{Message, MessageDispatcher};
 pub use message_type::MessageType;
 pub use peer::Peer;

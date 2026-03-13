@@ -27,6 +27,23 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         self.network.lock().await.peer_count()
     }
 
+    /// Return a snapshot of all currently connected peers.
+    ///
+    /// Delegates to [`crate::network::manager::PeerNetworkManager::get_peers_snapshot`]
+    /// via a downcast.  Returns an empty `Vec` when the underlying network
+    /// manager is not a `PeerNetworkManager`.
+    pub async fn peers_snapshot(&self) -> Vec<crate::network::manager::PeerSnapshot> {
+        let network_guard = self.network.lock().await;
+        if let Some(network) = network_guard
+            .as_any()
+            .downcast_ref::<crate::network::manager::PeerNetworkManager>()
+        {
+            network.get_peers_snapshot().await
+        } else {
+            vec![]
+        }
+    }
+
     /// Disconnect a specific peer.
     pub async fn disconnect_peer(&self, addr: &std::net::SocketAddr, reason: &str) -> Result<()> {
         // Cast network manager to PeerNetworkManager to access disconnect_peer
