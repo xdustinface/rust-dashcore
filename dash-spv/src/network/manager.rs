@@ -230,7 +230,7 @@ impl PeerNetworkManager {
         let addrv2_handler = self.addrv2_handler.clone();
         let shutdown_token = self.shutdown_token.clone();
         let reputation_manager = self.reputation_manager.clone();
-        let relay = self.mempool_strategy != MempoolStrategy::BloomFilter;
+        let relay = false;
         let user_agent = self.user_agent.clone();
         let connected_peer_count = self.connected_peer_count.clone();
         let headers2_disabled = self.headers2_disabled.clone();
