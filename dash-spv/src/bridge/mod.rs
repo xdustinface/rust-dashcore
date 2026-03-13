@@ -630,7 +630,14 @@ mod tests {
             unconfirmed: 0,
             immature: 0,
         };
-        assert_eq!(balance, WalletBalance { confirmed: 0, unconfirmed: 0, immature: 0 });
+        assert_eq!(
+            balance,
+            WalletBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+                immature: 0
+            }
+        );
     }
 
     // ---- TransactionInfo record tests ----
@@ -682,7 +689,11 @@ mod tests {
         let balance = client.get_balance().await;
         assert_eq!(
             balance,
-            WalletBalance { confirmed: 0, unconfirmed: 0, immature: 0 },
+            WalletBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+                immature: 0
+            },
             "stub get_balance should return all-zero balance"
         );
     }
