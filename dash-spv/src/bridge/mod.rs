@@ -183,6 +183,36 @@ pub enum NetworkEvent {
     },
 }
 
+// ============ Network info types ============
+
+/// UniFFI-compatible record describing a single connected peer.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PeerInfo {
+    /// Socket address of the peer, e.g. `"192.0.2.1:9999"`.
+    pub address: String,
+    /// User-agent string reported by the peer.
+    pub user_agent: String,
+    /// Best block height reported by the peer.
+    pub best_height: u32,
+    /// Unix timestamp (seconds) of when the peer connected.
+    pub connected_since: u64,
+    /// Services bitmask advertised by the peer.
+    pub services: u64,
+}
+
+/// UniFFI-compatible record describing the current network state.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct NetworkInfo {
+    /// Network name (e.g. `"mainnet"`, `"testnet"`, `"regtest"`).
+    pub network: String,
+    /// Number of currently connected peers.
+    pub peer_count: u32,
+    /// Details for each connected peer.
+    ///
+    /// TODO: populate with real peer data from `PeerNetworkManager`.
+    pub peers: Vec<PeerInfo>,
+}
+
 /// Callback interface for receiving SPV client events on the foreign side.
 ///
 /// Implement this trait in React Native / Swift and register it via
@@ -378,6 +408,38 @@ impl From<SpvError> for SpvClientError {
     }
 }
 
+// ============ Wallet record types ============
+
+/// UniFFI-compatible wallet balance record.
+///
+/// All amounts are in duffs (1 DASH = 100,000,000 duffs).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct WalletBalance {
+    /// Confirmed spendable balance, in duffs.
+    pub confirmed: u64,
+    /// Unconfirmed (pending) balance, in duffs.
+    pub unconfirmed: u64,
+    /// Immature coinbase balance not yet spendable, in duffs.
+    pub immature: u64,
+}
+
+/// UniFFI-compatible transaction summary record.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct TransactionInfo {
+    /// Transaction ID as a hex string.
+    pub txid: String,
+    /// Net amount in duffs — positive for incoming, negative for outgoing.
+    pub amount: i64,
+    /// Fee paid in duffs.
+    pub fee: u64,
+    /// Number of confirmations (0 = unconfirmed).
+    pub confirmations: u32,
+    /// Unix timestamp of when the transaction was first seen.
+    pub timestamp: u64,
+    /// `true` if the transaction added funds to this wallet.
+    pub is_incoming: bool,
+}
+
 // ============ Concrete type alias ============
 
 type ConcreteClient =
@@ -467,6 +529,101 @@ impl SpvClient {
     /// Returns `true` when the client is actively downloading and processing blocks.
     pub async fn is_syncing(&self) -> bool {
         matches!(self.inner.sync_progress().await.state(), SyncState::Syncing)
+    }
+
+    /// Returns the wallet balance.
+    ///
+    /// TODO: delegate to `self.inner.wallet()` once wallet integration is complete.
+    pub async fn get_balance(&self) -> WalletBalance {
+        WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+            immature: 0,
+        }
+    }
+
+    /// Returns network and peer information.
+    ///
+    /// Currently returns a stub with the network name, peer count, and an empty
+    /// peer list.  Peer details will be wired up once `PeerNetworkManager`
+    /// exposes per-peer metadata.
+    ///
+    /// TODO: populate `peers` with real data from `PeerNetworkManager`.
+    pub async fn get_network_info(&self) -> NetworkInfo {
+        let network = self.inner.network().await;
+        let peer_count = self.inner.peer_count().await as u32;
+        NetworkInfo {
+            network: network.to_string(),
+            peer_count,
+            peers: vec![], // TODO: populate with real peer data
+        }
+    }
+}
+
+// ============ Masternode and Governance types ============
+
+/// UniFFI-compatible record representing a single masternode entry.
+///
+/// Fields are mapped from `MasternodeListEntry` internals. All hashes and
+/// addresses are represented as `String` values for cross-language convenience.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct MasternodeInfo {
+    /// ProRegTx hash that uniquely identifies this masternode.
+    pub pro_tx_hash: String,
+    /// Service address of the masternode (IP:port).
+    pub address: String,
+    /// Status of the masternode (e.g. "Enabled", "PoSeBanned").
+    pub status: String,
+    /// Proof-of-Service penalty score.
+    pub pose_penalty: u32,
+    /// Height at which this masternode was last paid.
+    pub last_paid_height: u32,
+    /// Block height at which the masternode was registered.
+    pub registered_height: u32,
+}
+
+/// UniFFI-compatible record representing a governance proposal.
+///
+/// These fields are stubs — governance sync is not yet implemented. The type
+/// is exported so foreign-language bindings can be generated in advance.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct GovernanceProposal {
+    /// Hash of the governance proposal object.
+    pub hash: String,
+    /// Human-readable name of the proposal.
+    pub name: String,
+    /// URL linking to the proposal details.
+    pub url: String,
+    /// Dash address that will receive the payment if the proposal passes.
+    pub payment_address: String,
+    /// Requested payment amount in duffs.
+    pub payment_amount: u64,
+    /// Number of "yes" votes cast for this proposal.
+    pub yes_count: u32,
+    /// Number of "no" votes cast against this proposal.
+    pub no_count: u32,
+    /// Number of "abstain" votes cast for this proposal.
+    pub abstain_count: u32,
+}
+
+#[uniffi::export]
+impl SpvClient {
+    /// Returns the number of masternodes in the current masternode list.
+    ///
+    /// TODO: wire up to `MasternodeListEngine` once the engine is accessible
+    /// from `DashSpvClient`.
+    pub async fn get_masternode_count(&self) -> u32 {
+        // TODO: return self.inner.masternode_list_engine()?.read().await.count()
+        0
+    }
+
+    /// Returns all masternodes from the current masternode list.
+    ///
+    /// TODO: wire up to `MasternodeListEngine` once the engine is accessible
+    /// from `DashSpvClient`.
+    pub async fn get_masternodes(&self) -> Vec<MasternodeInfo> {
+        // TODO: map MasternodeListEntry fields to MasternodeInfo
+        vec![]
     }
 }
 
@@ -869,5 +1026,239 @@ mod tests {
             "overall_percentage out of range: {}",
             info.overall_percentage
         );
+    }
+
+    // ---- WalletBalance record tests ----
+
+    #[test]
+    fn test_wallet_balance_fields() {
+        let balance = WalletBalance {
+            confirmed: 100_000_000,
+            unconfirmed: 50_000,
+            immature: 0,
+        };
+        assert_eq!(balance.confirmed, 100_000_000);
+        assert_eq!(balance.unconfirmed, 50_000);
+        assert_eq!(balance.immature, 0);
+    }
+
+    #[test]
+    fn test_wallet_balance_zero() {
+        let balance = WalletBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+            immature: 0,
+        };
+        assert_eq!(
+            balance,
+            WalletBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+                immature: 0
+            }
+        );
+    }
+
+    // ---- TransactionInfo record tests ----
+
+    #[test]
+    fn test_transaction_info_incoming() {
+        let tx = TransactionInfo {
+            txid: "abcd1234".to_string(),
+            amount: 500_000_000,
+            fee: 1_000,
+            confirmations: 6,
+            timestamp: 1_700_000_000,
+            is_incoming: true,
+        };
+        assert_eq!(tx.txid, "abcd1234");
+        assert_eq!(tx.amount, 500_000_000);
+        assert_eq!(tx.fee, 1_000);
+        assert_eq!(tx.confirmations, 6);
+        assert_eq!(tx.timestamp, 1_700_000_000);
+        assert!(tx.is_incoming);
+    }
+
+    #[test]
+    fn test_transaction_info_outgoing() {
+        let tx = TransactionInfo {
+            txid: "deadbeef".to_string(),
+            amount: -200_000_000,
+            fee: 2_000,
+            confirmations: 0,
+            timestamp: 1_700_001_000,
+            is_incoming: false,
+        };
+        assert!(tx.amount < 0);
+        assert!(!tx.is_incoming);
+        assert_eq!(tx.confirmations, 0);
+    }
+
+    // ---- SpvClient::get_balance stub test ----
+
+    #[tokio::test]
+    async fn test_get_balance_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let balance = client.get_balance().await;
+        assert_eq!(
+            balance,
+            WalletBalance {
+                confirmed: 0,
+                unconfirmed: 0,
+                immature: 0
+            },
+            "stub get_balance should return all-zero balance"
+        );
+    }
+
+    // ---- PeerInfo / NetworkInfo record tests ----
+
+    #[test]
+    fn test_peer_info_record() {
+        let peer = PeerInfo {
+            address: "192.0.2.1:9999".to_string(),
+            user_agent: "/DashCore:0.18.0/".to_string(),
+            best_height: 1234,
+            connected_since: 1_700_000_000,
+            services: 0x40d,
+        };
+        assert_eq!(peer.address, "192.0.2.1:9999");
+        assert_eq!(peer.user_agent, "/DashCore:0.18.0/");
+        assert_eq!(peer.best_height, 1234);
+        assert_eq!(peer.connected_since, 1_700_000_000);
+        assert_eq!(peer.services, 0x40d);
+    }
+
+    #[test]
+    fn test_network_info_record_empty_peers() {
+        let info = NetworkInfo {
+            network: "mainnet".to_string(),
+            peer_count: 0,
+            peers: vec![],
+        };
+        assert_eq!(info.network, "mainnet");
+        assert_eq!(info.peer_count, 0);
+        assert!(info.peers.is_empty());
+    }
+
+    #[test]
+    fn test_network_info_record_with_peers() {
+        let peers = vec![
+            PeerInfo {
+                address: "10.0.0.1:9999".to_string(),
+                user_agent: "/DashCore:0.19.0/".to_string(),
+                best_height: 500,
+                connected_since: 1_600_000_000,
+                services: 1,
+            },
+            PeerInfo {
+                address: "10.0.0.2:9999".to_string(),
+                user_agent: "/DashCore:0.20.0/".to_string(),
+                best_height: 501,
+                connected_since: 1_600_000_001,
+                services: 5,
+            },
+        ];
+        let info = NetworkInfo {
+            network: "testnet".to_string(),
+            peer_count: 2,
+            peers: peers.clone(),
+        };
+        assert_eq!(info.network, "testnet");
+        assert_eq!(info.peer_count, 2);
+        assert_eq!(info.peers.len(), 2);
+        assert_eq!(info.peers[0].address, "10.0.0.1:9999");
+        assert_eq!(info.peers[1].best_height, 501);
+    }
+
+    /// Verify that `get_network_info` returns a stub with the correct network
+    /// name and zero peers before the client is started.
+    #[tokio::test]
+    async fn test_get_network_info_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let info = client.get_network_info().await;
+
+        assert_eq!(info.network, "regtest", "network name should be 'regtest'");
+        assert_eq!(info.peer_count, 0, "peer count should be 0 before start");
+        assert!(info.peers.is_empty(), "peers should be empty in stub implementation");
+    }
+
+    // ---- MasternodeInfo / GovernanceProposal record tests ----
+
+    #[test]
+    fn test_masternode_info_fields() {
+        let info = MasternodeInfo {
+            pro_tx_hash: "abcd1234".to_string(),
+            address: "1.2.3.4:9999".to_string(),
+            status: "Enabled".to_string(),
+            pose_penalty: 0,
+            last_paid_height: 500,
+            registered_height: 100,
+        };
+        assert_eq!(info.pro_tx_hash, "abcd1234");
+        assert_eq!(info.address, "1.2.3.4:9999");
+        assert_eq!(info.status, "Enabled");
+        assert_eq!(info.pose_penalty, 0);
+        assert_eq!(info.last_paid_height, 500);
+        assert_eq!(info.registered_height, 100);
+    }
+
+    #[test]
+    fn test_governance_proposal_fields() {
+        let proposal = GovernanceProposal {
+            hash: "deadbeef".to_string(),
+            name: "Test Proposal".to_string(),
+            url: "https://example.com".to_string(),
+            payment_address: "XtestAddr".to_string(),
+            payment_amount: 100_000_000,
+            yes_count: 10,
+            no_count: 2,
+            abstain_count: 1,
+        };
+        assert_eq!(proposal.hash, "deadbeef");
+        assert_eq!(proposal.name, "Test Proposal");
+        assert_eq!(proposal.url, "https://example.com");
+        assert_eq!(proposal.payment_address, "XtestAddr");
+        assert_eq!(proposal.payment_amount, 100_000_000);
+        assert_eq!(proposal.yes_count, 10);
+        assert_eq!(proposal.no_count, 2);
+        assert_eq!(proposal.abstain_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_masternode_count_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert_eq!(client.get_masternode_count().await, 0, "stub should return 0");
+    }
+
+    #[tokio::test]
+    async fn test_get_masternodes_stub() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let masternodes = client.get_masternodes().await;
+        assert!(masternodes.is_empty(), "stub should return empty vec");
     }
 }
