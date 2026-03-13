@@ -9,6 +9,12 @@
 
 use std::sync::Arc;
 
+uniffi::custom_type!(dashcore::Network, String, {
+    remote,
+    lower: |n| n.to_string(),
+    try_lift: |s| s.parse().map_err(Into::into),
+});
+
 /// A simple sync function that returns a greeting string.
 #[uniffi::export]
 pub fn hello() -> String {
