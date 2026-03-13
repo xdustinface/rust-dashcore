@@ -125,7 +125,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // For now, create empty filter until wallet integration is complete
         let filter = Arc::new(MempoolFilter::new(
             config.mempool_strategy,
-            config.max_mempool_transactions,
+            config.max_mempool_transactions as usize,
             self.mempool_state.clone(),
             HashSet::new(), // Will be populated from wallet's monitored addresses
             config.network,

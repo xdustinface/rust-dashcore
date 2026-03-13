@@ -151,7 +151,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             if config.enable_mempool_tracking {
                 let filter = Arc::new(MempoolFilter::new(
                     config.mempool_strategy,
-                    config.max_mempool_transactions,
+                    config.max_mempool_transactions as usize,
                     client.mempool_state.clone(),
                     HashSet::new(), // TODO: populate from wallet's monitored addresses
                     config.network,
