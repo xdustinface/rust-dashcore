@@ -803,10 +803,7 @@ impl SpvClient {
     /// Returns [`SpvClientError::Network`] when:
     /// * No peers are connected.
     /// * All peers reject or fail to receive the message.
-    pub async fn send_transaction(
-        &self,
-        raw_tx_hex: String,
-    ) -> Result<SendResult, SpvClientError> {
+    pub async fn send_transaction(&self, raw_tx_hex: String) -> Result<SendResult, SpvClientError> {
         use dashcore::consensus::Decodable;
         use hex::FromHex;
 
