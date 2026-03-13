@@ -50,11 +50,11 @@ mod tests {
     use crate::storage::DiskStorageManager;
     use crate::{test_utils::MockNetworkManager, types::UnconfirmedTransaction};
     use dashcore::sml::masternode_list::MasternodeList;
-    use dashcore::sml::masternode_list_entry::{
-        EntryMasternodeType, MasternodeListEntry,
-        qualified_masternode_list_entry::QualifiedMasternodeListEntry,
-    };
     use dashcore::sml::masternode_list_engine::MasternodeListEngine;
+    use dashcore::sml::masternode_list_entry::{
+        qualified_masternode_list_entry::QualifiedMasternodeListEntry, EntryMasternodeType,
+        MasternodeListEntry,
+    };
     use dashcore::{Address, Amount, BlockHash, ProTxHash, Transaction, TxOut};
     use dashcore_hashes::Hash;
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
@@ -243,10 +243,7 @@ mod tests {
             .await
             .expect("client construction must succeed");
 
-        let engine_arc = client
-            .masternode_engine()
-            .await
-            .expect("engine should be Some");
+        let engine_arc = client.masternode_engine().await.expect("engine should be Some");
 
         // Build a minimal MasternodeListEntry for testing.
         let pro_reg_tx_hash = ProTxHash::all_zeros();
@@ -273,19 +270,13 @@ mod tests {
         }
 
         // Now read back via the accessor.
-        let engine_arc2 = client
-            .masternode_engine()
-            .await
-            .expect("engine should still be Some");
+        let engine_arc2 = client.masternode_engine().await.expect("engine should still be Some");
         let engine = engine_arc2.read().await;
         let latest = engine.latest_masternode_list().expect("list should be present");
 
         assert_eq!(latest.masternodes.len(), 1, "should have 1 masternode");
         let mn = latest.masternodes.values().next().unwrap();
         assert!(mn.masternode_list_entry.is_valid, "masternode should be valid (Enabled)");
-        assert_eq!(
-            mn.masternode_list_entry.service_address.to_string(),
-            "1.2.3.4:9999"
-        );
+        assert_eq!(mn.masternode_list_entry.service_address.to_string(), "1.2.3.4:9999");
     }
 }

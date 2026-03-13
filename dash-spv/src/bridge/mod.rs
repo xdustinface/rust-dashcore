@@ -618,10 +618,7 @@ impl SpvClient {
             return 0;
         };
         let guard = engine.read().await;
-        guard
-            .latest_masternode_list()
-            .map(|list| list.masternodes.len() as u32)
-            .unwrap_or(0)
+        guard.latest_masternode_list().map(|list| list.masternodes.len() as u32).unwrap_or(0)
     }
 
     /// Returns all masternodes from the current masternode list.
@@ -1292,11 +1289,7 @@ mod tests {
             .with_storage_path(temp_dir.path());
 
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
-        assert_eq!(
-            client.get_masternode_count().await,
-            0,
-            "should return 0 when engine is None"
-        );
+        assert_eq!(client.get_masternode_count().await, 0, "should return 0 when engine is None");
     }
 
     /// `get_masternodes` returns an empty vec when masternodes are disabled (no engine).
@@ -1321,8 +1314,7 @@ mod tests {
     async fn test_get_masternode_count_empty_engine() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         // Default regtest config has enable_masternodes = true
-        let config =
-            ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
 
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
         assert_eq!(
@@ -1337,8 +1329,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_masternodes_empty_engine() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config =
-            ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
 
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
         assert!(
