@@ -1,8 +1,8 @@
 //! Full SpvClient UniFFI facade.
 //!
 //! Exposes:
-//! - `SpvConfig` — UniFFI record wrapping [`ClientConfig`] with per-network defaults
-//! - `SpvClient` — UniFFI object wrapping the monomorphised [`DashSpvClient`]
+//! - `SpvConfig` — UniFFI record wrapping `ClientConfig` with per-network defaults
+//! - `SpvClient` — UniFFI object wrapping the monomorphised `DashSpvClient`
 //! - Lifecycle methods: `start`, `stop`, `shutdown`
 //! - State queries: `is_running`, `tip_hash`, `tip_height`, `peer_count`
 //! - Legacy shims: `hello`, `get_version`, `start_mock_sync`, `SpvEventListener`
