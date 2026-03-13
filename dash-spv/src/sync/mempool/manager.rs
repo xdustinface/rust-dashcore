@@ -8,7 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use dashcore::network::message_blockdata::Inventory;
 use dashcore::{Amount, Transaction, Txid};
@@ -842,7 +843,7 @@ mod tests {
         assert_eq!(manager.pending_requests.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_prune_expired() {
         let (mut manager, _requests, _rx) = create_test_manager();
 
@@ -1372,7 +1373,7 @@ mod tests {
         assert!(!state.transactions.contains_key(&txid));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_prune_expired_preserves_unrelated_is_locks() {
         let (mut manager, _requests, _rx) = create_test_manager();
 
@@ -1386,7 +1387,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_prune_expired_removes_is_lock_for_expired_tx() {
         let (mut manager, _requests, _rx) = create_test_manager();
 
@@ -1399,16 +1400,18 @@ mod tests {
         };
         let txid = tx.txid();
 
-        // Add the tx with a timestamp far in the past so it expires
+        // Add the tx at T=0
         {
             let mut state = manager.mempool_state.write().await;
-            let mut utx =
+            let utx =
                 UnconfirmedTransaction::new(tx, Amount::from_sat(0), false, false, Vec::new(), 0);
-            utx.first_seen = Instant::now() - MEMPOOL_TX_EXPIRY - Duration::from_secs(1);
             state.add_transaction(utx);
         }
 
-        // Also store a pending IS lock for this txid and an unrelated one
+        // Advance time past the expiry threshold so the tx is now considered expired
+        tokio::time::advance(MEMPOOL_TX_EXPIRY + Duration::from_secs(1)).await;
+
+        // Insert IS locks after the time advance so they are fresh at the new "now"
         let unrelated_txid = Txid::from_byte_array([0xdd; 32]);
         manager.pending_is_locks.insert(txid, Instant::now());
         manager.pending_is_locks.insert(unrelated_txid, Instant::now());
@@ -1427,17 +1430,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_prune_expired_removes_stale_pending_is_locks() {
         let (mut manager, _requests, _rx) = create_test_manager();
 
-        // Insert a pending IS lock that is older than the expiry threshold
+        // Insert a pending IS lock at T=0; it will become stale after we advance time
         let stale_txid = Txid::from_byte_array([0xaa; 32]);
-        manager
-            .pending_is_locks
-            .insert(stale_txid, Instant::now() - MEMPOOL_TX_EXPIRY - Duration::from_secs(1));
+        manager.pending_is_locks.insert(stale_txid, Instant::now());
 
-        // Insert a fresh pending IS lock
+        // Advance time past the expiry threshold
+        tokio::time::advance(MEMPOOL_TX_EXPIRY + Duration::from_secs(1)).await;
+
+        // Insert a fresh pending IS lock at the new "now"
         let fresh_txid = Txid::from_byte_array([0xbb; 32]);
         manager.pending_is_locks.insert(fresh_txid, Instant::now());
 

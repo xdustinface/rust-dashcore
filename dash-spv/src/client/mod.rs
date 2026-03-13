@@ -123,7 +123,7 @@ mod tests {
             let mut mempool_state = client.mempool_state.write().await;
             let tx_record = UnconfirmedTransaction {
                 transaction: tx.clone(),
-                first_seen: std::time::Instant::now(),
+                first_seen: tokio::time::Instant::now(),
                 fee: Amount::ZERO,
                 size: 0,
                 is_instant_send: false,

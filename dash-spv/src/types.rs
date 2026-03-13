@@ -1,6 +1,7 @@
 //! Common type definitions for the Dash SPV client.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use dashcore::{
     block::Header as BlockHeader,
