@@ -423,6 +423,24 @@ pub struct SendResult {
     pub status: String,
 }
 
+// ============ Fee estimation record ============
+
+/// UniFFI-compatible fee estimate record.
+///
+/// Returned by [`SpvClient::estimate_fee`] with a breakdown of the estimated
+/// transaction fee for a given amount and fee-rate level.
+///
+/// All amounts are in duffs (1 DASH = 100,000,000 duffs).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct FeeEstimate {
+    /// Estimated fee in duffs.
+    pub fee: u64,
+    /// Fee rate level used: `"low"`, `"medium"`, or `"high"`.
+    pub fee_rate: String,
+    /// Estimated transaction size in bytes.
+    pub estimated_size: u32,
+}
+
 // ============ Wallet record types ============
 
 /// UniFFI-compatible wallet balance record.
@@ -1223,6 +1241,55 @@ impl SpvClient {
     pub async fn unsubscribe(&self) {
         if let Some(handle) = self.subscription_handle.lock().await.take() {
             handle.abort();
+        }
+    }
+}
+
+// ============ Fee estimation ============
+
+#[uniffi::export]
+impl SpvClient {
+    /// Estimate the fee for a transaction with the given amount and fee-rate level.
+    ///
+    /// # Fee rate levels
+    ///
+    /// | Level      | Rate (duffs/byte) |
+    /// |------------|-------------------|
+    /// | `"low"`    | 1                 |
+    /// | `"medium"` | 10                |
+    /// | `"high"`   | 100               |
+    ///
+    /// Any unrecognised fee-rate string defaults to the `"medium"` rate.
+    ///
+    /// # Size estimation
+    ///
+    /// A typical P2PKH transaction with one input and two outputs (payment +
+    /// change) is approximately 226 bytes:
+    ///
+    /// ```text
+    /// 1 input  × 148 bytes = 148
+    /// 2 outputs ×  34 bytes =  68
+    /// overhead              =  10
+    /// total                 = 226
+    /// ```
+    ///
+    /// The `amount` parameter is accepted for API compatibility but does not
+    /// affect the size estimate, which always assumes the standard 1-in/2-out
+    /// P2PKH layout.
+    pub fn estimate_fee(&self, _amount: u64, fee_rate: String) -> FeeEstimate {
+        /// Bytes for a standard 1-input 2-output P2PKH transaction.
+        const ESTIMATED_SIZE: u32 = 226;
+
+        let rate: u64 = match fee_rate.to_lowercase().as_str() {
+            "low" => 1,
+            "high" => 100,
+            _ => 10, // "medium" and any unknown level
+        };
+
+        FeeEstimate {
+            fee: u64::from(ESTIMATED_SIZE) * rate,
+            fee_rate,
+            estimated_size: ESTIMATED_SIZE,
         }
     }
 }
@@ -2720,5 +2787,149 @@ mod tests {
             addresses.is_empty(),
             "get_addresses with nonexistent account should return empty vec"
         );
+    }
+
+    // ---- FeeEstimate record tests ----
+
+    #[test]
+    fn test_fee_estimate_fields() {
+        let estimate = FeeEstimate {
+            fee: 226,
+            fee_rate: "low".to_string(),
+            estimated_size: 226,
+        };
+        assert_eq!(estimate.fee, 226);
+        assert_eq!(estimate.fee_rate, "low");
+        assert_eq!(estimate.estimated_size, 226);
+    }
+
+    #[test]
+    fn test_fee_estimate_clone_and_eq() {
+        let estimate = FeeEstimate {
+            fee: 2260,
+            fee_rate: "medium".to_string(),
+            estimated_size: 226,
+        };
+        let cloned = estimate.clone();
+        assert_eq!(estimate, cloned);
+    }
+
+    // ---- SpvClient::estimate_fee tests ----
+
+    #[tokio::test]
+    async fn test_estimate_fee_low_rate() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let estimate = client.estimate_fee(100_000_000, "low".to_string());
+
+        assert_eq!(estimate.estimated_size, 226, "standard P2PKH tx should be 226 bytes");
+        assert_eq!(estimate.fee_rate, "low");
+        assert_eq!(estimate.fee, 226, "low rate: 226 bytes × 1 duff/byte = 226 duffs");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_medium_rate() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let estimate = client.estimate_fee(50_000_000, "medium".to_string());
+
+        assert_eq!(estimate.estimated_size, 226);
+        assert_eq!(estimate.fee_rate, "medium");
+        assert_eq!(estimate.fee, 2260, "medium rate: 226 bytes × 10 duffs/byte = 2260 duffs");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_high_rate() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let estimate = client.estimate_fee(200_000_000, "high".to_string());
+
+        assert_eq!(estimate.estimated_size, 226);
+        assert_eq!(estimate.fee_rate, "high");
+        assert_eq!(estimate.fee, 22600, "high rate: 226 bytes × 100 duffs/byte = 22600 duffs");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_unknown_rate_defaults_to_medium() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let estimate = client.estimate_fee(0, "unknown_rate".to_string());
+
+        assert_eq!(estimate.estimated_size, 226);
+        assert_eq!(estimate.fee_rate, "unknown_rate");
+        assert_eq!(estimate.fee, 2260, "unknown rate should default to medium (10 duffs/byte)");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_amount_does_not_affect_result() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        // Fee estimate should be the same regardless of amount
+        let estimate_small = client.estimate_fee(1_000, "medium".to_string());
+        let estimate_large = client.estimate_fee(100_000_000_000, "medium".to_string());
+
+        assert_eq!(estimate_small.fee, estimate_large.fee);
+        assert_eq!(estimate_small.estimated_size, estimate_large.estimated_size);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_zero_amount() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let estimate = client.estimate_fee(0, "low".to_string());
+
+        // Should still return a valid estimate even for amount=0
+        assert_eq!(estimate.estimated_size, 226);
+        assert_eq!(estimate.fee, 226);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_fee_case_insensitive() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        let low_upper = client.estimate_fee(0, "LOW".to_string());
+        let medium_mixed = client.estimate_fee(0, "Medium".to_string());
+        let high_upper = client.estimate_fee(0, "HIGH".to_string());
+
+        assert_eq!(low_upper.fee, 226, "LOW should map to 1 duff/byte");
+        assert_eq!(medium_mixed.fee, 2260, "Medium should map to 10 duffs/byte");
+        assert_eq!(high_upper.fee, 22600, "HIGH should map to 100 duffs/byte");
     }
 }
