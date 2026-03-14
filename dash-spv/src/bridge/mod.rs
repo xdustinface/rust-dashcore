@@ -437,6 +437,23 @@ pub struct WalletBalance {
     pub immature: u64,
 }
 
+/// UniFFI-compatible address information record.
+///
+/// Describes a single HD-wallet address together with its BIP44/DIP9 derivation
+/// path and usage state.  Returned by [`SpvClient::get_addresses`] and used
+/// internally by [`SpvClient::get_receive_address`].
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct AddressInfo {
+    /// The Dash address (Base58Check encoded).
+    pub address: String,
+    /// Full BIP44/DIP9 derivation path, e.g. `"m/44'/5'/0'/0/0"`.
+    pub path: String,
+    /// `true` if this address has already received a transaction.
+    pub used: bool,
+    /// Child index within the address pool.
+    pub index: u32,
+}
+
 /// UniFFI-compatible transaction summary record.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct TransactionInfo {
@@ -864,6 +881,85 @@ impl SpvClient {
     /// be generated and call-sites can be wired up in advance.
     pub async fn get_transaction_count(&self) -> u32 {
         0
+    }
+}
+
+// ============ Address generation methods ============
+
+#[uniffi::export]
+impl SpvClient {
+    /// Returns the next unused receive address for account 0 of the first loaded wallet.
+    ///
+    /// Scans the external (receive) address pool of the first standard BIP44 account
+    /// (index 0) in the first registered wallet and returns the lowest-indexed address
+    /// that has not yet been used.
+    ///
+    /// Returns an empty string when no wallet has been loaded into the manager yet,
+    /// or when all pre-generated addresses are already used and no key material is
+    /// available to derive more.
+    pub async fn get_receive_address(&self) -> String {
+        let wallet = self.inner.wallet().read().await;
+        let wallet_infos = wallet.get_all_wallet_infos();
+
+        for info in wallet_infos.values() {
+            // Use account 0 from standard BIP44 accounts
+            if let Some(account) = info.accounts.standard_bip44_accounts.get(&0) {
+                if let key_wallet::managed_account::managed_account_type::ManagedAccountType::Standard {
+                    external_addresses,
+                    ..
+                } = &account.account_type
+                {
+                    // Return the first unused address
+                    for addr_info in external_addresses.addresses.values() {
+                        if !addr_info.used {
+                            return addr_info.address.to_string();
+                        }
+                    }
+                }
+            }
+        }
+
+        String::new()
+    }
+
+    /// Returns all known addresses for the given BIP44 account index.
+    ///
+    /// Iterates the external (receive) address pool of the standard BIP44 account
+    /// at `account` in the first registered wallet and maps each entry to an
+    /// [`AddressInfo`] record.
+    ///
+    /// Returns an empty `Vec` when no wallet is loaded, the requested account does
+    /// not exist, or the address pool contains no generated addresses yet.
+    ///
+    /// # Parameters
+    ///
+    /// * `account` – BIP44 account index (0-based).
+    pub async fn get_addresses(&self, account: u32) -> Vec<AddressInfo> {
+        let wallet = self.inner.wallet().read().await;
+        let wallet_infos = wallet.get_all_wallet_infos();
+
+        for info in wallet_infos.values() {
+            if let Some(managed_account) = info.accounts.standard_bip44_accounts.get(&account) {
+                if let key_wallet::managed_account::managed_account_type::ManagedAccountType::Standard {
+                    external_addresses,
+                    ..
+                } = &managed_account.account_type
+                {
+                    return external_addresses
+                        .addresses
+                        .values()
+                        .map(|addr_info| AddressInfo {
+                            address: addr_info.address.to_string(),
+                            path: addr_info.path.to_string(),
+                            used: addr_info.used,
+                            index: addr_info.index,
+                        })
+                        .collect();
+                }
+            }
+        }
+
+        vec![]
     }
 }
 
@@ -1853,6 +1949,92 @@ mod tests {
         assert!(
             matches!(err, SpvClientError::Network { .. }),
             "expected Network error when no peers connected, got: {err:?}"
+        );
+    }
+
+    // ---- AddressInfo record tests ----
+
+    #[test]
+    fn test_address_info_record_fields() {
+        let info = AddressInfo {
+            address: "XqEkVnMDPBcTkGputvMpkSTh27UiKmPDp9".to_string(),
+            path: "m/44'/5'/0'/0/0".to_string(),
+            used: false,
+            index: 0,
+        };
+        assert_eq!(info.address, "XqEkVnMDPBcTkGputvMpkSTh27UiKmPDp9");
+        assert_eq!(info.path, "m/44'/5'/0'/0/0");
+        assert!(!info.used);
+        assert_eq!(info.index, 0);
+    }
+
+    #[test]
+    fn test_address_info_used_flag() {
+        let unused = AddressInfo {
+            address: "Xaddr1".to_string(),
+            path: "m/44'/5'/0'/0/0".to_string(),
+            used: false,
+            index: 0,
+        };
+        let used = AddressInfo {
+            address: "Xaddr2".to_string(),
+            path: "m/44'/5'/0'/0/1".to_string(),
+            used: true,
+            index: 1,
+        };
+        assert!(!unused.used);
+        assert!(used.used);
+        assert_eq!(used.index, 1);
+    }
+
+    /// `get_receive_address` returns an empty string when no wallet is loaded.
+    #[tokio::test]
+    async fn test_get_receive_address_no_wallet() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let address = client.get_receive_address().await;
+        assert!(
+            address.is_empty(),
+            "get_receive_address should return empty string when no wallet is loaded"
+        );
+    }
+
+    /// `get_addresses` returns an empty vec when no wallet is loaded.
+    #[tokio::test]
+    async fn test_get_addresses_no_wallet() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let addresses = client.get_addresses(0).await;
+        assert!(
+            addresses.is_empty(),
+            "get_addresses should return empty vec when no wallet is loaded"
+        );
+    }
+
+    /// `get_addresses` with a non-existent account index returns an empty vec.
+    #[tokio::test]
+    async fn test_get_addresses_nonexistent_account() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let addresses = client.get_addresses(999).await;
+        assert!(
+            addresses.is_empty(),
+            "get_addresses with nonexistent account should return empty vec"
         );
     }
 }
