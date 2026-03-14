@@ -379,6 +379,10 @@ pub enum SpvClientError {
     Sync {
         message: String,
     },
+    #[error("Transaction error: {message}")]
+    Transaction {
+        message: String,
+    },
     #[error("General error: {message}")]
     General {
         message: String,
@@ -405,6 +409,17 @@ impl From<SpvError> for SpvClientError {
             },
         }
     }
+}
+
+// ============ Send result type ============
+
+/// UniFFI-compatible result record for a broadcasted transaction.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct SendResult {
+    /// Transaction ID (txid) of the broadcasted transaction, as a hex string.
+    pub txid: String,
+    /// Broadcast status: `"broadcasted"` on success.
+    pub status: String,
 }
 
 // ============ Wallet record types ============
@@ -766,6 +781,50 @@ impl SpvClient {
     pub async fn get_governance_proposal(&self, hash: String) -> Option<GovernanceProposal> {
         let _ = hash;
         None
+    }
+}
+
+// ============ Send transaction ============
+
+#[uniffi::export]
+impl SpvClient {
+    /// Broadcast a raw transaction to the Dash network.
+    ///
+    /// Decodes `raw_tx_hex` (a hex-encoded serialised Dash transaction), broadcasts
+    /// it to all connected peers via `DashSpvClient::broadcast_transaction`, and
+    /// returns a [`SendResult`] containing the transaction ID on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpvClientError::Transaction`] when:
+    /// * `raw_tx_hex` is not valid hexadecimal.
+    /// * The decoded bytes cannot be deserialised as a `dashcore::Transaction`.
+    ///
+    /// Returns [`SpvClientError::Network`] when:
+    /// * No peers are connected.
+    /// * All peers reject or fail to receive the message.
+    pub async fn send_transaction(&self, raw_tx_hex: String) -> Result<SendResult, SpvClientError> {
+        use dashcore::consensus::Decodable;
+        use hex::FromHex;
+
+        let bytes = Vec::<u8>::from_hex(&raw_tx_hex).map_err(|e| SpvClientError::Transaction {
+            message: format!("Invalid hex: {e}"),
+        })?;
+
+        let tx = dashcore::Transaction::consensus_decode(&mut bytes.as_slice()).map_err(|e| {
+            SpvClientError::Transaction {
+                message: format!("Failed to deserialise transaction: {e}"),
+            }
+        })?;
+
+        let txid = tx.txid().to_string();
+
+        self.inner.broadcast_transaction(&tx).await.map_err(SpvClientError::from)?;
+
+        Ok(SendResult {
+            txid,
+            status: "broadcasted".to_string(),
+        })
     }
 }
 
@@ -1680,6 +1739,120 @@ mod tests {
         assert!(
             client.get_transaction("abcd1234".to_string()).await.is_none(),
             "get_transaction should return None (stub)"
+        );
+    }
+
+    // ---- SendResult record tests ----
+
+    #[test]
+    fn test_send_result_fields() {
+        let result = SendResult {
+            txid: "abcd1234efgh5678".to_string(),
+            status: "broadcasted".to_string(),
+        };
+        assert_eq!(result.txid, "abcd1234efgh5678");
+        assert_eq!(result.status, "broadcasted");
+    }
+
+    #[test]
+    fn test_send_result_clone_and_eq() {
+        let result = SendResult {
+            txid: "txid001".to_string(),
+            status: "broadcasted".to_string(),
+        };
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+    }
+
+    // ---- send_transaction error-path tests ----
+
+    /// `send_transaction` with invalid hex returns `SpvClientError::Transaction`.
+    #[tokio::test]
+    async fn test_send_transaction_invalid_hex() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let err = client
+            .send_transaction("not-valid-hex!!".to_string())
+            .await
+            .expect_err("should fail on invalid hex");
+
+        assert!(
+            matches!(err, SpvClientError::Transaction { .. }),
+            "expected Transaction error, got: {err:?}"
+        );
+    }
+
+    /// `send_transaction` with valid hex that is not a valid transaction returns
+    /// `SpvClientError::Transaction`.
+    #[tokio::test]
+    async fn test_send_transaction_invalid_tx_bytes() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        // Valid hex but random bytes — not a parseable transaction.
+        let err = client
+            .send_transaction("deadbeefcafe".to_string())
+            .await
+            .expect_err("should fail on non-transaction bytes");
+
+        assert!(
+            matches!(err, SpvClientError::Transaction { .. }),
+            "expected Transaction error, got: {err:?}"
+        );
+    }
+
+    /// `send_transaction` with a well-formed transaction but no connected peers
+    /// returns `SpvClientError::Network`.
+    #[tokio::test]
+    async fn test_send_transaction_no_peers() {
+        use dashcore::consensus::Encodable;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        // Build a minimal coinbase-style transaction (version=1, 1 input, 1 output).
+        let tx = dashcore::Transaction {
+            version: 1,
+            lock_time: 0,
+            input: vec![dashcore::TxIn {
+                previous_output: dashcore::OutPoint::null(),
+                script_sig: dashcore::ScriptBuf::new(),
+                sequence: 0xFFFF_FFFF,
+                witness: dashcore::Witness::default(),
+            }],
+            output: vec![dashcore::TxOut {
+                value: 50_000_000,
+                script_pubkey: dashcore::ScriptBuf::new(),
+            }],
+            special_transaction_payload: None,
+        };
+
+        let mut raw = Vec::new();
+        tx.consensus_encode(&mut raw).expect("encode must succeed");
+        let raw_hex = hex::encode(&raw);
+
+        let err = client
+            .send_transaction(raw_hex)
+            .await
+            .expect_err("should fail when no peers are connected");
+
+        assert!(
+            matches!(err, SpvClientError::Network { .. }),
+            "expected Network error when no peers connected, got: {err:?}"
         );
     }
 }
