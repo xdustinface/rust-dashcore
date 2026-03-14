@@ -213,6 +213,50 @@ pub struct NetworkInfo {
     pub peers: Vec<PeerInfo>,
 }
 
+/// UniFFI-compatible representation of a wallet event.
+///
+/// This is a flattened version of the internal [`key_wallet_manager::WalletEvent`]
+/// that uses only types expressible across the UniFFI boundary.  Complex fields
+/// such as `WalletId`, `Txid`, and `Address` are represented as `String` values.
+#[derive(uniffi::Enum, Clone, Debug)]
+pub enum WalletEvent {
+    /// A transaction relevant to the wallet was received for the first time.
+    TransactionReceived {
+        /// Hex-encoded wallet ID of the affected wallet.
+        wallet_id: String,
+        /// Transaction context as a string (e.g. `"mempool"`, `"instant send"`, `"block 100"`).
+        status: String,
+        /// Account index within the wallet.
+        account_index: u32,
+        /// Hex-encoded transaction ID.
+        txid: String,
+        /// Net amount change in duffs (positive for incoming, negative for outgoing).
+        amount_sats: i64,
+        /// Addresses involved in the transaction (Base58Check encoded).
+        addresses: Vec<String>,
+    },
+    /// The confirmation status of a previously seen transaction has changed.
+    TransactionStatusChanged {
+        /// Hex-encoded transaction ID.
+        txid: String,
+        /// New transaction context as a string.
+        status: String,
+    },
+    /// The wallet balance has changed.
+    BalanceUpdated {
+        /// Hex-encoded wallet ID of the affected wallet.
+        wallet_id: String,
+        /// New spendable balance in duffs (confirmed and mature).
+        spendable_sats: u64,
+        /// New unconfirmed balance in duffs.
+        unconfirmed_sats: u64,
+        /// New immature balance (coinbase UTXOs not yet mature) in duffs.
+        immature_sats: u64,
+        /// New locked balance in duffs.
+        locked_sats: u64,
+    },
+}
+
 /// Callback interface for receiving SPV client events on the foreign side.
 ///
 /// Implement this trait in React Native / Swift and register it via
@@ -228,6 +272,9 @@ pub trait SpvEventListener: Send + Sync {
 
     /// Called whenever a network event occurs (peer connected / disconnected).
     fn on_network_event(&self, event: NetworkEvent);
+
+    /// Called whenever a wallet event occurs (transaction received, balance updated, etc.).
+    fn on_wallet_event(&self, event: WalletEvent);
 
     /// Called when overall sync progress changes.
     ///
@@ -1157,6 +1204,48 @@ fn convert_network_event(event: crate::network::NetworkEvent) -> NetworkEvent {
     }
 }
 
+/// Convert an internal [`key_wallet_manager::WalletEvent`] to the bridge [`WalletEvent`].
+fn convert_wallet_event(event: key_wallet_manager::WalletEvent) -> WalletEvent {
+    use key_wallet_manager::WalletEvent as I;
+    match event {
+        I::TransactionReceived {
+            wallet_id,
+            status,
+            account_index,
+            txid,
+            amount,
+            addresses,
+        } => WalletEvent::TransactionReceived {
+            wallet_id: hex::encode(wallet_id),
+            status: status.to_string(),
+            account_index,
+            txid: txid.to_string(),
+            amount_sats: amount,
+            addresses: addresses.iter().map(|a| a.to_string()).collect(),
+        },
+        I::TransactionStatusChanged {
+            txid,
+            status,
+        } => WalletEvent::TransactionStatusChanged {
+            txid: txid.to_string(),
+            status: status.to_string(),
+        },
+        I::BalanceUpdated {
+            wallet_id,
+            spendable,
+            unconfirmed,
+            immature,
+            locked,
+        } => WalletEvent::BalanceUpdated {
+            wallet_id: hex::encode(wallet_id),
+            spendable_sats: spendable,
+            unconfirmed_sats: unconfirmed,
+            immature_sats: immature,
+            locked_sats: locked,
+        },
+    }
+}
+
 // ============ Subscription methods ============
 
 #[uniffi::export]
@@ -1177,6 +1266,7 @@ impl SpvClient {
         let mut sync_rx = self.inner.subscribe_sync_events().await;
         let mut net_rx = self.inner.subscribe_network_events().await;
         let mut progress_rx = self.inner.subscribe_progress().await;
+        let mut wallet_rx = self.inner.wallet().read().await.subscribe_events();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1206,6 +1296,20 @@ impl SpvClient {
                                 tracing::warn!(
                                     skipped = n,
                                     "SPV network-event subscriber lagged; some events were dropped"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    result = wallet_rx.recv() => {
+                        match result {
+                            Ok(event) => {
+                                listener.on_wallet_event(convert_wallet_event(event));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    skipped = n,
+                                    "SPV wallet-event subscriber lagged; some events were dropped"
                                 );
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1331,6 +1435,7 @@ mod tests {
     struct MockListener {
         sync_events: Mutex<Vec<SyncEvent>>,
         network_events: Mutex<Vec<NetworkEvent>>,
+        wallet_events: Mutex<Vec<WalletEvent>>,
         progress_events: Mutex<Vec<(f64, u32, u32)>>,
     }
 
@@ -1339,6 +1444,7 @@ mod tests {
             Self {
                 sync_events: Mutex::new(Vec::new()),
                 network_events: Mutex::new(Vec::new()),
+                wallet_events: Mutex::new(Vec::new()),
                 progress_events: Mutex::new(Vec::new()),
             }
         }
@@ -1351,6 +1457,10 @@ mod tests {
 
         fn on_network_event(&self, event: NetworkEvent) {
             self.network_events.lock().unwrap().push(event);
+        }
+
+        fn on_wallet_event(&self, event: WalletEvent) {
+            self.wallet_events.lock().unwrap().push(event);
         }
 
         fn on_sync_progress(&self, percentage: f64, current_height: u32, target_height: u32) {
@@ -2609,6 +2719,152 @@ mod tests {
             NetworkEvent::PeersUpdated { connected_count: 0, ref addresses, best_height: None }
             if addresses.is_empty()
         ));
+    }
+
+    // ---- WalletEvent enum tests ----
+
+    #[test]
+    fn test_wallet_event_variants() {
+        let events: Vec<WalletEvent> = vec![
+            WalletEvent::TransactionReceived {
+                wallet_id: "aabb".to_string(),
+                status: "mempool".to_string(),
+                account_index: 0,
+                txid: "deadbeef".to_string(),
+                amount_sats: 100_000,
+                addresses: vec!["XtestAddr1".to_string()],
+            },
+            WalletEvent::TransactionStatusChanged {
+                txid: "deadbeef".to_string(),
+                status: "block 100".to_string(),
+            },
+            WalletEvent::BalanceUpdated {
+                wallet_id: "aabb".to_string(),
+                spendable_sats: 1_000_000,
+                unconfirmed_sats: 50_000,
+                immature_sats: 0,
+                locked_sats: 0,
+            },
+        ];
+        let _cloned: Vec<WalletEvent> = events.to_vec();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn test_listener_receives_wallet_event() {
+        let listener = MockListener::new();
+        listener.on_wallet_event(WalletEvent::BalanceUpdated {
+            wallet_id: "aabb".to_string(),
+            spendable_sats: 1_000_000,
+            unconfirmed_sats: 0,
+            immature_sats: 0,
+            locked_sats: 0,
+        });
+        let events = listener.wallet_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], WalletEvent::BalanceUpdated { .. }));
+    }
+
+    // ---- convert_wallet_event tests ----
+
+    /// `convert_wallet_event` maps `TransactionReceived` correctly.
+    #[test]
+    fn test_convert_wallet_event_transaction_received() {
+        use dashcore::hashes::Hash;
+        use dashcore::Txid;
+        use key_wallet::transaction_checking::TransactionContext;
+        use key_wallet_manager::WalletEvent as I;
+
+        let wallet_id = [0xabu8; 32];
+        let txid = Txid::all_zeros();
+        let event = I::TransactionReceived {
+            wallet_id,
+            status: TransactionContext::Mempool,
+            account_index: 2,
+            txid,
+            amount: 500_000,
+            addresses: vec![],
+        };
+
+        let bridge = convert_wallet_event(event);
+        match bridge {
+            WalletEvent::TransactionReceived {
+                wallet_id: wid,
+                status,
+                account_index,
+                txid: txid_str,
+                amount_sats,
+                addresses,
+            } => {
+                assert_eq!(wid, hex::encode([0xabu8; 32]));
+                assert_eq!(status, "mempool");
+                assert_eq!(account_index, 2);
+                assert_eq!(txid_str, Txid::all_zeros().to_string());
+                assert_eq!(amount_sats, 500_000);
+                assert!(addresses.is_empty());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `convert_wallet_event` maps `TransactionStatusChanged` correctly.
+    #[test]
+    fn test_convert_wallet_event_transaction_status_changed() {
+        use dashcore::hashes::Hash;
+        use dashcore::Txid;
+        use key_wallet::transaction_checking::TransactionContext;
+        use key_wallet_manager::WalletEvent as I;
+
+        let txid = Txid::all_zeros();
+        let event = I::TransactionStatusChanged {
+            txid,
+            status: TransactionContext::InstantSend,
+        };
+
+        let bridge = convert_wallet_event(event);
+        match bridge {
+            WalletEvent::TransactionStatusChanged {
+                txid: txid_str,
+                status,
+            } => {
+                assert_eq!(txid_str, Txid::all_zeros().to_string());
+                assert_eq!(status, "instant send");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `convert_wallet_event` maps `BalanceUpdated` correctly.
+    #[test]
+    fn test_convert_wallet_event_balance_updated() {
+        use key_wallet_manager::WalletEvent as I;
+
+        let wallet_id = [0x01u8; 32];
+        let event = I::BalanceUpdated {
+            wallet_id,
+            spendable: 1_000_000,
+            unconfirmed: 250_000,
+            immature: 50_000,
+            locked: 10_000,
+        };
+
+        let bridge = convert_wallet_event(event);
+        match bridge {
+            WalletEvent::BalanceUpdated {
+                wallet_id: wid,
+                spendable_sats,
+                unconfirmed_sats,
+                immature_sats,
+                locked_sats,
+            } => {
+                assert_eq!(wid, hex::encode([0x01u8; 32]));
+                assert_eq!(spendable_sats, 1_000_000);
+                assert_eq!(unconfirmed_sats, 250_000);
+                assert_eq!(immature_sats, 50_000);
+                assert_eq!(locked_sats, 10_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     // ---- send_transaction error-path tests ----
