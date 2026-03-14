@@ -623,6 +623,62 @@ impl SpvClient {
             peers,
         }
     }
+
+    /// Returns detailed info about all currently connected peers.
+    ///
+    /// Delegates to [`crate::network::manager::PeerNetworkManager::get_peers_snapshot`]
+    /// and maps each entry to a [`PeerInfo`] record.  Returns an empty `Vec` when no
+    /// peers are connected or the underlying network manager is not a
+    /// `PeerNetworkManager`.
+    pub async fn get_peers(&self) -> Vec<PeerInfo> {
+        self.inner
+            .peers_snapshot()
+            .await
+            .into_iter()
+            .map(|s| PeerInfo {
+                address: s.address.to_string(),
+                user_agent: s.user_agent,
+                best_height: s.best_height,
+                connected_since: s.connected_since,
+                services: s.services,
+            })
+            .collect()
+    }
+
+    /// Disconnect a specific peer by address string (e.g. `"192.0.2.1:9999"`).
+    ///
+    /// Parses `address` as a [`SocketAddr`], then delegates to
+    /// [`crate::client::DashSpvClient::disconnect_peer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpvClientError::Config`] when:
+    /// * `address` cannot be parsed as a valid socket address.
+    /// * The underlying network manager does not support peer disconnection.
+    pub async fn disconnect_peer(&self, address: String) -> Result<(), SpvClientError> {
+        let addr = address.parse::<SocketAddr>().map_err(|e| SpvClientError::Config {
+            message: format!("Invalid peer address '{}': {}", address, e),
+        })?;
+        self.inner.disconnect_peer(&addr, "requested by user").await.map_err(SpvClientError::from)
+    }
+
+    /// Add a peer by address string (e.g. `"192.0.2.1:9999"`) and attempt to connect.
+    ///
+    /// Parses `address` as a [`SocketAddr`], then delegates to
+    /// [`crate::client::DashSpvClient::add_peer`].  The connection attempt is
+    /// initiated in the background; this method returns as soon as it is queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpvClientError::Config`] when:
+    /// * `address` cannot be parsed as a valid socket address.
+    /// * The underlying network manager does not support adding peers.
+    pub async fn add_peer(&self, address: String) -> Result<(), SpvClientError> {
+        let addr = address.parse::<SocketAddr>().map_err(|e| SpvClientError::Config {
+            message: format!("Invalid peer address '{}': {}", address, e),
+        })?;
+        self.inner.add_peer(&addr).await.map_err(SpvClientError::from)
+    }
 }
 
 // ============ Masternode and Governance types ============
@@ -2931,5 +2987,120 @@ mod tests {
         assert_eq!(low_upper.fee, 226, "LOW should map to 1 duff/byte");
         assert_eq!(medium_mixed.fee, 2260, "Medium should map to 10 duffs/byte");
         assert_eq!(high_upper.fee, 22600, "HIGH should map to 100 duffs/byte");
+    }
+
+    // ---- get_peers tests ----
+
+    /// `get_peers` returns an empty vec when no peers are connected.
+    #[tokio::test]
+    async fn test_get_peers_returns_empty_when_no_peers() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let peers = client.get_peers().await;
+        assert!(peers.is_empty(), "expected no connected peers on a fresh client");
+    }
+
+    /// `get_peers` and `get_network_info` return the same peer data.
+    #[tokio::test]
+    async fn test_get_peers_matches_network_info() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        let peers = client.get_peers().await;
+        let network_info = client.get_network_info().await;
+
+        assert_eq!(
+            peers.len(),
+            network_info.peers.len(),
+            "get_peers() and get_network_info().peers must have the same length"
+        );
+    }
+
+    // ---- disconnect_peer tests ----
+
+    /// `disconnect_peer` returns an error for an unparseable address string.
+    #[tokio::test]
+    async fn test_disconnect_peer_invalid_address() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let result = client.disconnect_peer("not_a_valid_address".to_string()).await;
+        assert!(result.is_err(), "invalid address should produce an error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SpvClientError::Config { .. }),
+            "expected SpvClientError::Config for bad address, got {:?}",
+            err
+        );
+    }
+
+    /// `disconnect_peer` succeeds (no-op) for a valid address that is not connected.
+    #[tokio::test]
+    async fn test_disconnect_peer_valid_address_not_connected() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        // Disconnecting a peer that is not connected should succeed (no-op).
+        let result = client.disconnect_peer("127.0.0.1:19999".to_string()).await;
+        assert!(
+            result.is_ok(),
+            "disconnect of non-connected peer should succeed, got {:?}",
+            result
+        );
+    }
+
+    // ---- add_peer tests ----
+
+    /// `add_peer` returns an error for an unparseable address string.
+    #[tokio::test]
+    async fn test_add_peer_invalid_address() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let result = client.add_peer("bad::address".to_string()).await;
+        assert!(result.is_err(), "invalid address should produce an error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, SpvClientError::Config { .. }),
+            "expected SpvClientError::Config for bad address, got {:?}",
+            err
+        );
+    }
+
+    /// `add_peer` succeeds for a valid address (connection is attempted in background).
+    #[tokio::test]
+    async fn test_add_peer_valid_address() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        // Connection will fail (no real node listening), but the call itself should succeed.
+        let result = client.add_peer("127.0.0.1:19999".to_string()).await;
+        assert!(result.is_ok(), "add_peer with valid address should succeed, got {:?}", result);
     }
 }

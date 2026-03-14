@@ -1190,6 +1190,16 @@ impl PeerNetworkManager {
         Ok(())
     }
 
+    /// Add a peer address and attempt to connect to it.
+    ///
+    /// Initiates a connection attempt to the given address in the background.
+    /// Returns immediately; the connection itself is asynchronous.
+    pub async fn add_peer(&self, addr: SocketAddr) -> Result<(), Error> {
+        log::info!("Adding peer {}", addr);
+        self.connect_to_peer(addr).await;
+        Ok(())
+    }
+
     /// Return a point-in-time snapshot of all currently connected peers.
     ///
     /// Each entry captures the address, user-agent, best height, connection

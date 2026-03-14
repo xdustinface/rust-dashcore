@@ -43,6 +43,18 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         }
     }
 
+    /// Add a peer address and attempt to connect to it.
+    pub async fn add_peer(&self, addr: &std::net::SocketAddr) -> Result<()> {
+        let network_guard = self.network.lock().await;
+        let network = network_guard
+            .as_any()
+            .downcast_ref::<crate::network::manager::PeerNetworkManager>()
+            .ok_or_else(|| {
+                SpvError::Config("Network manager does not support adding peers".to_string())
+            })?;
+        network.add_peer(*addr).await
+    }
+
     /// Disconnect a specific peer.
     pub async fn disconnect_peer(&self, addr: &std::net::SocketAddr, reason: &str) -> Result<()> {
         // Cast network manager to PeerNetworkManager to access disconnect_peer
