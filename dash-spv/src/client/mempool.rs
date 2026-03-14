@@ -110,6 +110,30 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         mempool_state.transactions.len()
     }
 
+    /// Return a snapshot of all currently tracked mempool transactions.
+    ///
+    /// Clones the transactions from the shared mempool state so that callers
+    /// can iterate them without holding the lock.
+    pub async fn get_all_mempool_transactions(&self) -> Vec<crate::types::UnconfirmedTransaction> {
+        let mempool_state = self.mempool_state.read().await;
+        mempool_state.transactions.values().cloned().collect()
+    }
+
+    /// Return the aggregate pending balance from the mempool state.
+    ///
+    /// Sums regular and InstantSend pending balances.  Negative values (which
+    /// can arise if a transaction is removed after the balance was credited) are
+    /// clamped to zero.
+    pub async fn get_aggregate_mempool_balance(&self) -> crate::types::MempoolBalance {
+        let mempool_state = self.mempool_state.read().await;
+        let pending_sats = mempool_state.pending_balance.max(0) as u64;
+        let pending_instant_sats = mempool_state.pending_instant_balance.max(0) as u64;
+        crate::types::MempoolBalance {
+            pending: dashcore::Amount::from_sat(pending_sats),
+            pending_instant: dashcore::Amount::from_sat(pending_instant_sats),
+        }
+    }
+
     /// Record that we attempted to send a transaction (for UX/heuristics).
     pub async fn record_send(&self, txid: dashcore::Txid) -> Result<()> {
         let mut mempool_state = self.mempool_state.write().await;

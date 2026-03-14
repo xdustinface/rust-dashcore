@@ -558,6 +558,45 @@ pub struct TransactionInfo {
     pub is_incoming: bool,
 }
 
+// ============ Mempool record types ============
+
+/// UniFFI-compatible record for a single unconfirmed (mempool) transaction.
+///
+/// Maps from [`crate::types::UnconfirmedTransaction`].  The `Instant`-based
+/// `first_seen` field is converted to "seconds ago" at mapping time so that
+/// it is safe to cross the FFI boundary.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MempoolTransactionInfo {
+    /// Transaction ID as a hex string.
+    pub txid: String,
+    /// Fee paid by the transaction, in duffs (satoshis).
+    pub fee_sats: u64,
+    /// Serialised size of the transaction in bytes.
+    pub size: u32,
+    /// `true` if this transaction was locked via InstantSend.
+    pub is_instant_send: bool,
+    /// `true` if this transaction was sent from our wallet.
+    pub is_outgoing: bool,
+    /// Addresses involved in the transaction (Base58Check encoded).
+    pub addresses: Vec<String>,
+    /// Net amount change for our wallet in duffs — positive for incoming,
+    /// negative for outgoing.
+    pub net_amount_sats: i64,
+    /// Seconds elapsed since the transaction was first seen in the mempool.
+    pub first_seen_secs_ago: u64,
+}
+
+/// UniFFI-compatible aggregate pending-balance record from the mempool.
+///
+/// All amounts are in duffs (1 DASH = 100,000,000 duffs).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct MempoolBalanceInfo {
+    /// Pending balance from regular (non-InstantSend) mempool transactions, in duffs.
+    pub pending_sats: u64,
+    /// Pending balance from InstantSend-locked mempool transactions, in duffs.
+    pub pending_instant_sats: u64,
+}
+
 // ============ Concrete type alias ============
 
 type ConcreteClient =
@@ -1091,6 +1130,54 @@ impl SpvClient {
         }
 
         vec![]
+    }
+}
+
+// ============ Mempool methods ============
+
+/// Maps an [`crate::types::UnconfirmedTransaction`] to the UniFFI-compatible
+/// [`MempoolTransactionInfo`] record.
+fn unconfirmed_tx_to_info(tx: &crate::types::UnconfirmedTransaction) -> MempoolTransactionInfo {
+    let first_seen_secs_ago = tokio::time::Instant::now().duration_since(tx.first_seen).as_secs();
+    MempoolTransactionInfo {
+        txid: tx.txid().to_string(),
+        fee_sats: tx.fee.to_sat(),
+        size: tx.size as u32,
+        is_instant_send: tx.is_instant_send,
+        is_outgoing: tx.is_outgoing,
+        addresses: tx.addresses.iter().map(|a| a.to_string()).collect(),
+        net_amount_sats: tx.net_amount,
+        first_seen_secs_ago,
+    }
+}
+
+#[uniffi::export]
+impl SpvClient {
+    /// Returns all transactions currently tracked in the mempool.
+    ///
+    /// Maps each [`crate::types::UnconfirmedTransaction`] to a
+    /// [`MempoolTransactionInfo`] record.  Returns an empty `Vec` when the
+    /// mempool is empty.
+    pub async fn get_mempool_transactions(&self) -> Vec<MempoolTransactionInfo> {
+        self.inner.get_all_mempool_transactions().await.iter().map(unconfirmed_tx_to_info).collect()
+    }
+
+    /// Returns the number of transactions currently tracked in the mempool.
+    pub async fn get_mempool_transaction_count(&self) -> u32 {
+        self.inner.get_mempool_transaction_count().await as u32
+    }
+
+    /// Returns the aggregate pending balance from the mempool.
+    ///
+    /// Reads `pending_balance` and `pending_instant_balance` directly from
+    /// the shared [`crate::types::MempoolState`].  Negative balances are
+    /// clamped to zero.
+    pub async fn get_mempool_balance(&self) -> MempoolBalanceInfo {
+        let balance = self.inner.get_aggregate_mempool_balance().await;
+        MempoolBalanceInfo {
+            pending_sats: balance.pending.to_sat(),
+            pending_instant_sats: balance.pending_instant.to_sat(),
+        }
     }
 }
 
@@ -3497,5 +3584,104 @@ mod tests {
             matches!(err, SpvClientError::Wallet { .. }),
             "expected Wallet error when restoring duplicate wallet, got: {err:?}"
         );
+    }
+
+    // ============ MempoolTransactionInfo / MempoolBalanceInfo tests ============
+
+    /// `unconfirmed_tx_to_info` maps all fields correctly.
+    #[test]
+    fn test_unconfirmed_tx_to_info_fields() {
+        use crate::types::UnconfirmedTransaction;
+        use dashcore::{Amount, Network, PublicKey};
+
+        // Build a minimal transaction for testing.
+        let tx = dashcore::Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![],
+            output: vec![],
+            special_transaction_payload: None,
+        };
+
+        // Construct a valid P2PKH address from a well-known compressed public key.
+        let pubkey = PublicKey::from_slice(&[
+            0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE,
+            0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81,
+            0x5B, 0x16, 0xF8, 0x17, 0x98,
+        ])
+        .expect("valid compressed pubkey");
+        let address = dashcore::Address::p2pkh(&pubkey, Network::Testnet);
+
+        let unconfirmed = UnconfirmedTransaction::new(
+            tx,
+            Amount::from_sat(500),
+            true,
+            false,
+            vec![address],
+            1_000,
+        );
+
+        let info = unconfirmed_tx_to_info(&unconfirmed);
+
+        assert_eq!(info.fee_sats, 500);
+        assert!(info.is_instant_send);
+        assert!(!info.is_outgoing);
+        assert_eq!(info.net_amount_sats, 1_000);
+        assert_eq!(info.addresses.len(), 1);
+        // first_seen_secs_ago should be very small (just created)
+        assert!(info.first_seen_secs_ago < 5, "first_seen_secs_ago should be near zero");
+    }
+
+    /// `MempoolBalanceInfo` fields are populated correctly.
+    #[test]
+    fn test_mempool_balance_info_fields() {
+        let info = MempoolBalanceInfo {
+            pending_sats: 1_000_000,
+            pending_instant_sats: 500_000,
+        };
+        assert_eq!(info.pending_sats, 1_000_000);
+        assert_eq!(info.pending_instant_sats, 500_000);
+    }
+
+    /// `get_mempool_transactions` returns an empty vec on a freshly constructed client.
+    #[tokio::test]
+    async fn test_get_mempool_transactions_empty() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let txs = client.get_mempool_transactions().await;
+        assert!(txs.is_empty(), "mempool should be empty on fresh client");
+    }
+
+    /// `get_mempool_transaction_count` returns 0 on a freshly constructed client.
+    #[tokio::test]
+    async fn test_get_mempool_transaction_count_zero() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        assert_eq!(client.get_mempool_transaction_count().await, 0);
+    }
+
+    /// `get_mempool_balance` returns zeros on a freshly constructed client.
+    #[tokio::test]
+    async fn test_get_mempool_balance_zero() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let balance = client.get_mempool_balance().await;
+        assert_eq!(balance.pending_sats, 0);
+        assert_eq!(balance.pending_instant_sats, 0);
     }
 }
