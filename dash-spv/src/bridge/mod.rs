@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::Network;
+use key_wallet::mnemonic::{Language, Mnemonic};
+use key_wallet::wallet::initialization::WalletAccountCreationOptions;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::{ManagedWalletInfo, TransactionRecord};
 use key_wallet_manager::wallet_manager::WalletManager;
@@ -388,6 +390,10 @@ pub enum SpvClientError {
     General {
         message: String,
     },
+    #[error("Wallet error: {message}")]
+    Wallet {
+        message: String,
+    },
 }
 
 impl From<SpvError> for SpvClientError {
@@ -439,6 +445,21 @@ pub struct FeeEstimate {
     pub fee_rate: String,
     /// Estimated transaction size in bytes.
     pub estimated_size: u32,
+}
+
+// ============ Wallet creation result ============
+
+/// Result of wallet creation, containing the generated mnemonic and wallet ID.
+///
+/// Returned by [`SpvClient::create_wallet`].  The `mnemonic` field should be
+/// presented to the user for secure backup; the `wallet_id` is a hex-encoded
+/// 32-byte identifier derived from the wallet's root public key.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct WalletCreationResult {
+    /// BIP39 mnemonic phrase (12 or 24 space-separated words).
+    pub mnemonic: String,
+    /// Hex-encoded 32-byte wallet identifier.
+    pub wallet_id: String,
 }
 
 // ============ Wallet record types ============
@@ -1292,6 +1313,93 @@ impl SpvClient {
             estimated_size: ESTIMATED_SIZE,
         }
     }
+}
+
+// ============ Wallet management methods ============
+
+#[uniffi::export]
+impl SpvClient {
+    /// Create a new HD wallet with a freshly generated BIP39 mnemonic.
+    ///
+    /// Generates a new mnemonic of the specified word count, derives a wallet
+    /// from it using the default account creation options, registers it with
+    /// the wallet manager, and returns the mnemonic phrase together with the
+    /// wallet's unique identifier.
+    ///
+    /// # Parameters
+    ///
+    /// * `word_count` – Number of mnemonic words; must be one of `12` or `24`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpvClientError::Wallet`] when:
+    /// * `word_count` is not a supported value (12 or 24).
+    /// * Entropy generation fails (platform RNG unavailable).
+    /// * A wallet with the same root key already exists in the manager.
+    pub async fn create_wallet(
+        &self,
+        word_count: u8,
+    ) -> Result<WalletCreationResult, SpvClientError> {
+        let mnemonic = Mnemonic::generate(word_count as usize, Language::English).map_err(|e| {
+            SpvClientError::Wallet {
+                message: e.to_string(),
+            }
+        })?;
+
+        let phrase = mnemonic.phrase();
+
+        let mut wallet_manager = self.inner.wallet().write().await;
+        let wallet_id = wallet_manager
+            .create_wallet_from_mnemonic(&phrase, "", 0, WalletAccountCreationOptions::Default)
+            .map_err(|e| SpvClientError::Wallet {
+                message: e.to_string(),
+            })?;
+
+        let wallet_id_hex = wallet_id.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+
+        Ok(WalletCreationResult {
+            mnemonic: phrase,
+            wallet_id: wallet_id_hex,
+        })
+    }
+
+    /// Restore a wallet from an existing BIP39 mnemonic phrase.
+    ///
+    /// Parses and validates the mnemonic, derives the wallet using the default
+    /// account creation options, and registers it with the wallet manager.
+    /// This is the inverse of [`SpvClient::create_wallet`] and is used during
+    /// the onboarding flow to recover a previously created wallet.
+    ///
+    /// # Parameters
+    ///
+    /// * `mnemonic` – A space-separated BIP39 mnemonic phrase (12 or 24 words).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpvClientError::Wallet`] when:
+    /// * The mnemonic is not a valid BIP39 phrase.
+    /// * A wallet with the same root key already exists in the manager.
+    pub async fn restore_wallet(&self, mnemonic: String) -> Result<(), SpvClientError> {
+        let mut wallet_manager = self.inner.wallet().write().await;
+        wallet_manager
+            .create_wallet_from_mnemonic(&mnemonic, "", 0, WalletAccountCreationOptions::Default)
+            .map_err(|e| SpvClientError::Wallet {
+                message: e.to_string(),
+            })?;
+
+        Ok(())
+    }
+}
+
+/// Validate a BIP39 mnemonic phrase without creating a wallet.
+///
+/// Returns `true` if `mnemonic` is a well-formed English BIP39 phrase with a
+/// valid checksum, `false` otherwise.  This can be used to provide immediate
+/// feedback to the user during the restore flow before calling
+/// [`SpvClient::restore_wallet`].
+#[uniffi::export]
+pub fn validate_mnemonic(mnemonic: String) -> bool {
+    Mnemonic::validate(&mnemonic, Language::English)
 }
 
 // ============ Stub functions ============
@@ -2931,5 +3039,207 @@ mod tests {
         assert_eq!(low_upper.fee, 226, "LOW should map to 1 duff/byte");
         assert_eq!(medium_mixed.fee, 2260, "Medium should map to 10 duffs/byte");
         assert_eq!(high_upper.fee, 22600, "HIGH should map to 100 duffs/byte");
+    }
+
+    // ---- validate_mnemonic tests ----
+
+    #[test]
+    fn test_validate_mnemonic_valid_12_words() {
+        let valid = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        assert!(validate_mnemonic(valid.to_string()), "valid 12-word mnemonic should return true");
+    }
+
+    #[test]
+    fn test_validate_mnemonic_valid_24_words() {
+        let valid = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+        assert!(validate_mnemonic(valid.to_string()), "valid 24-word mnemonic should return true");
+    }
+
+    #[test]
+    fn test_validate_mnemonic_invalid() {
+        assert!(
+            !validate_mnemonic("not a valid mnemonic phrase at all".to_string()),
+            "invalid phrase should return false"
+        );
+    }
+
+    #[test]
+    fn test_validate_mnemonic_empty() {
+        assert!(!validate_mnemonic(String::new()), "empty string should return false");
+    }
+
+    #[test]
+    fn test_validate_mnemonic_wrong_checksum() {
+        // All 'abandon' words with wrong last word (changes checksum)
+        let bad_checksum =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        assert!(
+            !validate_mnemonic(bad_checksum.to_string()),
+            "mnemonic with bad checksum should return false"
+        );
+    }
+
+    // ---- WalletCreationResult record tests ----
+
+    #[test]
+    fn test_wallet_creation_result_fields() {
+        let result = WalletCreationResult {
+            mnemonic: "test mnemonic".to_string(),
+            wallet_id: "abcdef1234567890".to_string(),
+        };
+        assert_eq!(result.mnemonic, "test mnemonic");
+        assert_eq!(result.wallet_id, "abcdef1234567890");
+    }
+
+    // ---- create_wallet tests ----
+
+    /// `create_wallet` with 12 words succeeds and returns valid mnemonic and wallet_id.
+    #[tokio::test]
+    async fn test_create_wallet_12_words() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let result = client.create_wallet(12).await.expect("create_wallet(12) should succeed");
+
+        // Mnemonic should have 12 words
+        assert_eq!(result.mnemonic.split_whitespace().count(), 12, "should have 12 words");
+        // wallet_id should be a 64-char hex string (32 bytes)
+        assert_eq!(result.wallet_id.len(), 64, "wallet_id should be 64 hex chars");
+        // The mnemonic should be valid
+        assert!(validate_mnemonic(result.mnemonic), "generated mnemonic must be valid");
+    }
+
+    /// `create_wallet` with 24 words succeeds and returns valid mnemonic and wallet_id.
+    #[tokio::test]
+    async fn test_create_wallet_24_words() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let result = client.create_wallet(24).await.expect("create_wallet(24) should succeed");
+
+        assert_eq!(result.mnemonic.split_whitespace().count(), 24, "should have 24 words");
+        assert_eq!(result.wallet_id.len(), 64, "wallet_id should be 64 hex chars");
+        assert!(validate_mnemonic(result.mnemonic), "generated mnemonic must be valid");
+    }
+
+    /// `create_wallet` with an invalid word count returns a `Wallet` error.
+    #[tokio::test]
+    async fn test_create_wallet_invalid_word_count() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let err = client
+            .create_wallet(13)
+            .await
+            .expect_err("create_wallet(13) should fail with unsupported word count");
+
+        assert!(
+            matches!(err, SpvClientError::Wallet { .. }),
+            "expected Wallet error for invalid word count, got: {err:?}"
+        );
+    }
+
+    // ---- restore_wallet tests ----
+
+    /// `restore_wallet` with a valid mnemonic succeeds.
+    #[tokio::test]
+    async fn test_restore_wallet_valid_mnemonic() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        client
+            .restore_wallet(mnemonic.to_string())
+            .await
+            .expect("restore_wallet with valid mnemonic should succeed");
+    }
+
+    /// `restore_wallet` with an invalid mnemonic returns a `Wallet` error.
+    #[tokio::test]
+    async fn test_restore_wallet_invalid_mnemonic() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let err = client
+            .restore_wallet("not a valid mnemonic".to_string())
+            .await
+            .expect_err("restore_wallet with invalid mnemonic should fail");
+
+        assert!(
+            matches!(err, SpvClientError::Wallet { .. }),
+            "expected Wallet error for invalid mnemonic, got: {err:?}"
+        );
+    }
+
+    /// `restore_wallet` called twice with the same mnemonic returns a `Wallet` error
+    /// (wallet already exists).
+    #[tokio::test]
+    async fn test_restore_wallet_duplicate_returns_error() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        client.restore_wallet(mnemonic.to_string()).await.expect("first restore should succeed");
+
+        let err = client
+            .restore_wallet(mnemonic.to_string())
+            .await
+            .expect_err("second restore with same mnemonic should fail");
+
+        assert!(
+            matches!(err, SpvClientError::Wallet { .. }),
+            "expected Wallet error for duplicate wallet, got: {err:?}"
+        );
+    }
+
+    /// `create_wallet` followed by `restore_wallet` with its mnemonic returns a `Wallet`
+    /// error (wallet already exists).
+    #[tokio::test]
+    async fn test_create_then_restore_same_wallet_fails() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest()
+            .without_filters()
+            .without_masternodes()
+            .with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        let result = client.create_wallet(12).await.expect("create_wallet should succeed");
+        let mnemonic = result.mnemonic.clone();
+
+        let err = client
+            .restore_wallet(mnemonic)
+            .await
+            .expect_err("restoring an already-created wallet should fail");
+
+        assert!(
+            matches!(err, SpvClientError::Wallet { .. }),
+            "expected Wallet error when restoring duplicate wallet, got: {err:?}"
+        );
     }
 }
