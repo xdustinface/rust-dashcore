@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::Network;
-use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
+use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+use key_wallet::wallet::managed_wallet_info::{ManagedWalletInfo, TransactionRecord};
 use key_wallet_manager::wallet_manager::WalletManager;
 use tokio::sync::RwLock;
 
@@ -830,40 +831,81 @@ impl SpvClient {
 
 // ============ Transaction history methods ============
 
+/// Maps a [`TransactionRecord`] to the UniFFI-compatible [`TransactionInfo`] type.
+///
+/// `tip_height` is the current chain tip used to compute the confirmation count.
+fn transaction_record_to_info(record: &TransactionRecord, tip_height: u32) -> TransactionInfo {
+    TransactionInfo {
+        txid: record.txid.to_string(),
+        amount: record.net_amount,
+        fee: record.fee.unwrap_or(0),
+        confirmations: record.confirmations(tip_height),
+        timestamp: record.timestamp,
+        is_incoming: record.net_amount >= 0,
+    }
+}
+
 #[uniffi::export]
 impl SpvClient {
-    /// Returns a paginated list of transactions from the wallet's transaction history.
+    /// Returns a paginated list of transactions from the wallet's transaction history,
+    /// sorted by timestamp descending (newest first).
     ///
-    /// Transaction history sync is not yet implemented in the SPV client, so this
-    /// method always returns an empty `Vec`.  It is exported so foreign-language
-    /// bindings can be generated and call-sites can be wired up in advance.
+    /// Reads transaction records from all managed wallets and applies `offset` / `limit`
+    /// pagination.  When `limit` is `0` all remaining transactions after `offset` are
+    /// returned.
     ///
     /// # Parameters
     ///
-    /// * `limit`  – maximum number of transactions to return.
+    /// * `limit`  – maximum number of transactions to return (0 = unlimited).
     /// * `offset` – number of transactions to skip before returning results.
     pub async fn get_transactions(&self, limit: u32, offset: u32) -> Vec<TransactionInfo> {
-        let _ = (limit, offset);
-        vec![]
+        let tip_height = self.inner.tip_height().await;
+        let wallet = self.inner.wallet().read().await;
+
+        let mut records: Vec<&TransactionRecord> = wallet
+            .get_all_wallet_infos()
+            .values()
+            .flat_map(|info| info.transaction_history())
+            .collect();
+
+        // Newest first.
+        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        let limit_usize = if limit == 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
+        records
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit_usize)
+            .map(|record| transaction_record_to_info(record, tip_height))
+            .collect()
     }
 
     /// Looks up a single transaction by its transaction ID.
     ///
-    /// Transaction history sync is not yet implemented in the SPV client, so this
-    /// method always returns `None`.  It is exported so foreign-language bindings
-    /// can be generated and call-sites can be wired up in advance.
+    /// Searches the transaction history of all managed wallets for a record whose
+    /// `txid` matches the provided hex string.  Returns `None` when no match is found.
     pub async fn get_transaction(&self, txid: String) -> Option<TransactionInfo> {
-        let _ = txid;
-        None
+        let tip_height = self.inner.tip_height().await;
+        let wallet = self.inner.wallet().read().await;
+
+        wallet
+            .get_all_wallet_infos()
+            .values()
+            .flat_map(|info| info.transaction_history())
+            .find(|record| record.txid.to_string() == txid)
+            .map(|record| transaction_record_to_info(record, tip_height))
     }
 
-    /// Returns the total number of transactions in the wallet's transaction history.
-    ///
-    /// Transaction history sync is not yet implemented in the SPV client, so this
-    /// method always returns `0`.  It is exported so foreign-language bindings can
-    /// be generated and call-sites can be wired up in advance.
+    /// Returns the total number of transactions across all managed wallets.
     pub async fn get_transaction_count(&self) -> u32 {
-        0
+        let wallet = self.inner.wallet().read().await;
+
+        wallet.get_all_wallet_infos().values().flat_map(|info| info.transaction_history()).count()
+            as u32
     }
 }
 
@@ -1689,9 +1731,9 @@ mod tests {
         );
     }
 
-    // ---- get_transactions / get_transaction / get_transaction_count stub tests ----
+    // ---- get_transactions / get_transaction / get_transaction_count tests ----
 
-    /// `get_transaction_count` always returns 0 (transaction history not yet implemented).
+    /// `get_transaction_count` returns 0 when no wallets are loaded.
     #[tokio::test]
     async fn test_get_transaction_count_returns_zero() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1701,11 +1743,11 @@ mod tests {
         assert_eq!(
             client.get_transaction_count().await,
             0,
-            "get_transaction_count should return 0 (stub)"
+            "get_transaction_count should return 0 when no wallets are loaded"
         );
     }
 
-    /// `get_transactions` always returns an empty vec (transaction history not yet implemented).
+    /// `get_transactions` returns an empty vec when no wallets are loaded.
     #[tokio::test]
     async fn test_get_transactions_returns_empty() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1714,11 +1756,11 @@ mod tests {
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
         assert!(
             client.get_transactions(10, 0).await.is_empty(),
-            "get_transactions should return empty vec (stub)"
+            "get_transactions should return empty vec when no wallets are loaded"
         );
     }
 
-    /// `get_transactions` with various limit/offset values always returns empty (stub).
+    /// `get_transactions` with various limit/offset values returns empty when no wallets are loaded.
     #[tokio::test]
     async fn test_get_transactions_with_limit_and_offset() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1729,7 +1771,7 @@ mod tests {
         assert!(client.get_transactions(100, 50).await.is_empty());
     }
 
-    /// `get_transaction` always returns `None` (transaction history not yet implemented).
+    /// `get_transaction` returns `None` for an unknown txid.
     #[tokio::test]
     async fn test_get_transaction_returns_none() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1738,8 +1780,142 @@ mod tests {
         let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
         assert!(
             client.get_transaction("abcd1234".to_string()).await.is_none(),
-            "get_transaction should return None (stub)"
+            "get_transaction should return None for unknown txid"
         );
+    }
+
+    // ---- get_transactions wiring tests ----
+
+    /// Helper that builds a minimal valid `dashcore::Transaction` with a unique lock_time
+    /// so that each call with a distinct `seed` produces a different txid.
+    fn make_test_tx(seed: u32) -> dashcore::Transaction {
+        dashcore::Transaction {
+            version: 1,
+            lock_time: seed,
+            input: vec![],
+            output: vec![],
+            special_transaction_payload: None,
+        }
+    }
+
+    /// Wires up a wallet with two transaction records and asserts that
+    /// `get_transaction_count`, `get_transactions`, and `get_transaction` all
+    /// return the correct values.
+    #[tokio::test]
+    async fn test_get_transactions_returns_wallet_data() {
+        use key_wallet::wallet::initialization::WalletAccountCreationOptions;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let config = ClientConfig::regtest().without_filters().with_storage_path(temp_dir.path());
+
+        let client = SpvClient::new(config).await.expect("SpvClient construction must succeed");
+
+        // Populate the wallet manager with a wallet and two transaction records.
+        {
+            let mut wallet_guard = client.inner.wallet().write().await;
+            let wallet_id = wallet_guard
+                .create_wallet_from_mnemonic(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                    "",
+                    0,
+                    WalletAccountCreationOptions::default(),
+                )
+                .expect("wallet creation must succeed");
+
+            let tx1 = make_test_tx(1);
+            let tx2 = make_test_tx(2);
+            let txid1 = tx1.txid();
+            let txid2 = tx2.txid();
+
+            let record1 = TransactionRecord::new(tx1, 1_000_000, 50_000, false);
+            let record2 = TransactionRecord::new(tx2, 2_000_000, -30_000, true);
+
+            let info =
+                wallet_guard.get_wallet_info_mut(&wallet_id).expect("wallet info must exist");
+
+            // Insert records directly into the first available account's transaction map.
+            let account = info
+                .accounts_mut()
+                .all_accounts_mut()
+                .into_iter()
+                .next()
+                .expect("wallet must have at least one account");
+
+            account.transactions.insert(txid1, record1);
+            account.transactions.insert(txid2, record2);
+        }
+
+        // Count
+        assert_eq!(client.get_transaction_count().await, 2);
+
+        // Full list (limit 0 = unlimited)
+        let all = client.get_transactions(0, 0).await;
+        assert_eq!(all.len(), 2);
+
+        // Sorted newest-first: record2 has timestamp 2_000_000
+        assert_eq!(all[0].timestamp, 2_000_000);
+        assert_eq!(all[1].timestamp, 1_000_000);
+
+        // Direction flags
+        assert!(!all[0].is_incoming, "negative net_amount => outgoing");
+        assert!(all[1].is_incoming, "positive net_amount => incoming");
+
+        // Amounts
+        assert_eq!(all[0].amount, -30_000);
+        assert_eq!(all[1].amount, 50_000);
+
+        // Pagination: limit=1, offset=0 returns only the newest
+        let page = client.get_transactions(1, 0).await;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].timestamp, 2_000_000);
+
+        // Pagination: offset=1 skips the newest, returns the older one
+        let page2 = client.get_transactions(10, 1).await;
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].timestamp, 1_000_000);
+
+        // get_transaction by txid – build txid string from known tx2 (amount -30_000)
+        let outgoing_txid = all[0].txid.clone();
+        let found = client.get_transaction(outgoing_txid.clone()).await;
+        assert!(found.is_some(), "should find transaction by txid");
+        assert_eq!(found.unwrap().amount, -30_000);
+
+        // get_transaction with unknown txid returns None
+        assert!(client
+            .get_transaction(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            )
+            .await
+            .is_none());
+    }
+
+    /// `transaction_record_to_info` correctly computes confirmations and maps fields.
+    #[test]
+    fn test_transaction_record_to_info_mapping() {
+        use dashcore::hashes::Hash;
+        use dashcore::BlockHash;
+
+        let tx = make_test_tx(10);
+        let txid = tx.txid();
+        let mut record = TransactionRecord::new(tx, 1_700_000_000, 100_000, false);
+        record.mark_confirmed(500, BlockHash::all_zeros());
+        record.set_fee(226);
+
+        // tip at height 505 → 505 - 500 + 1 = 6 confirmations
+        let info = transaction_record_to_info(&record, 505);
+        assert_eq!(info.txid, txid.to_string());
+        assert_eq!(info.amount, 100_000);
+        assert_eq!(info.fee, 226);
+        assert_eq!(info.confirmations, 6);
+        assert_eq!(info.timestamp, 1_700_000_000);
+        assert!(info.is_incoming);
+
+        // Unconfirmed tx → 0 confirmations
+        let tx2 = make_test_tx(11);
+        let record2 = TransactionRecord::new(tx2, 1_700_000_000, -50_000, true);
+        let info2 = transaction_record_to_info(&record2, 1000);
+        assert_eq!(info2.confirmations, 0);
+        assert!(!info2.is_incoming);
     }
 
     // ---- SendResult record tests ----
