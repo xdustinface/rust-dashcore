@@ -106,7 +106,7 @@ impl Denomination {
 /// These form are ambiguous and could have many meanings.  For example, M could denote Mega or Milli.
 /// If any of these forms are used, an error type PossiblyConfusingDenomination is returned.
 const CONFUSING_FORMS: [&str; 9] =
-    ["Msat", "Msats", "MSAT", "MSATS", "MSat", "MSats", "MDASH", "Mdash", "PDASH"];
+    ["Msat", "Msats", "MSAT", "MSATS", "MSat", "MSats", "MDASH", "MDash", "PDASH"];
 
 impl fmt::Display for Denomination {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1958,22 +1958,22 @@ mod tests {
     }
 
     check_format_non_negative_show_denom! {
-        Dash, " BTC";
-        btc_check_fmt_non_negative_show_denom_0, 1, "{:14.1}", "0.00000001";
-        btc_check_fmt_non_negative_show_denom_1, 1, "{:14.8}", "0.00000001";
-        btc_check_fmt_non_negative_show_denom_2, 1, "{:15}", " 0.00000001";
-        btc_check_fmt_non_negative_show_denom_3, 1, "{:015}", "00.00000001";
+        Dash, " DASH";
+        btc_check_fmt_non_negative_show_denom_0, 1, "{:15.1}", "0.00000001";
+        btc_check_fmt_non_negative_show_denom_1, 1, "{:15.8}", "0.00000001";
+        btc_check_fmt_non_negative_show_denom_2, 1, "{:16}", " 0.00000001";
+        btc_check_fmt_non_negative_show_denom_3, 1, "{:016}", "00.00000001";
         btc_check_fmt_non_negative_show_denom_4, 1, "{:.9}", "0.000000010";
-        btc_check_fmt_non_negative_show_denom_5, 1, "{:15.9}", "0.000000010";
-        btc_check_fmt_non_negative_show_denom_6, 1, "{:16.9}", " 0.000000010";
-        btc_check_fmt_non_negative_show_denom_7, 1, "{:016.9}", "00.000000010";
+        btc_check_fmt_non_negative_show_denom_5, 1, "{:16.9}", "0.000000010";
+        btc_check_fmt_non_negative_show_denom_6, 1, "{:17.9}", " 0.000000010";
+        btc_check_fmt_non_negative_show_denom_7, 1, "{:017.9}", "00.000000010";
     }
 
     check_format_non_negative_show_denom! {
-        Dash, " BTC ";
-        btc_check_fmt_non_negative_show_denom_align_0, 1, "{:<15}", "0.00000001";
-        btc_check_fmt_non_negative_show_denom_align_1, 1, "{:^15}", "0.00000001";
-        btc_check_fmt_non_negative_show_denom_align_2, 1, "{:^16}", " 0.00000001";
+        Dash, " DASH ";
+        btc_check_fmt_non_negative_show_denom_align_0, 1, "{:<16}", "0.00000001";
+        btc_check_fmt_non_negative_show_denom_align_1, 1, "{:^16}", "0.00000001";
+        btc_check_fmt_non_negative_show_denom_align_2, 1, "{:^17}", " 0.00000001";
     }
 
     check_format_non_negative! {
@@ -2146,7 +2146,7 @@ mod tests {
         );
         assert_eq!(
             SignedAmount::from_str("-42 satoshi BTC"),
-            Err(ParseAmountError::UnknownDenomination("satoshi DASH".into())),
+            Err(ParseAmountError::UnknownDenomination("satoshi BTC".into())),
         );
     }
 
