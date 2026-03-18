@@ -10,7 +10,10 @@ fuzz/hfuzz_workspace
 
 # Claude Flow and AI assistant files
 .claude-flow.pid
-.claude/
+.claude/settings.local.json
+.claude/worktrees/
+.claude/commands/
+.claude/scheduled_tasks.lock
 .roo/
 .roomodes
 claude-flow
