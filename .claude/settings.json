@@ -34,5 +34,8 @@
   },
   "env": {
     "RUST_BACKTRACE": "1"
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
   }
 }
