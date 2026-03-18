@@ -50,6 +50,18 @@ Located in `src/test_utils/`, feature-gated with `test-utils`:
 
 Integration tests require: `eval $(python3 contrib/setup-dashd.py)`
 
+### Debugging integration test failures
+
+When dashd integration tests fail, use these env vars to retain logs for analysis:
+
+- `DASHD_TEST_LOG=1` — enable per-test console logging (use with `--nocapture`)
+- `DASHD_TEST_RETAIN_DIR=<path>` — retain test data directories on failure (contains dashd logs, SPV storage, wallet state)
+- `DASHD_TEST_RETAIN_ALWAYS=1` — retain even on success
+
+Example: `DASHD_TEST_LOG=1 DASHD_TEST_RETAIN_DIR=/tmp/test-debug cargo test -p dash-spv dashd_sync -- --nocapture`
+
+The retained directory contains dashd's `debug.log` and the SPV client's storage files — check both when diagnosing sync or protocol issues.
+
 ## Feature Flags
 
 - `test-utils` — expose test infrastructure (enables dashcore/test-utils, tempfile, dashcore-rpc)
