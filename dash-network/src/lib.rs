@@ -97,6 +97,14 @@ impl Network {
         }
     }
 
+    /// Returns the currency unit display string for this network.
+    pub const fn currency_unit(self) -> &'static str {
+        match self {
+            Network::Mainnet => "DASH",
+            Network::Testnet | Network::Devnet | Network::Regtest => "tDASH",
+        }
+    }
+
     /// The default P2P port for this network.
     ///
     /// Regtest's default is the typical Dash Core regtest value; devnets can
