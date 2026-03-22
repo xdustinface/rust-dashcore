@@ -7,7 +7,7 @@ use dashcore_rpc::json as rpc_json;
 use dashcore_rpc::{Auth, Client, RpcApi};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -547,5 +547,18 @@ impl WalletFile {
 
         let contents = fs::read_to_string(&wallet_path).expect("Failed to read wallet file");
         serde_json::from_str(&contents).expect("Failed to deserialize wallet file")
+    }
+
+    /// Returns the number of unique txids in the wallet baseline.
+    ///
+    /// The raw `transaction_count` from dashd counts each output separately
+    /// (a single transaction with multiple outputs to the wallet appears
+    /// multiple times), while the SPV wallet stores transactions by txid.
+    pub fn unique_txid_count(&self) -> usize {
+        self.transactions
+            .iter()
+            .filter_map(|tx| tx.get("txid").and_then(|v| v.as_str()))
+            .collect::<HashSet<_>>()
+            .len()
     }
 }
