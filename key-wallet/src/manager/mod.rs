@@ -16,7 +16,7 @@ mod wallet_interface;
 
 pub use events::WalletEvent;
 pub use matching::{check_compact_filters_for_addresses, FilterMatchKey};
-pub use wallet_interface::{BlockProcessingResult, WalletInterface};
+pub use wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 
 use crate::account::AccountCollection;
 use crate::transaction_checking::TransactionContext;
@@ -74,6 +74,12 @@ pub struct CheckTransactionsResult {
     pub is_new_transaction: bool,
     /// New addresses generated during gap limit maintenance
     pub new_addresses: Vec<Address>,
+    /// Total value received across all wallets
+    pub total_received: u64,
+    /// Total value sent across all wallets
+    pub total_sent: u64,
+    /// Addresses involved across all wallets
+    pub involved_addresses: Vec<Address>,
 }
 
 /// High-level wallet manager that manages multiple wallets
@@ -92,6 +98,10 @@ pub struct WalletManager<T: WalletInfoInterface = ManagedWalletInfo> {
     wallets: BTreeMap<WalletId, Wallet>,
     /// Mutable wallet info indexed by wallet ID
     wallet_infos: BTreeMap<WalletId, T>,
+    /// Structural revision counter incremented when wallets or accounts are
+    /// added/removed. Combined with per-wallet account-level revisions to
+    /// produce the total monitor revision.
+    structural_revision: u64,
     /// Event sender for wallet events
     #[cfg(feature = "std")]
     event_sender: broadcast::Sender<WalletEvent>,
@@ -106,6 +116,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
             filter_committed_height: 0,
             wallets: BTreeMap::new(),
             wallet_infos: BTreeMap::new(),
+            structural_revision: 0,
             #[cfg(feature = "std")]
             event_sender: broadcast::Sender::new(DEFAULT_WALLET_EVENT_CAPACITY),
         }
@@ -123,6 +134,17 @@ impl<T: WalletInfoInterface> WalletManager<T> {
     #[cfg(feature = "std")]
     pub fn event_sender(&self) -> &broadcast::Sender<WalletEvent> {
         &self.event_sender
+    }
+
+    /// Return the total monitor revision (structural + per-wallet account revisions).
+    pub fn monitor_revision(&self) -> u64 {
+        self.structural_revision
+            + self.wallet_infos.values().map(|w| w.monitor_revision()).sum::<u64>()
+    }
+
+    /// Increment the structural revision for wallet/account additions or removals.
+    fn bump_structural_revision(&mut self) {
+        self.structural_revision += 1;
     }
 
     /// Create a new wallet from mnemonic and add it to the manager
@@ -176,6 +198,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, wallet_mut);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
         Ok(wallet_id)
     }
 
@@ -282,6 +305,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, final_wallet);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
 
         Ok((serialized_bytes, wallet_id))
     }
@@ -315,6 +339,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, wallet);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
         Ok(wallet_id)
     }
 
@@ -347,6 +372,9 @@ impl<T: WalletInfoInterface> WalletManager<T> {
             self.wallets.remove(wallet_id).ok_or(WalletError::WalletNotFound(*wallet_id))?;
         let info =
             self.wallet_infos.remove(wallet_id).ok_or(WalletError::WalletNotFound(*wallet_id))?;
+        // Absorb the removed wallet's account-level revision so the total
+        // stays monotonically increasing even though we lost a contributor.
+        self.structural_revision += info.monitor_revision() + 1;
         Ok((wallet, info))
     }
 
@@ -407,6 +435,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, wallet);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
         Ok(wallet_id)
     }
 
@@ -454,6 +483,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, wallet);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
         Ok(wallet_id)
     }
 
@@ -498,6 +528,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         self.wallets.insert(wallet_id, wallet);
         self.wallet_infos.insert(wallet_id, managed_info);
+        self.bump_structural_revision();
         Ok(wallet_id)
     }
 
@@ -538,6 +569,16 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                     // If any wallet reports this as new, mark result as new
                     if check_result.is_new_transaction {
                         result.is_new_transaction = true;
+                    }
+
+                    // Aggregate totals and involved addresses across wallets
+                    result.total_received =
+                        result.total_received.saturating_add(check_result.total_received);
+                    result.total_sent = result.total_sent.saturating_add(check_result.total_sent);
+                    for account_match in &check_result.affected_accounts {
+                        for addr_info in account_match.account_type_match.all_involved_addresses() {
+                            result.involved_addresses.push(addr_info.address);
+                        }
                     }
 
                     #[cfg(feature = "std")]
@@ -598,7 +639,10 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
         wallet
             .add_account(account_type, account_xpub)
-            .map_err(|e| WalletError::AccountCreation(e.to_string()))
+            .map_err(|e| WalletError::AccountCreation(e.to_string()))?;
+
+        self.bump_structural_revision();
+        Ok(())
     }
 
     /// Get all accounts in a specific wallet
@@ -1057,6 +1101,16 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                 }
             }
         }
+    }
+
+    /// Get all outpoints from wallet UTXOs across all managed wallets.
+    /// Used for bloom filter construction to detect spends of our UTXOs.
+    pub fn watched_outpoints(&self) -> Vec<dashcore::OutPoint> {
+        let mut outpoints = Vec::new();
+        for info in self.wallet_infos.values() {
+            outpoints.extend(info.utxos().into_iter().map(|u| u.outpoint));
+        }
+        outpoints
     }
 }
 
