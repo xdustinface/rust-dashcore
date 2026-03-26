@@ -1,7 +1,11 @@
 mod account;
+#[cfg(feature = "manager")]
+mod mock_wallet;
 mod utxo;
 mod wallet;
 
-pub use wallet::MockWallet;
-pub use wallet::NonMatchingMockWallet;
+#[cfg(feature = "manager")]
+pub use mock_wallet::MockWallet;
+#[cfg(feature = "manager")]
+pub use mock_wallet::NonMatchingMockWallet;
 pub use wallet::TestWalletContext;
