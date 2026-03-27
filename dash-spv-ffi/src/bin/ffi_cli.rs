@@ -162,6 +162,8 @@ extern "C" fn on_transaction_received(
     txid: *const [u8; 32],
     amount: i64,
     addresses: *const c_char,
+    _tx_data: *const u8,
+    tx_len: usize,
     _user_data: *mut c_void,
 ) {
     let wallet_str = ffi_string_to_rust(wallet_id);
@@ -173,8 +175,8 @@ extern "C" fn on_transaction_received(
     };
     let txid_hex = unsafe { hex::encode(*txid) };
     println!(
-        "[Wallet] TX received: wallet={}..., txid={}, account={}, amount={} duffs, status={:?}, addresses={}",
-        wallet_short, txid_hex, account_index, amount, status, addr_str
+        "[Wallet] TX received: wallet={}..., txid={}, account={}, amount={} duffs, status={:?}, tx_size={}, addresses={}",
+        wallet_short, txid_hex, account_index, amount, status, tx_len, addr_str
     );
 }
 

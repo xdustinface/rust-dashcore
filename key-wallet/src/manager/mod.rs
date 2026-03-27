@@ -602,6 +602,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                                 wallet_id,
                                 status: context,
                                 account_index,
+                                transaction: Box::new(tx.clone()),
                                 txid: tx.txid(),
                                 amount,
                                 addresses,

@@ -348,6 +348,8 @@ extern "C" fn on_transaction_received(
     txid: *const [u8; 32],
     amount: i64,
     _addresses: *const c_char,
+    _tx_data: *const u8,
+    _tx_len: usize,
     user_data: *mut c_void,
 ) {
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {

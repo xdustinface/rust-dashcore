@@ -541,6 +541,8 @@ pub type OnTransactionReceivedCallback = Option<
         txid: *const [u8; 32],
         amount: i64,
         addresses: *const c_char,
+        tx_data: *const u8,
+        tx_len: usize,
         user_data: *mut c_void,
     ),
 >;
@@ -698,6 +700,7 @@ impl FFIWalletEventCallbacks {
                 wallet_id,
                 status,
                 account_index,
+                transaction,
                 txid,
                 amount,
                 addresses,
@@ -709,6 +712,7 @@ impl FFIWalletEventCallbacks {
                     let addresses_str: Vec<String> =
                         addresses.iter().map(|a| a.to_string()).collect();
                     let c_addresses = CString::new(addresses_str.join(",")).unwrap_or_default();
+                    let tx_bytes = dashcore::consensus::serialize(transaction.as_ref());
                     cb(
                         c_wallet_id.as_ptr(),
                         FFITransactionContext::from(*status),
@@ -716,6 +720,8 @@ impl FFIWalletEventCallbacks {
                         txid_bytes as *const [u8; 32],
                         *amount,
                         c_addresses.as_ptr(),
+                        tx_bytes.as_ptr(),
+                        tx_bytes.len(),
                         self.user_data,
                     );
                 }

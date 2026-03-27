@@ -5,9 +5,10 @@
 
 use crate::manager::WalletId;
 use crate::transaction_checking::TransactionContext;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use dashcore::{Address, Amount, SignedAmount, Txid};
+use dashcore::{Address, Amount, SignedAmount, Transaction, Txid};
 
 /// Events emitted by the wallet manager.
 ///
@@ -23,6 +24,8 @@ pub enum WalletEvent {
         status: TransactionContext,
         /// Account index within the wallet.
         account_index: u32,
+        /// The full transaction.
+        transaction: Box<Transaction>,
         /// Transaction ID.
         txid: Txid,
         /// Net amount change (positive for incoming, negative for outgoing).
