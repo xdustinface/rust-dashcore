@@ -405,7 +405,7 @@ impl ManagedCoreAccount {
         tx: &Transaction,
         account_match: &AccountMatch,
         context: TransactionContext,
-        transaction_type: &TransactionType,
+        transaction_type: TransactionType,
     ) -> bool {
         if !self.transactions.contains_key(&tx.txid()) {
             self.record_transaction(tx, account_match, context, transaction_type);
@@ -434,7 +434,7 @@ impl ManagedCoreAccount {
         tx: &Transaction,
         account_match: &AccountMatch,
         context: TransactionContext,
-        transaction_type: &TransactionType,
+        transaction_type: TransactionType,
     ) {
         let net_amount = account_match.received as i64 - account_match.sent as i64;
 
@@ -451,7 +451,7 @@ impl ManagedCoreAccount {
             .map(|info| &info.address)
             .collect();
 
-        // Build input details from UTXOs we own that are being spent
+        // Input details must be built before `update_utxos` removes spent UTXOs
         let mut input_details = Vec::new();
         if !tx.is_coin_base() {
             for (idx, input) in tx.input.iter().enumerate() {
@@ -490,15 +490,15 @@ impl ManagedCoreAccount {
         }
 
         // Determine direction
-        let direction = if *transaction_type == TransactionType::CoinJoin {
+        let has_sent = output_details.iter().any(|d| d.role == OutputRole::Sent);
+        let has_our_outputs = output_details
+            .iter()
+            .any(|d| d.role == OutputRole::Received || d.role == OutputRole::Change);
+        let direction = if transaction_type == TransactionType::CoinJoin {
             TransactionDirection::CoinJoin
-        } else if !output_details.iter().any(|d| d.role == OutputRole::Sent)
-            && !input_details.is_empty()
-        {
+        } else if !has_sent && !input_details.is_empty() && has_our_outputs {
             TransactionDirection::Internal
-        } else if !input_details.is_empty()
-            && output_details.iter().any(|d| d.role == OutputRole::Sent)
-        {
+        } else if !input_details.is_empty() {
             TransactionDirection::Outgoing
         } else {
             TransactionDirection::Incoming
@@ -507,7 +507,7 @@ impl ManagedCoreAccount {
         let tx_record = TransactionRecord::new(
             tx.clone(),
             context,
-            transaction_type.clone(),
+            transaction_type,
             direction,
             input_details,
             output_details,

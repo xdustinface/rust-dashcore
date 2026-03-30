@@ -124,9 +124,9 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             };
 
             if is_new {
-                account.record_transaction(tx, &account_match, context, &tx_type);
+                account.record_transaction(tx, &account_match, context, tx_type);
                 result.state_modified = true;
-            } else if account.confirm_transaction(tx, &account_match, context, &tx_type) {
+            } else if account.confirm_transaction(tx, &account_match, context, tx_type) {
                 result.state_modified = true;
             }
 
@@ -193,6 +193,7 @@ mod tests {
     use crate::managed_account::transaction_record::{OutputRole, TransactionDirection};
     use crate::test_utils::TestWalletContext;
     use crate::transaction_checking::BlockInfo;
+    use crate::transaction_checking::TransactionType;
     use crate::wallet::initialization::WalletAccountCreationOptions;
     use crate::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
     use crate::wallet::{ManagedWalletInfo, Wallet};
@@ -1014,7 +1015,7 @@ mod tests {
         let block_context =
             TransactionContext::InBlock(BlockInfo::new(600, block_hash, 1700000000));
         let tx_type = TransactionRouter::classify_transaction(&tx);
-        let changed = account.confirm_transaction(&tx, &account_match, block_context, &tx_type);
+        let changed = account.confirm_transaction(&tx, &account_match, block_context, tx_type);
         assert!(changed, "Should return true when backfilling a missing record");
 
         // Verify the transaction was recorded with block context
@@ -1065,7 +1066,7 @@ mod tests {
             .first_bip44_managed_account_mut()
             .expect("Should have BIP44 account");
         let tx_type = TransactionRouter::classify_transaction(&tx);
-        let changed = account.confirm_transaction(&tx, &account_match, block_context, &tx_type);
+        let changed = account.confirm_transaction(&tx, &account_match, block_context, tx_type);
         assert!(changed, "Should return true when confirming unconfirmed tx");
 
         let record = account.transactions.get(&txid).expect("Should have record");
@@ -1094,6 +1095,7 @@ mod tests {
 
         let record = ctx.transaction(&txid);
         assert_eq!(record.direction, TransactionDirection::Incoming);
+        assert_eq!(record.transaction_type, TransactionType::Standard);
         assert_eq!(record.net_amount, amount as i64);
 
         // No input details — the inputs are not ours
@@ -1371,6 +1373,10 @@ mod tests {
         let account = managed_wallet.first_coinjoin_managed_account().expect("coinjoin account");
         let record = account.transactions.get(&tx.txid()).expect("should have record");
         assert_eq!(record.direction, TransactionDirection::CoinJoin);
+        assert_eq!(record.transaction_type, TransactionType::CoinJoin);
+        assert!(record.input_details.is_empty(), "CoinJoin test has no funded UTXOs");
+        assert_eq!(record.output_details.len(), 1, "One output to our CoinJoin address");
+        assert_eq!(record.output_details[0].role, OutputRole::Received);
     }
 
     /// Coinbase transaction: direction should be `Incoming` with no input details.
@@ -1390,6 +1396,7 @@ mod tests {
 
         let record = ctx.transaction(&coinbase_tx.txid());
         assert_eq!(record.direction, TransactionDirection::Incoming);
+        assert_eq!(record.transaction_type, TransactionType::Standard);
 
         // Coinbase has no real inputs — input_details should be empty
         assert!(record.input_details.is_empty(), "Coinbase should have no input details");
@@ -1398,6 +1405,64 @@ mod tests {
         assert_eq!(record.output_details.len(), 1);
         assert_eq!(record.output_details[0].role, OutputRole::Received);
         assert_eq!(record.output_details[0].index, 0);
+    }
+
+    /// Transaction with multiple outputs to different receive addresses of the same account.
+    #[tokio::test]
+    async fn test_record_details_multiple_owned_outputs() {
+        let mut ctx = TestWalletContext::new_random();
+        let amount_1 = 300_000u64;
+        let amount_2 = 200_000u64;
+
+        let second_address = ctx
+            .managed_wallet
+            .first_bip44_managed_account_mut()
+            .expect("account")
+            .next_receive_address(Some(&ctx.xpub), true)
+            .expect("second receive address");
+
+        let tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from([1u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+                witness: dashcore::Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: amount_1,
+                    script_pubkey: ctx.receive_address.script_pubkey(),
+                },
+                TxOut {
+                    value: amount_2,
+                    script_pubkey: second_address.script_pubkey(),
+                },
+            ],
+            special_transaction_payload: None,
+        };
+
+        let context = TransactionContext::InBlock(BlockInfo::new(
+            10,
+            BlockHash::from_slice(&[1u8; 32]).expect("hash"),
+            1_700_000_000,
+        ));
+        let result = ctx.check_transaction(&tx, context).await;
+        assert!(result.is_relevant);
+
+        let record = ctx.transaction(&tx.txid());
+        assert_eq!(record.direction, TransactionDirection::Incoming);
+
+        assert_eq!(record.output_details.len(), 2);
+        assert!(
+            record.output_details.iter().all(|d| d.role == OutputRole::Received),
+            "Both outputs should be Received"
+        );
+        assert_eq!(record.output_details[0].index, 0);
+        assert_eq!(record.output_details[1].index, 1);
+
+        assert_eq!(record.net_amount, (amount_1 + amount_2) as i64);
     }
 
     /// Transaction confirmation preserves details fields.

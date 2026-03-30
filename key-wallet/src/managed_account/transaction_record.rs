@@ -158,16 +158,6 @@ impl TransactionRecord {
         self.context = context;
     }
 
-    /// Whether this transaction was initiated by our wallet (outgoing, internal, or coinjoin)
-    pub fn is_ours(&self) -> bool {
-        matches!(
-            self.direction,
-            TransactionDirection::Outgoing
-                | TransactionDirection::Internal
-                | TransactionDirection::CoinJoin
-        )
-    }
-
     /// Check if this is an incoming transaction (positive net amount)
     pub fn is_incoming(&self) -> bool {
         self.net_amount > 0
