@@ -1203,8 +1203,12 @@ impl<'de> Deserialize<'de> for ManagedCoreAccount {
         let spent_outpoints = helper
             .transactions
             .values()
-            .flat_map(|record| &record.transaction.input)
-            .map(|input| input.previous_output)
+            .flat_map(|record| {
+                record
+                    .input_details
+                    .iter()
+                    .map(|d| record.transaction.input[d.index as usize].previous_output)
+            })
             .collect();
 
         Ok(ManagedCoreAccount {

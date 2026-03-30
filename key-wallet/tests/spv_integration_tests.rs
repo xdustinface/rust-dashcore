@@ -138,7 +138,7 @@ async fn test_immature_balance_matures_during_block_processing() {
     // Verify the coinbase is detected and stored as immature
     let wallet_info = manager.get_wallet_info(&wallet_id).expect("Wallet info should exist");
     assert!(
-        wallet_info.immature_transactions().contains(&coinbase_tx),
+        wallet_info.immature_transactions().contains(&coinbase_tx.txid()),
         "Coinbase should be in immature transactions"
     );
     assert_eq!(
@@ -158,7 +158,7 @@ async fn test_immature_balance_matures_during_block_processing() {
     // Verify still immature just before maturity
     let wallet_info = manager.get_wallet_info(&wallet_id).expect("Wallet info should exist");
     assert!(
-        wallet_info.immature_transactions().contains(&coinbase_tx),
+        wallet_info.immature_transactions().contains(&coinbase_tx.txid()),
         "Coinbase should still be immature at height {}",
         maturity_height - 1
     );
@@ -170,7 +170,7 @@ async fn test_immature_balance_matures_during_block_processing() {
     // Verify the coinbase has matured
     let wallet_info = manager.get_wallet_info(&wallet_id).expect("Wallet info should exist");
     assert!(
-        !wallet_info.immature_transactions().contains(&coinbase_tx),
+        !wallet_info.immature_transactions().contains(&coinbase_tx.txid()),
         "Coinbase should no longer be immature after maturity height"
     );
     assert_eq!(

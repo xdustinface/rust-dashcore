@@ -414,7 +414,7 @@ mod tests {
         // Coinbase should be in immature_transactions() since it hasn't matured
         let immature_txs = managed_wallet.immature_transactions();
         assert_eq!(immature_txs.len(), 1, "Should have one immature transaction");
-        assert_eq!(immature_txs[0].txid(), coinbase_tx.txid());
+        assert!(immature_txs.contains(&coinbase_tx.txid()));
 
         // Immature balance should reflect the coinbase value
         assert_eq!(managed_wallet.balance().immature(), 5_000_000_000);

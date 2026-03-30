@@ -12,7 +12,7 @@ use crate::{Network, Utxo, Wallet, WalletCoreBalance};
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Address as DashAddress, Transaction, Txid};
+use dashcore::{Address as DashAddress, Txid};
 
 /// Trait that wallet info types must implement to work with WalletManager
 pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccountOperations {
@@ -81,8 +81,8 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// Get accounts (immutable)
     fn accounts(&self) -> &ManagedAccountCollection;
 
-    /// Get immature transactions
-    fn immature_transactions(&self) -> Vec<Transaction>;
+    /// Get immature transaction IDs
+    fn immature_transactions(&self) -> BTreeSet<Txid>;
 
     /// Return the last fully processed height of the wallet.
     fn synced_height(&self) -> CoreBlockHeight;
@@ -209,10 +209,8 @@ impl WalletInfoInterface for ManagedWalletInfo {
         &self.accounts
     }
 
-    fn immature_transactions(&self) -> Vec<Transaction> {
-        let mut immature_txids: BTreeSet<Txid> = BTreeSet::new();
-
-        // Find txids of immature coinbase UTXOs
+    fn immature_transactions(&self) -> BTreeSet<Txid> {
+        let mut immature_txids = BTreeSet::new();
         for account in self.accounts.all_accounts() {
             for utxo in account.utxos.values() {
                 if utxo.is_coinbase && !utxo.is_mature(self.synced_height()) {
@@ -220,17 +218,7 @@ impl WalletInfoInterface for ManagedWalletInfo {
                 }
             }
         }
-
-        // Get the actual transactions
-        let mut transactions = Vec::new();
-        for account in self.accounts.all_accounts() {
-            for (txid, record) in &account.transactions {
-                if immature_txids.contains(txid) {
-                    transactions.push(record.transaction.clone());
-                }
-            }
-        }
-        transactions
+        immature_txids
     }
 
     fn update_synced_height(&mut self, current_height: u32) {
