@@ -1,0 +1,18 @@
+# Manki — AI Code Review Configuration
+# https://github.com/xdustinface/manki
+
+auto_review: true
+auto_approve: true
+
+exclude_paths:
+  - "*.lock"
+  - "fuzz/**"
+
+instructions: |
+  This is a Rust implementation of the Dash cryptocurrency protocol.
+  Pay special attention to:
+  - Consensus-critical code paths — changes here can cause chain splits
+  - FFI safety for C/Swift bindings in dash-spv-* crates
+  - Proper error handling — prefer Result over unwrap/expect in library code
+  - DIP (Dash Improvement Proposal) compliance for protocol changes
+  - Memory safety in hash/crypto implementations
