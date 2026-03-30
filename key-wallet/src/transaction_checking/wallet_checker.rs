@@ -168,6 +168,10 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             }
             self.increment_transactions();
 
+            if !context.confirmed() {
+                self.unconfirmed_transactions.insert(txid, tx.clone());
+            }
+
             let wallet_net = result.total_received as i64 - result.total_sent as i64;
             tracing::info!(
                 txid = %tx.txid(),
@@ -177,6 +181,8 @@ impl WalletTransactionChecker for ManagedWalletInfo {
                 sent = result.total_sent,
                 "New wallet transaction detected"
             );
+        } else if context.confirmed() {
+            self.unconfirmed_transactions.remove(&txid);
         }
 
         if update_balance {
@@ -1069,5 +1075,144 @@ mod tests {
         assert!(record.is_confirmed());
         assert_eq!(record.height(), Some(700));
         assert_eq!(record.block_info().unwrap().block_hash, block_hash);
+    }
+
+    #[tokio::test]
+    async fn test_unconfirmed_store_mempool_adds_transaction() {
+        let TestWalletContext {
+            mut managed_wallet,
+            mut wallet,
+            receive_address,
+            ..
+        } = TestWalletContext::new_random();
+
+        let tx = Transaction::dummy(&receive_address, 0..1, &[100_000]);
+        let txid = tx.txid();
+
+        let result = managed_wallet
+            .check_core_transaction(&tx, TransactionContext::Mempool, &mut wallet, true, true)
+            .await;
+        assert!(result.is_relevant);
+        assert!(result.is_new_transaction);
+        assert!(managed_wallet.unconfirmed_transactions().contains_key(&txid));
+        assert_eq!(managed_wallet.get_unconfirmed_transaction(&txid).unwrap().txid(), txid);
+    }
+
+    #[tokio::test]
+    async fn test_unconfirmed_store_instantsend_adds_transaction() {
+        let TestWalletContext {
+            mut managed_wallet,
+            mut wallet,
+            receive_address,
+            ..
+        } = TestWalletContext::new_random();
+
+        let tx = Transaction::dummy(&receive_address, 0..1, &[100_000]);
+        let txid = tx.txid();
+
+        let result = managed_wallet
+            .check_core_transaction(&tx, TransactionContext::InstantSend, &mut wallet, true, true)
+            .await;
+        assert!(result.is_relevant);
+        assert!(result.is_new_transaction);
+        assert!(managed_wallet.unconfirmed_transactions().contains_key(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_unconfirmed_store_inblock_skips_store() {
+        let TestWalletContext {
+            mut managed_wallet,
+            mut wallet,
+            receive_address,
+            ..
+        } = TestWalletContext::new_random();
+
+        let tx = Transaction::dummy(&receive_address, 0..1, &[100_000]);
+        let txid = tx.txid();
+
+        let block_ctx = TransactionContext::InBlock(BlockInfo::new(
+            100,
+            BlockHash::from_slice(&[0u8; 32]).expect("block hash"),
+            1234567890,
+        ));
+
+        let result =
+            managed_wallet.check_core_transaction(&tx, block_ctx, &mut wallet, true, true).await;
+        assert!(result.is_relevant);
+        assert!(result.is_new_transaction);
+        assert!(!managed_wallet.unconfirmed_transactions().contains_key(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_unconfirmed_store_removed_on_confirmation() {
+        let TestWalletContext {
+            mut managed_wallet,
+            mut wallet,
+            receive_address,
+            ..
+        } = TestWalletContext::new_random();
+
+        let tx = Transaction::dummy(&receive_address, 0..1, &[100_000]);
+        let txid = tx.txid();
+
+        // First, record as mempool
+        managed_wallet
+            .check_core_transaction(&tx, TransactionContext::Mempool, &mut wallet, true, true)
+            .await;
+        assert!(managed_wallet.unconfirmed_transactions().contains_key(&txid));
+
+        // Confirm in a block
+        let block_ctx = TransactionContext::InBlock(BlockInfo::new(
+            200,
+            BlockHash::from_slice(&[1u8; 32]).expect("block hash"),
+            1234567891,
+        ));
+        managed_wallet.check_core_transaction(&tx, block_ctx, &mut wallet, true, true).await;
+        assert!(!managed_wallet.unconfirmed_transactions().contains_key(&txid));
+    }
+
+    #[tokio::test]
+    async fn test_unconfirmed_store_serde_roundtrip() {
+        use std::collections::HashMap;
+
+        let TestWalletContext {
+            mut managed_wallet,
+            mut wallet,
+            receive_address,
+            ..
+        } = TestWalletContext::new_random();
+
+        let tx = Transaction::dummy(&receive_address, 0..1, &[100_000]);
+        let txid = tx.txid();
+
+        managed_wallet
+            .check_core_transaction(&tx, TransactionContext::Mempool, &mut wallet, true, true)
+            .await;
+        assert!(managed_wallet.unconfirmed_transactions().contains_key(&txid));
+
+        // Roundtrip just the unconfirmed map via JSON (using a Vec encoding)
+        let map = managed_wallet.unconfirmed_transactions();
+        let entries: Vec<_> = map.iter().collect();
+        let serialized = serde_json::to_string(&entries).expect("serialize");
+        let deserialized: Vec<(Txid, Transaction)> =
+            serde_json::from_str(&serialized).expect("deserialize");
+        let restored: HashMap<Txid, Transaction> = deserialized.into_iter().collect();
+
+        assert!(restored.contains_key(&txid));
+        assert_eq!(restored.get(&txid).unwrap().txid(), txid);
+    }
+
+    #[test]
+    fn test_unconfirmed_store_serde_default_backward_compat() {
+        // Deserializing a ManagedWalletInfo that was serialized without the
+        // `unconfirmed_transactions` field should produce an empty map.
+        let info = ManagedWalletInfo::new(Network::Testnet, [0u8; 32]);
+        let mut json = serde_json::to_value(&info).expect("serialize");
+
+        // Remove the field to simulate old data
+        json.as_object_mut().unwrap().remove("unconfirmed_transactions");
+
+        let restored: ManagedWalletInfo = serde_json::from_value(json).expect("deserialize");
+        assert!(restored.unconfirmed_transactions().is_empty());
     }
 }

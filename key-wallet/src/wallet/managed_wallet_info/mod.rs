@@ -20,10 +20,10 @@ use crate::account::ManagedAccountCollection;
 use crate::Network;
 use alloc::string::String;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::Txid;
+use dashcore::{Transaction, Txid};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Information about a managed wallet
 ///
@@ -50,6 +50,10 @@ pub struct ManagedWalletInfo {
     /// Transactions that have received an InstantSend lock.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) instant_send_locks: HashSet<Txid>,
+    /// Full transactions retained while unconfirmed, for re-broadcast on restart.
+    /// Keyed by txid, removed when the transaction is confirmed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) unconfirmed_transactions: HashMap<Txid, Transaction>,
 }
 
 impl ManagedWalletInfo {
@@ -64,6 +68,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::new(),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            unconfirmed_transactions: HashMap::new(),
         }
     }
 
@@ -78,6 +83,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::new(),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            unconfirmed_transactions: HashMap::new(),
         }
     }
 
@@ -92,6 +98,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::from_account_collection(&wallet.accounts),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            unconfirmed_transactions: HashMap::new(),
         }
     }
 
@@ -121,6 +128,16 @@ impl ManagedWalletInfo {
     /// Increment the transaction count
     pub fn increment_transactions(&mut self) {
         self.metadata.total_transactions += 1;
+    }
+
+    /// Get an unconfirmed transaction by txid.
+    pub fn get_unconfirmed_transaction(&self, txid: &Txid) -> Option<&Transaction> {
+        self.unconfirmed_transactions.get(txid)
+    }
+
+    /// Get all unconfirmed transactions for re-broadcast.
+    pub fn unconfirmed_transactions(&self) -> &HashMap<Txid, Transaction> {
+        &self.unconfirmed_transactions
     }
 }
 
