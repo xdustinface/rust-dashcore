@@ -732,7 +732,7 @@ pub unsafe extern "C" fn managed_core_account_get_transactions(
         ffi_record.fee = record.fee.unwrap_or(0);
 
         // Copy is_ours flag
-        ffi_record.is_ours = record.is_ours;
+        ffi_record.is_ours = record.is_ours();
     }
 
     *transactions_out = ptr;

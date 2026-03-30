@@ -14,6 +14,10 @@ use crate::account::TransactionRecord;
 use crate::derivation_bls_bip32::ExtendedBLSPubKey;
 #[cfg(any(feature = "bls", feature = "eddsa"))]
 use crate::managed_account::address_pool::PublicKeyType;
+use crate::managed_account::transaction_record::{
+    InputDetail, OutputDetail, OutputRole, TransactionDirection,
+};
+use crate::transaction_checking::transaction_router::TransactionType;
 use crate::transaction_checking::{AccountMatch, TransactionContext};
 use crate::utxo::Utxo;
 use crate::wallet::balance::WalletCoreBalance;
@@ -401,9 +405,10 @@ impl ManagedCoreAccount {
         tx: &Transaction,
         account_match: &AccountMatch,
         context: TransactionContext,
+        transaction_type: &TransactionType,
     ) -> bool {
         if !self.transactions.contains_key(&tx.txid()) {
-            self.record_transaction(tx, account_match, context);
+            self.record_transaction(tx, account_match, context, transaction_type);
             return true;
         }
 
@@ -429,9 +434,85 @@ impl ManagedCoreAccount {
         tx: &Transaction,
         account_match: &AccountMatch,
         context: TransactionContext,
+        transaction_type: &TransactionType,
     ) {
         let net_amount = account_match.received as i64 - account_match.sent as i64;
-        let tx_record = TransactionRecord::new(tx.clone(), context, net_amount, net_amount < 0);
+
+        let receive_addrs: HashSet<_> = account_match
+            .account_type_match
+            .involved_receive_addresses()
+            .iter()
+            .map(|info| &info.address)
+            .collect();
+        let change_addrs: HashSet<_> = account_match
+            .account_type_match
+            .involved_change_addresses()
+            .iter()
+            .map(|info| &info.address)
+            .collect();
+
+        // Build input details from UTXOs we own that are being spent
+        let mut input_details = Vec::new();
+        if !tx.is_coin_base() {
+            for (idx, input) in tx.input.iter().enumerate() {
+                if let Some(utxo) = self.utxos.get(&input.previous_output) {
+                    input_details.push(InputDetail {
+                        index: idx as u32,
+                        value: utxo.txout.value,
+                        address: utxo.address.clone(),
+                    });
+                }
+            }
+        }
+
+        // Build output details — only annotate relevant outputs
+        let mut output_details = Vec::new();
+        for (idx, output) in tx.output.iter().enumerate() {
+            if let Ok(addr) = Address::from_script(&output.script_pubkey, self.network) {
+                if receive_addrs.contains(&addr) {
+                    output_details.push(OutputDetail {
+                        index: idx as u32,
+                        role: OutputRole::Received,
+                    });
+                } else if change_addrs.contains(&addr) {
+                    output_details.push(OutputDetail {
+                        index: idx as u32,
+                        role: OutputRole::Change,
+                    });
+                } else if !input_details.is_empty() {
+                    // Only mark as Sent if we created this tx (have inputs)
+                    output_details.push(OutputDetail {
+                        index: idx as u32,
+                        role: OutputRole::Sent,
+                    });
+                }
+            }
+        }
+
+        // Determine direction
+        let direction = if *transaction_type == TransactionType::CoinJoin {
+            TransactionDirection::CoinJoin
+        } else if !output_details.iter().any(|d| d.role == OutputRole::Sent)
+            && !input_details.is_empty()
+        {
+            TransactionDirection::Internal
+        } else if !input_details.is_empty()
+            && output_details.iter().any(|d| d.role == OutputRole::Sent)
+        {
+            TransactionDirection::Outgoing
+        } else {
+            TransactionDirection::Incoming
+        };
+
+        let tx_record = TransactionRecord::new(
+            tx.clone(),
+            context,
+            transaction_type.clone(),
+            direction,
+            input_details,
+            output_details,
+            net_amount,
+        );
 
         self.transactions.insert(tx.txid(), tx_record);
 

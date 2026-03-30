@@ -11,6 +11,7 @@ use dashcore::blockdata::transaction::Transaction;
 
 /// Classification of transaction types for routing
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TransactionType {
     /// Standard payment transaction
     Standard,
