@@ -1195,6 +1195,10 @@ mod tests {
         assert!(change.is_some(), "Should have a Change output detail");
         assert_eq!(sent.unwrap().index, 0);
         assert_eq!(change.unwrap().index, 1);
+
+        // net_amount should be negative: received change minus spent input
+        assert!(record.net_amount < 0, "Outgoing tx net_amount should be negative");
+        assert_eq!(record.net_amount, change_amount as i64 - funding_value as i64);
     }
 
     /// Internal/self-transfer: we send funds back to our own receive address.
@@ -1289,6 +1293,10 @@ mod tests {
             record.output_details.iter().any(|d| d.role == OutputRole::Change),
             "Internal tx should have a Change output detail"
         );
+
+        // net_amount for internal tx: received outputs minus spent inputs (equals negative fee)
+        let expected_net = (self_amount + change_amount) as i64 - funding_value as i64;
+        assert_eq!(record.net_amount, expected_net);
     }
 
     /// CoinJoin transaction: direction should be `CoinJoin` regardless of output roles.
@@ -1578,6 +1586,9 @@ mod tests {
             !record.output_details.iter().any(|d| d.role == OutputRole::Change),
             "Sweep tx should have no Change output details"
         );
+
+        // net_amount: nothing received, spent entire funding value
+        assert_eq!(record.net_amount, -(funding_value as i64));
     }
 
     /// Outgoing transaction with an OP_RETURN output gets `Unspendable` role.
@@ -1714,5 +1725,8 @@ mod tests {
         assert_eq!(record.input_details.len(), 1);
         assert_eq!(record.output_details.len(), 1);
         assert_eq!(record.output_details[0].role, OutputRole::Unspendable);
+
+        // net_amount: nothing received, spent entire funding value
+        assert_eq!(record.net_amount, -(funding_value as i64));
     }
 }

@@ -259,6 +259,30 @@ mod tests {
         assert!(!outgoing.is_incoming());
         assert!(outgoing.is_outgoing());
         assert_eq!(outgoing.amount(), 50000);
+
+        let internal = TransactionRecord::new(
+            tx.clone(),
+            TransactionContext::Mempool,
+            TransactionType::Standard,
+            TransactionDirection::Internal,
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert!(!internal.is_incoming());
+        assert!(!internal.is_outgoing());
+
+        let coinjoin = TransactionRecord::new(
+            tx,
+            TransactionContext::Mempool,
+            TransactionType::CoinJoin,
+            TransactionDirection::CoinJoin,
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert!(!coinjoin.is_incoming());
+        assert!(!coinjoin.is_outgoing());
     }
 
     #[test]

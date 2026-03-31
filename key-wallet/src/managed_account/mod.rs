@@ -414,6 +414,12 @@ impl ManagedCoreAccount {
 
         let mut changed = false;
         if let Some(tx_record) = self.transactions.get_mut(&tx.txid()) {
+            debug_assert_eq!(
+                tx_record.transaction_type,
+                transaction_type,
+                "transaction_type changed between recordings for {}",
+                tx.txid()
+            );
             if tx_record.context != context {
                 let was_confirmed = tx_record.context.confirmed();
                 tx_record.update_context(context);
