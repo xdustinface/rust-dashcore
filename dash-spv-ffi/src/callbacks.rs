@@ -533,6 +533,9 @@ impl FFINetworkEventCallbacks {
 /// The `wallet_id`, `addresses` string pointers and the `txid` hash pointer
 /// are borrowed and only valid for the duration of the callback. Callers must
 /// copy any data they need to retain after the callback returns.
+///
+/// `tx_data` points to the consensus-serialized transaction bytes and is
+/// only valid for the duration of the callback.
 pub type OnTransactionReceivedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
@@ -541,6 +544,8 @@ pub type OnTransactionReceivedCallback = Option<
         txid: *const [u8; 32],
         amount: i64,
         addresses: *const c_char,
+        tx_data: *const u8,
+        tx_len: usize,
         user_data: *mut c_void,
     ),
 >;
@@ -701,6 +706,7 @@ impl FFIWalletEventCallbacks {
                 txid,
                 amount,
                 addresses,
+                transaction,
             } => {
                 if let Some(cb) = self.on_transaction_received {
                     let wallet_id_hex = hex::encode(wallet_id);
@@ -709,6 +715,7 @@ impl FFIWalletEventCallbacks {
                     let addresses_str: Vec<String> =
                         addresses.iter().map(|a| a.to_string()).collect();
                     let c_addresses = CString::new(addresses_str.join(",")).unwrap_or_default();
+                    let tx_bytes = dashcore::consensus::serialize(transaction.as_ref());
                     cb(
                         c_wallet_id.as_ptr(),
                         FFITransactionContext::from(*status),
@@ -716,6 +723,8 @@ impl FFIWalletEventCallbacks {
                         txid_bytes as *const [u8; 32],
                         *amount,
                         c_addresses.as_ptr(),
+                        tx_bytes.as_ptr(),
+                        tx_bytes.len(),
                         self.user_data,
                     );
                 }
