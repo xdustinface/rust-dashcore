@@ -1567,4 +1567,89 @@ mod tests {
             "Sweep tx should have no Change output details"
         );
     }
+
+    /// Outgoing transaction with an OP_RETURN output gets `Unspendable` role.
+    #[tokio::test]
+    async fn test_record_details_op_return_output_is_unspendable() {
+        let mut ctx = TestWalletContext::new_random();
+        let funding_value = 1_000_000u64;
+
+        // Fund the wallet
+        let funding_tx = Transaction::dummy(&ctx.receive_address, 0..1, &[funding_value]);
+        let funding_context = TransactionContext::InBlock(BlockInfo::new(
+            10,
+            BlockHash::from_slice(&[1u8; 32]).expect("hash"),
+            1_700_000_000,
+        ));
+        ctx.check_transaction(&funding_tx, funding_context).await;
+
+        // Get a change address
+        let change_address = ctx
+            .managed_wallet
+            .first_bip44_managed_account_mut()
+            .expect("account")
+            .next_change_address(Some(&ctx.xpub), true)
+            .expect("change address");
+
+        // Build outgoing tx with an OP_RETURN output
+        let external_address = Address::p2pkh(
+            &dashcore::PublicKey::from_slice(&[0x02; 33]).expect("pubkey"),
+            Network::Testnet,
+        );
+        let send_amount = 400_000u64;
+        let change_amount = funding_value - send_amount - 1_000;
+        let spend_tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: funding_tx.txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+                witness: dashcore::Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: send_amount,
+                    script_pubkey: external_address.script_pubkey(),
+                },
+                TxOut {
+                    value: 0,
+                    script_pubkey: ScriptBuf::new_op_return(&[0x01, 0x02, 0x03]),
+                },
+                TxOut {
+                    value: change_amount,
+                    script_pubkey: change_address.script_pubkey(),
+                },
+            ],
+            special_transaction_payload: None,
+        };
+
+        let spend_context = TransactionContext::InBlock(BlockInfo::new(
+            11,
+            BlockHash::from_slice(&[2u8; 32]).expect("hash"),
+            1_700_000_100,
+        ));
+        let spend_result = ctx.check_transaction(&spend_tx, spend_context).await;
+        assert!(spend_result.is_relevant);
+
+        let record = ctx.transaction(&spend_tx.txid());
+        assert_eq!(record.direction, TransactionDirection::Outgoing);
+        assert_eq!(record.output_details.len(), 3);
+
+        let sent = record.output_details.iter().find(|d| d.role == OutputRole::Sent);
+        let unspendable = record.output_details.iter().find(|d| d.role == OutputRole::Unspendable);
+        let change = record.output_details.iter().find(|d| d.role == OutputRole::Change);
+
+        assert!(sent.is_some(), "Should have a Sent output detail");
+        assert_eq!(sent.unwrap().index, 0);
+
+        assert!(unspendable.is_some(), "OP_RETURN output should be Unspendable");
+        assert_eq!(unspendable.unwrap().index, 1);
+
+        assert!(change.is_some(), "Should have a Change output detail");
+        assert_eq!(change.unwrap().index, 2);
+    }
 }

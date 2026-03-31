@@ -470,28 +470,20 @@ impl ManagedCoreAccount {
         // `account_match.sent > 0` serves as a secondary indicator.
         let has_inputs = !input_details.is_empty() || account_match.sent > 0;
 
-        // Build output details — only annotate relevant outputs
+        // Build output details — annotate every output with its role
         let mut output_details = Vec::new();
         for (idx, output) in tx.output.iter().enumerate() {
-            if let Ok(addr) = Address::from_script(&output.script_pubkey, self.network) {
-                if receive_addrs.contains(&addr) {
-                    output_details.push(OutputDetail {
-                        index: idx as u32,
-                        role: OutputRole::Received,
-                    });
-                } else if change_addrs.contains(&addr) {
-                    output_details.push(OutputDetail {
-                        index: idx as u32,
-                        role: OutputRole::Change,
-                    });
-                } else if has_inputs {
-                    // Only mark as Sent if we created this tx
-                    output_details.push(OutputDetail {
-                        index: idx as u32,
-                        role: OutputRole::Sent,
-                    });
-                }
-            }
+            let role = match Address::from_script(&output.script_pubkey, self.network) {
+                Ok(addr) if receive_addrs.contains(&addr) => OutputRole::Received,
+                Ok(addr) if change_addrs.contains(&addr) => OutputRole::Change,
+                Ok(_) if has_inputs => OutputRole::Sent,
+                Ok(_) => continue,
+                Err(_) => OutputRole::Unspendable,
+            };
+            output_details.push(OutputDetail {
+                index: idx as u32,
+                role,
+            });
         }
 
         // Determine direction

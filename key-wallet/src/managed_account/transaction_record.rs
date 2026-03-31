@@ -47,6 +47,8 @@ pub enum OutputRole {
     Change,
     /// Output to counterparty address
     Sent,
+    /// Unspendable output (OP_RETURN, non-standard, bare multisig)
+    Unspendable,
 }
 
 /// Direction of a transaction from the wallet's perspective

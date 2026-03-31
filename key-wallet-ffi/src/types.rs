@@ -1,6 +1,8 @@
 //! Common types for FFI interface
 
 use dashcore::hashes::Hash;
+use key_wallet::managed_account::transaction_record::{OutputRole, TransactionDirection};
+use key_wallet::transaction_checking::transaction_router::TransactionType;
 use key_wallet::transaction_checking::{BlockInfo, TransactionContext};
 use key_wallet::{Network, Wallet};
 use std::os::raw::c_char;
@@ -565,6 +567,59 @@ mod tests {
             matches!(ctx, TransactionContext::InChainLockedBlock(info) if info.height() == 1000)
         );
     }
+
+    #[test]
+    fn test_ffi_transaction_direction_from() {
+        assert_eq!(
+            FFITransactionDirection::from(TransactionDirection::Incoming),
+            FFITransactionDirection::Incoming
+        );
+        assert_eq!(
+            FFITransactionDirection::from(TransactionDirection::Outgoing),
+            FFITransactionDirection::Outgoing
+        );
+        assert_eq!(
+            FFITransactionDirection::from(TransactionDirection::Internal),
+            FFITransactionDirection::Internal
+        );
+        assert_eq!(
+            FFITransactionDirection::from(TransactionDirection::CoinJoin),
+            FFITransactionDirection::CoinJoin
+        );
+    }
+
+    #[test]
+    fn test_ffi_transaction_type_from() {
+        assert_eq!(
+            FFITransactionType::from(TransactionType::Standard),
+            FFITransactionType::Standard
+        );
+        assert_eq!(
+            FFITransactionType::from(TransactionType::CoinJoin),
+            FFITransactionType::CoinJoin
+        );
+        assert_eq!(
+            FFITransactionType::from(TransactionType::ProviderRegistration),
+            FFITransactionType::ProviderRegistration
+        );
+        assert_eq!(
+            FFITransactionType::from(TransactionType::AssetLock),
+            FFITransactionType::AssetLock
+        );
+        assert_eq!(
+            FFITransactionType::from(TransactionType::Coinbase),
+            FFITransactionType::Coinbase
+        );
+        assert_eq!(FFITransactionType::from(TransactionType::Ignored), FFITransactionType::Ignored);
+    }
+
+    #[test]
+    fn test_ffi_output_role_from() {
+        assert_eq!(FFIOutputRole::from(OutputRole::Received), FFIOutputRole::Received);
+        assert_eq!(FFIOutputRole::from(OutputRole::Change), FFIOutputRole::Change);
+        assert_eq!(FFIOutputRole::from(OutputRole::Sent), FFIOutputRole::Sent);
+        assert_eq!(FFIOutputRole::from(OutputRole::Unspendable), FFIOutputRole::Unspendable);
+    }
 }
 
 /// Address type enumeration
@@ -912,4 +967,96 @@ impl From<TransactionContext> for FFITransactionContextDetails {
             block_info,
         }
     }
+}
+
+/// FFI-compatible transaction direction
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFITransactionDirection {
+    Incoming = 0,
+    Outgoing = 1,
+    Internal = 2,
+    CoinJoin = 3,
+}
+
+impl From<TransactionDirection> for FFITransactionDirection {
+    fn from(dir: TransactionDirection) -> Self {
+        match dir {
+            TransactionDirection::Incoming => FFITransactionDirection::Incoming,
+            TransactionDirection::Outgoing => FFITransactionDirection::Outgoing,
+            TransactionDirection::Internal => FFITransactionDirection::Internal,
+            TransactionDirection::CoinJoin => FFITransactionDirection::CoinJoin,
+        }
+    }
+}
+
+/// FFI-compatible transaction type
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFITransactionType {
+    Standard = 0,
+    CoinJoin = 1,
+    ProviderRegistration = 2,
+    ProviderUpdateRegistrar = 3,
+    ProviderUpdateService = 4,
+    ProviderUpdateRevocation = 5,
+    AssetLock = 6,
+    AssetUnlock = 7,
+    Coinbase = 8,
+    Ignored = 9,
+}
+
+impl From<TransactionType> for FFITransactionType {
+    fn from(tt: TransactionType) -> Self {
+        match tt {
+            TransactionType::Standard => FFITransactionType::Standard,
+            TransactionType::CoinJoin => FFITransactionType::CoinJoin,
+            TransactionType::ProviderRegistration => FFITransactionType::ProviderRegistration,
+            TransactionType::ProviderUpdateRegistrar => FFITransactionType::ProviderUpdateRegistrar,
+            TransactionType::ProviderUpdateService => FFITransactionType::ProviderUpdateService,
+            TransactionType::ProviderUpdateRevocation => {
+                FFITransactionType::ProviderUpdateRevocation
+            }
+            TransactionType::AssetLock => FFITransactionType::AssetLock,
+            TransactionType::AssetUnlock => FFITransactionType::AssetUnlock,
+            TransactionType::Coinbase => FFITransactionType::Coinbase,
+            TransactionType::Ignored => FFITransactionType::Ignored,
+        }
+    }
+}
+
+/// FFI-compatible output role
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFIOutputRole {
+    Received = 0,
+    Change = 1,
+    Sent = 2,
+    Unspendable = 3,
+}
+
+impl From<OutputRole> for FFIOutputRole {
+    fn from(role: OutputRole) -> Self {
+        match role {
+            OutputRole::Received => FFIOutputRole::Received,
+            OutputRole::Change => FFIOutputRole::Change,
+            OutputRole::Sent => FFIOutputRole::Sent,
+            OutputRole::Unspendable => FFIOutputRole::Unspendable,
+        }
+    }
+}
+
+/// FFI-compatible input detail
+#[repr(C)]
+pub struct FFIInputDetail {
+    pub index: u32,
+    pub value: u64,
+    pub address: *const c_char,
+}
+
+/// FFI-compatible output detail
+#[repr(C)]
+pub struct FFIOutputDetail {
+    pub index: u32,
+    pub role: FFIOutputRole,
 }
