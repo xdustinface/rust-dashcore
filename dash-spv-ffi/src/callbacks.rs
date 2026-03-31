@@ -718,7 +718,7 @@ impl FFIWalletEventCallbacks {
                     let tx_bytes = dashcore::consensus::serialize(transaction.as_ref());
                     cb(
                         c_wallet_id.as_ptr(),
-                        FFITransactionContext::from(*status),
+                        FFITransactionContext::from(status.clone()),
                         *account_index,
                         txid_bytes as *const [u8; 32],
                         *amount,
@@ -741,7 +741,7 @@ impl FFIWalletEventCallbacks {
                     cb(
                         c_wallet_id.as_ptr(),
                         txid_bytes as *const [u8; 32],
-                        FFITransactionContext::from(*status),
+                        FFITransactionContext::from(status.clone()),
                         self.user_data,
                     );
                 }

@@ -557,7 +557,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                 let check_result = wallet_info
                     .check_core_transaction(
                         tx,
-                        context,
+                        context.clone(),
                         wallet,
                         update_state_if_found,
                         update_balance,
@@ -602,7 +602,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
 
                             let event = WalletEvent::TransactionReceived {
                                 wallet_id,
-                                status: context,
+                                status: context.clone(),
                                 account_index,
                                 txid: tx.txid(),
                                 amount,
@@ -616,7 +616,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                         let event = WalletEvent::TransactionStatusChanged {
                             wallet_id,
                             txid: tx.txid(),
-                            status: context,
+                            status: context.clone(),
                         };
                         let _ = self.event_sender.send(event);
                     }

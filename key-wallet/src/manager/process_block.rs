@@ -9,8 +9,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::fmt::Write as _;
+use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Address, Block, Transaction, Txid};
+use dashcore::{Address, Block, Transaction};
 use tokio::sync::broadcast;
 
 #[async_trait]
@@ -49,12 +50,11 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
     async fn process_mempool_transaction(
         &mut self,
         tx: &Transaction,
-        is_instant_send: bool,
+        instant_lock: Option<InstantLock>,
     ) -> MempoolTransactionResult {
-        let context = if is_instant_send {
-            TransactionContext::InstantSend
-        } else {
-            TransactionContext::Mempool
+        let context = match instant_lock {
+            Some(lock) => TransactionContext::InstantSend(lock),
+            None => TransactionContext::Mempool,
         };
         let snapshot = self.snapshot_balances();
         let check_result = self.check_transaction_in_all_wallets(tx, context, true, false).await;
@@ -170,12 +170,13 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         self.event_sender.subscribe()
     }
 
-    fn process_instant_send_lock(&mut self, txid: Txid) {
+    fn process_instant_send_lock(&mut self, instant_lock: InstantLock) {
+        let txid = instant_lock.txid;
         let snapshot = self.snapshot_balances();
 
         let mut affected_wallets = Vec::new();
         for (wallet_id, info) in self.wallet_infos.iter_mut() {
-            if info.mark_instant_send_utxos(&txid) {
+            if info.mark_instant_send_utxos(&txid, &instant_lock) {
                 affected_wallets.push(*wallet_id);
             }
         }
@@ -184,11 +185,11 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             return;
         }
 
-        for wallet_id in affected_wallets {
+        for wallet_id in &affected_wallets {
             let event = WalletEvent::TransactionStatusChanged {
-                wallet_id,
+                wallet_id: *wallet_id,
                 txid,
-                status: TransactionContext::InstantSend,
+                status: TransactionContext::InstantSend(instant_lock.clone()),
             };
             let _ = self.event_sender().send(event);
         }
@@ -279,7 +280,7 @@ mod tests {
 
         // Relevant tx should emit BalanceUpdated
         let tx = create_tx_paying_to(&addr, 0xaa);
-        manager.process_mempool_transaction(&tx, false).await;
+        manager.process_mempool_transaction(&tx, None).await;
 
         let mut found = false;
         while let Ok(event) = rx.try_recv() {
@@ -316,7 +317,7 @@ mod tests {
             }],
             special_transaction_payload: None,
         };
-        manager.process_mempool_transaction(&unrelated_tx, false).await;
+        manager.process_mempool_transaction(&unrelated_tx, None).await;
         assert!(rx.try_recv().is_err(), "should not emit events for irrelevant transaction");
     }
 
@@ -349,7 +350,7 @@ mod tests {
         let (mut manager, _wallet_id, addr) = setup_manager_with_wallet();
         let tx = create_tx_paying_to(&addr, 0xaa);
 
-        let result = manager.process_mempool_transaction(&tx, false).await;
+        let result = manager.process_mempool_transaction(&tx, None).await;
 
         assert!(result.is_relevant);
         assert_eq!(result.net_amount, TX_AMOUNT as i64);
@@ -436,7 +437,7 @@ mod tests {
         let rev_before_mempool = manager.monitor_revision();
         let addr = manager.monitored_addresses()[0].clone();
         let tx = create_tx_paying_to(&addr, 0xd0);
-        let _result = manager.process_mempool_transaction(&tx, false).await;
+        let _result = manager.process_mempool_transaction(&tx, None).await;
         assert!(
             manager.monitor_revision() > rev_before_mempool,
             "mempool tx paying to our address should bump revision (UTXO added)"
@@ -444,7 +445,7 @@ mod tests {
         let rev_after_mempool = manager.monitor_revision();
 
         // process_instant_send_lock does NOT bump (no outpoint set change)
-        manager.process_instant_send_lock(tx.txid());
+        manager.process_instant_send_lock(dummy_instant_lock(tx.txid()));
         assert_eq!(
             manager.monitor_revision(),
             rev_after_mempool,

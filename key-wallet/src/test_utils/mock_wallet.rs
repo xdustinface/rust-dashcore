@@ -2,6 +2,7 @@ use crate::manager::MempoolTransactionResult;
 use crate::manager::{BlockProcessingResult, WalletEvent, WalletInterface};
 use crate::transaction_checking::TransactionContext;
 use dashcore::address::NetworkUnchecked;
+use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, OutPoint, Transaction, Txid};
 use std::collections::BTreeMap;
@@ -11,6 +12,9 @@ use tokio::sync::{broadcast, Mutex};
 
 // Type alias for transaction effects map
 type TransactionEffectsMap = Arc<Mutex<BTreeMap<Txid, (i64, Vec<String>)>>>;
+
+// Type alias for captured IS lock payloads
+type InstantLockCaptures = Arc<Mutex<Vec<(Txid, Option<InstantLock>)>>>;
 
 pub struct MockWallet {
     processed_blocks: Arc<Mutex<Vec<(dashcore::BlockHash, u32)>>>,
@@ -29,6 +33,9 @@ pub struct MockWallet {
     mempool_new_addresses: Vec<Address>,
     /// Recorded status change notifications for test assertions.
     status_changes: Arc<Mutex<Vec<(Txid, TransactionContext)>>>,
+    /// Captured `InstantLock` payloads from both `process_mempool_transaction` and
+    /// `process_instant_send_lock`, for test assertions.
+    pub processed_instant_locks: InstantLockCaptures,
     /// Monitor revision counter for staleness detection.
     monitor_revision: u64,
 }
@@ -53,6 +60,7 @@ impl MockWallet {
             outpoints: Vec::new(),
             mempool_new_addresses: Vec::new(),
             status_changes: Arc::new(Mutex::new(Vec::new())),
+            processed_instant_locks: Arc::new(Mutex::new(Vec::new())),
             monitor_revision: 0,
         }
     }
@@ -113,10 +121,14 @@ impl WalletInterface for MockWallet {
     async fn process_mempool_transaction(
         &mut self,
         tx: &Transaction,
-        _is_instant_send: bool,
+        instant_lock: Option<InstantLock>,
     ) -> MempoolTransactionResult {
         let mut processed = self.processed_transactions.lock().await;
         processed.push(tx.txid());
+
+        let mut locks = self.processed_instant_locks.lock().await;
+        locks.push((tx.txid(), instant_lock));
+        drop(locks);
 
         if !self.mempool_relevant {
             return MempoolTransactionResult::default();
@@ -177,10 +189,18 @@ impl WalletInterface for MockWallet {
         self.event_sender.subscribe()
     }
 
-    fn process_instant_send_lock(&mut self, txid: Txid) {
+    fn process_instant_send_lock(&mut self, instant_lock: InstantLock) {
+        let txid = instant_lock.txid;
+        let mut locks = self
+            .processed_instant_locks
+            .try_lock()
+            .expect("processed_instant_locks lock contention in test helper");
+        locks.push((txid, Some(instant_lock.clone())));
+        drop(locks);
+
         let mut changes =
             self.status_changes.try_lock().expect("status_changes lock contention in test helper");
-        changes.push((txid, TransactionContext::InstantSend));
+        changes.push((txid, TransactionContext::InstantSend(instant_lock)));
     }
 }
 
@@ -215,7 +235,7 @@ impl WalletInterface for NonMatchingMockWallet {
     async fn process_mempool_transaction(
         &mut self,
         _tx: &Transaction,
-        _is_instant_send: bool,
+        _instant_lock: Option<InstantLock>,
     ) -> MempoolTransactionResult {
         MempoolTransactionResult::default()
     }

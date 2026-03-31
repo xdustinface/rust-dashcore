@@ -395,6 +395,8 @@ pub unsafe extern "C" fn wallet_check_transaction(
     tx_len: usize,
     context_type: FFITransactionContextType,
     block_info: FFIBlockInfo,
+    islock_data: *const u8,
+    islock_len: usize,
     update_state: bool,
     result_out: *mut FFITransactionCheckResult,
     error: *mut FFIError,
@@ -423,7 +425,12 @@ pub unsafe extern "C" fn wallet_check_transaction(
         };
 
         // Build the transaction context
-        let context = match transaction_context_from_ffi(context_type, &block_info) {
+        let context = match transaction_context_from_ffi(
+            context_type,
+            &block_info,
+            islock_data,
+            islock_len,
+        ) {
             Some(ctx) => ctx,
             None => {
                 FFIError::set_error(
