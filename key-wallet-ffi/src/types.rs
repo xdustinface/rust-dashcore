@@ -48,13 +48,16 @@ impl From<BlockInfo> for FFIBlockInfo {
     }
 }
 
+/// Maximum accepted size for consensus-serialized `InstantLock` data.
+/// Actual IS locks are around 200 bytes; this is a generous safety cap.
+const MAX_ISLOCK_LEN: usize = 4096;
+
 /// Convert an `FFIBlockInfo` and context type to a native `TransactionContext`.
 ///
-/// Returns `None` when block info is all-zeros for confirmed contexts (`InBlock`,
-/// `InChainLockedBlock`), indicating invalid input from the FFI caller.
-///
-/// For `InstantSend` contexts, `islock_data`/`islock_len` carry the consensus-serialized
-/// `InstantLock`. When the pointer is null or length is zero, a default lock is used.
+/// Returns `None` when:
+/// - Block info is all-zeros for confirmed contexts (`InBlock`, `InChainLockedBlock`)
+/// - IS lock data is null/empty for `InstantSend` contexts
+/// - IS lock data exceeds `MAX_ISLOCK_LEN` or fails deserialization
 pub(crate) fn transaction_context_from_ffi(
     context_type: FFITransactionContextType,
     block_info: &FFIBlockInfo,
@@ -64,14 +67,16 @@ pub(crate) fn transaction_context_from_ffi(
     match context_type {
         FFITransactionContextType::Mempool => Some(TransactionContext::Mempool),
         FFITransactionContextType::InstantSend => {
-            let lock = if !islock_data.is_null() && islock_len > 0 {
-                let bytes = unsafe { std::slice::from_raw_parts(islock_data, islock_len) };
-                match dashcore::consensus::deserialize::<InstantLock>(bytes) {
-                    Ok(lock) => lock,
-                    Err(_) => return None,
-                }
-            } else {
-                InstantLock::default()
+            if islock_data.is_null() || islock_len == 0 {
+                return None;
+            }
+            if islock_len > MAX_ISLOCK_LEN {
+                return None;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(islock_data, islock_len) };
+            let lock = match dashcore::consensus::deserialize::<InstantLock>(bytes) {
+                Ok(lock) => lock,
+                Err(_) => return None,
             };
             Some(TransactionContext::InstantSend(lock))
         }
@@ -546,14 +551,41 @@ mod tests {
     }
 
     #[test]
-    fn transaction_context_from_ffi_instant_send_with_empty_block_info() {
+    fn transaction_context_from_ffi_instant_send_with_null_islock_returns_none() {
         let result = transaction_context_from_ffi(
             FFITransactionContextType::InstantSend,
             &FFIBlockInfo::empty(),
             std::ptr::null(),
             0,
         );
-        assert!(matches!(result, Some(TransactionContext::InstantSend(_))));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_instant_send_with_malformed_bytes_returns_none() {
+        let garbage: [u8; 16] = [
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c,
+        ];
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::InstantSend,
+            &FFIBlockInfo::empty(),
+            garbage.as_ptr(),
+            garbage.len(),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_instant_send_with_oversized_len_returns_none() {
+        let byte: u8 = 0;
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::InstantSend,
+            &FFIBlockInfo::empty(),
+            &byte as *const u8,
+            super::MAX_ISLOCK_LEN + 1,
+        );
+        assert!(result.is_none());
     }
 
     #[test]

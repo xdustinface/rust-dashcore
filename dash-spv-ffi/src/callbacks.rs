@@ -716,9 +716,10 @@ impl FFIWalletEventCallbacks {
                         addresses.iter().map(|a| a.to_string()).collect();
                     let c_addresses = CString::new(addresses_str.join(",")).unwrap_or_default();
                     let tx_bytes = dashcore::consensus::serialize(transaction.as_ref());
+                    let mut ffi_ctx = FFITransactionContext::from(status.clone());
                     cb(
                         c_wallet_id.as_ptr(),
-                        FFITransactionContext::from(status.clone()),
+                        ffi_ctx.clone(),
                         *account_index,
                         txid_bytes as *const [u8; 32],
                         *amount,
@@ -727,6 +728,9 @@ impl FFIWalletEventCallbacks {
                         tx_bytes.len(),
                         self.user_data,
                     );
+                    // SAFETY: `ffi_ctx` owns the heap-allocated IS lock bytes produced
+                    // by `From<TransactionContext>`. Free them after the callback returns.
+                    unsafe { ffi_ctx.free_islock_data() };
                 }
             }
             WalletEvent::TransactionStatusChanged {
@@ -738,12 +742,16 @@ impl FFIWalletEventCallbacks {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
                     let txid_bytes = txid.as_byte_array();
+                    let mut ffi_ctx = FFITransactionContext::from(status.clone());
                     cb(
                         c_wallet_id.as_ptr(),
                         txid_bytes as *const [u8; 32],
-                        FFITransactionContext::from(status.clone()),
+                        ffi_ctx.clone(),
                         self.user_data,
                     );
+                    // SAFETY: `ffi_ctx` owns the heap-allocated IS lock bytes produced
+                    // by `From<TransactionContext>`. Free them after the callback returns.
+                    unsafe { ffi_ctx.free_islock_data() };
                 }
             }
             WalletEvent::BalanceUpdated {

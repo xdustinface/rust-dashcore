@@ -143,18 +143,22 @@ pub unsafe extern "C" fn managed_wallet_check_transaction(
     };
 
     // Build the transaction context
-    let context =
-        match transaction_context_from_ffi(context_type, &block_info, islock_data, islock_len) {
-            Some(ctx) => ctx,
-            None => {
-                FFIError::set_error(
+    let context = match transaction_context_from_ffi(
+        context_type,
+        &block_info,
+        islock_data,
+        islock_len,
+    ) {
+        Some(ctx) => ctx,
+        None => {
+            FFIError::set_error(
                     error,
                     FFIErrorCode::InvalidInput,
-                    "Block info must not be zeroed for confirmed contexts".to_string(),
+                    "Invalid transaction context: block info is zeroed for a confirmed context, or IS lock data is missing/malformed for InstantSend".to_string(),
                 );
-                return false;
-            }
-        };
+            return false;
+        }
+    };
 
     // Check the transaction - wallet is now required
     if wallet.is_null() {
