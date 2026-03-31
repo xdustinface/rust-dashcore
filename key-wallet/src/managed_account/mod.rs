@@ -311,6 +311,7 @@ impl ManagedCoreAccount {
         tx: &Transaction,
         account_match: &AccountMatch,
         context: TransactionContext,
+        resolved_outputs: &[Option<Address>],
     ) {
         // Update UTXOs only for spendable account types
         match &mut self.account_type {
@@ -338,8 +339,8 @@ impl ManagedCoreAccount {
 
                 // Insert UTXOs for outputs paying to our addresses
                 for (vout, output) in tx.output.iter().enumerate() {
-                    if let Ok(addr) = Address::from_script(&output.script_pubkey, self.network) {
-                        if involved_addrs.contains(&addr) {
+                    if let Some(addr) = &resolved_outputs[vout] {
+                        if involved_addrs.contains(addr) {
                             let outpoint = OutPoint {
                                 txid,
                                 vout: vout as u32,
@@ -365,8 +366,13 @@ impl ManagedCoreAccount {
                                 script_pubkey: output.script_pubkey.clone(),
                             };
                             let block_height = context.block_info().map_or(0, |info| info.height);
-                            let mut utxo =
-                                Utxo::new(outpoint, txout, addr, block_height, tx.is_coin_base());
+                            let mut utxo = Utxo::new(
+                                outpoint,
+                                txout,
+                                addr.clone(),
+                                block_height,
+                                tx.is_coin_base(),
+                            );
                             utxo.is_confirmed = context.confirmed();
                             utxo.is_instantlocked =
                                 matches!(context, TransactionContext::InstantSend);
@@ -430,7 +436,12 @@ impl ManagedCoreAccount {
                 changed = !was_confirmed;
             }
         }
-        self.update_utxos(tx, account_match, context);
+        let resolved_outputs: Vec<Option<Address>> = tx
+            .output
+            .iter()
+            .map(|output| Address::from_script(&output.script_pubkey, self.network).ok())
+            .collect();
+        self.update_utxos(tx, account_match, context, &resolved_outputs);
         changed
     }
 
@@ -477,15 +488,22 @@ impl ManagedCoreAccount {
         // the transaction still spent our funds even without matching UTXOs.
         let has_inputs = !input_details.is_empty() || account_match.sent > 0;
 
+        // Resolve output addresses once, reused for both output details and UTXO updates
+        let resolved_outputs: Vec<Option<Address>> = tx
+            .output
+            .iter()
+            .map(|output| Address::from_script(&output.script_pubkey, self.network).ok())
+            .collect();
+
         // Build output details — annotate every output with its role
         let mut output_details = Vec::new();
         for (idx, output) in tx.output.iter().enumerate() {
-            let role = match Address::from_script(&output.script_pubkey, self.network) {
-                Ok(addr) if receive_addrs.contains(&addr) => OutputRole::Received,
-                Ok(addr) if change_addrs.contains(&addr) => OutputRole::Change,
-                Ok(_) if has_inputs => OutputRole::Sent,
-                Ok(_) => continue,
-                Err(_) => {
+            let role = match &resolved_outputs[idx] {
+                Some(addr) if receive_addrs.contains(addr) => OutputRole::Received,
+                Some(addr) if change_addrs.contains(addr) => OutputRole::Change,
+                Some(_) if has_inputs => OutputRole::Sent,
+                Some(_) => continue,
+                None => {
                     if output.script_pubkey.is_provably_unspendable() {
                         OutputRole::Unspendable
                     } else if has_inputs {
@@ -528,7 +546,7 @@ impl ManagedCoreAccount {
 
         self.transactions.insert(tx.txid(), tx_record);
 
-        self.update_utxos(tx, account_match, context);
+        self.update_utxos(tx, account_match, context, &resolved_outputs);
     }
 
     /// Mark all UTXOs belonging to a transaction as InstantSend-locked.
