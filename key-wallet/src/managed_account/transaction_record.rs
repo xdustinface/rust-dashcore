@@ -35,6 +35,8 @@ pub struct OutputDetail {
     pub index: u32,
     /// Role of this output from the wallet's perspective
     pub role: OutputRole,
+    /// Value of this output in duffs
+    pub value: u64,
 }
 
 /// Role of a transaction output from the wallet's perspective

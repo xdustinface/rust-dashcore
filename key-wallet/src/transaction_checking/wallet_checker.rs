@@ -1337,15 +1337,66 @@ mod tests {
             panic!("Expected CoinJoin account type");
         };
 
-        // Build a CoinJoin-like tx: 3+ inputs, 3+ outputs with denomination amounts
+        // Fund the CoinJoin account with a CoinJoin-shaped tx so the router routes
+        // it to the CoinJoin account (requires 3+ inputs, 3+ denomination outputs)
         let denomination = 100_000u64; // 0.001 DASH
+        let funding_tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint::new(Txid::from([10u8; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: 0xffffffff,
+                    witness: dashcore::Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint::new(Txid::from([11u8; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: 0xffffffff,
+                    witness: dashcore::Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint::new(Txid::from([12u8; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: 0xffffffff,
+                    witness: dashcore::Witness::new(),
+                },
+            ],
+            output: vec![
+                TxOut {
+                    value: denomination,
+                    script_pubkey: coinjoin_address.script_pubkey(),
+                },
+                TxOut {
+                    value: denomination,
+                    script_pubkey: Address::dummy(Network::Testnet, 50).script_pubkey(),
+                },
+                TxOut {
+                    value: denomination,
+                    script_pubkey: Address::dummy(Network::Testnet, 51).script_pubkey(),
+                },
+            ],
+            special_transaction_payload: None,
+        };
+        let funding_context = TransactionContext::InBlock(BlockInfo::new(
+            49,
+            BlockHash::from_slice(&[4u8; 32]).expect("hash"),
+            1_699_999_000,
+        ));
+        let funding_result = managed_wallet
+            .check_core_transaction(&funding_tx, funding_context, &mut wallet, true, true)
+            .await;
+        assert!(funding_result.is_relevant, "Funding tx should be relevant");
+
+        // Build a CoinJoin-like tx: 3+ inputs (one is ours), 3+ outputs with denomination amounts
         let external_addr = Address::dummy(Network::Testnet, 99);
         let tx = Transaction {
             version: 2,
             lock_time: 0,
             input: vec![
                 TxIn {
-                    previous_output: OutPoint::new(Txid::from([1u8; 32]), 0),
+                    previous_output: OutPoint::new(funding_tx.txid(), 0),
                     script_sig: ScriptBuf::new(),
                     sequence: 0xffffffff,
                     witness: dashcore::Witness::new(),
@@ -1393,9 +1444,25 @@ mod tests {
         let record = account.transactions.get(&tx.txid()).expect("should have record");
         assert_eq!(record.direction, TransactionDirection::CoinJoin);
         assert_eq!(record.transaction_type, TransactionType::CoinJoin);
-        assert!(record.input_details.is_empty(), "CoinJoin test has no funded UTXOs");
-        assert_eq!(record.output_details.len(), 1, "One output to our CoinJoin address");
-        assert_eq!(record.output_details[0].role, OutputRole::Received);
+
+        // We funded the account, so our input should be recognized
+        assert_eq!(record.input_details.len(), 1, "Should have one input from our funded UTXO");
+        assert_eq!(record.input_details[0].value, denomination);
+
+        // Our CoinJoin address output is Received, the two external outputs are Sent
+        assert_eq!(record.output_details.len(), 3);
+        assert!(
+            record.output_details.iter().any(|d| d.role == OutputRole::Received),
+            "Should have a Received output for our CoinJoin address"
+        );
+        let received =
+            record.output_details.iter().find(|d| d.role == OutputRole::Received).unwrap();
+        assert_eq!(received.value, denomination);
+        assert_eq!(
+            record.output_details.iter().filter(|d| d.role == OutputRole::Sent).count(),
+            2,
+            "Should have two Sent outputs for external addresses"
+        );
     }
 
     /// Coinbase transaction: direction should be `Incoming` with no input details.

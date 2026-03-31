@@ -522,6 +522,7 @@ impl ManagedCoreAccount {
             output_details.push(OutputDetail {
                 index: idx as u32,
                 role,
+                value: output.value,
             });
         }
 
