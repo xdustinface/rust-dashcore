@@ -230,7 +230,7 @@ Functions: 109
 | `managed_account_collection_summary_data` | Get structured account collection summary data for managed collection ... | managed_account_collection |
 | `managed_account_collection_summary_free` | Free a managed account collection summary and all its allocated memory  #... | managed_account_collection |
 | `managed_core_account_free` | Free a managed account handle  # Safety  - `account` must be a valid pointer... | managed_account |
-| `managed_core_account_free_transactions` | Free transactions array returned by `managed_core_account_get_transactions` | managed_account |
+| `managed_core_account_free_transactions` | Free transactions array returned by managed_core_account_get_transactions  #... | managed_account |
 | `managed_core_account_get_account_type` | Get the account type of a managed account  # Safety  - `account` must be a... | managed_account |
 | `managed_core_account_get_address_pool` | Get an address pool from a managed account by type  This function returns... | managed_account |
 | `managed_core_account_get_balance` | Get the balance of a managed account  # Safety  - `account` must be a valid... | managed_account |
@@ -3043,7 +3043,7 @@ managed_core_account_free_transactions(transactions: *mut FFITransactionRecord, 
 ```
 
 **Description:**
-Free transactions array returned by `managed_core_account_get_transactions`.  Frees all sub-allocations (tx_data, input detail address strings, input/output detail arrays) before freeing the main record array.  # Safety  - `transactions` must be a pointer returned by `managed_core_account_get_transactions` - `count` must be the count returned by `managed_core_account_get_transactions` - This function must only be called once per allocation
+Free transactions array returned by managed_core_account_get_transactions  # Safety  - `transactions` must be a pointer returned by `managed_core_account_get_transactions` - `count` must be the count returned by `managed_core_account_get_transactions` - This function must only be called once per allocation
 
 **Safety:**
 - `transactions` must be a pointer returned by `managed_core_account_get_transactions` - `count` must be the count returned by `managed_core_account_get_transactions` - This function must only be called once per allocation

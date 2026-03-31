@@ -289,5 +289,4 @@ mod tests {
         assert_eq!(record.fee, Some(226));
         assert_eq!(record.label, Some("Payment to Bob".to_string()));
     }
-
 }
