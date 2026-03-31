@@ -287,4 +287,65 @@ mod tests {
         assert_eq!(record.fee, Some(226));
         assert_eq!(record.label, Some("Payment to Bob".to_string()));
     }
+
+    #[test]
+    fn test_transaction_record_serde_roundtrip() {
+        use dashcore::{Address, Network};
+
+        let tx =
+            Transaction::dummy(&Address::dummy(Network::Mainnet, 0), 0..2, &[500_000, 300_000]);
+        let addr = Address::dummy(Network::Mainnet, 1);
+
+        let record = TransactionRecord {
+            txid: tx.txid(),
+            transaction: tx,
+            context: test_block_context(42),
+            transaction_type: TransactionType::Standard,
+            direction: TransactionDirection::Outgoing,
+            input_details: vec![
+                InputDetail {
+                    index: 0,
+                    value: 900_000,
+                    address: addr.clone(),
+                },
+                InputDetail {
+                    index: 1,
+                    value: 100_000,
+                    address: addr,
+                },
+            ],
+            output_details: vec![
+                OutputDetail {
+                    index: 0,
+                    role: OutputRole::Sent,
+                },
+                OutputDetail {
+                    index: 1,
+                    role: OutputRole::Change,
+                },
+            ],
+            net_amount: -500_000,
+            fee: Some(1_000),
+            label: Some("test payment".to_string()),
+        };
+
+        let json = serde_json::to_string(&record).expect("serialize");
+        let deserialized: TransactionRecord = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.txid, record.txid);
+        assert_eq!(deserialized.direction, record.direction);
+        assert_eq!(deserialized.transaction_type, record.transaction_type);
+        assert_eq!(deserialized.context, record.context);
+        assert_eq!(deserialized.net_amount, record.net_amount);
+        assert_eq!(deserialized.fee, record.fee);
+        assert_eq!(deserialized.label, record.label);
+        assert_eq!(deserialized.input_details.len(), 2);
+        assert_eq!(deserialized.input_details[0].index, 0);
+        assert_eq!(deserialized.input_details[0].value, 900_000);
+        assert_eq!(deserialized.input_details[1].index, 1);
+        assert_eq!(deserialized.input_details[1].value, 100_000);
+        assert_eq!(deserialized.output_details.len(), 2);
+        assert_eq!(deserialized.output_details[0].role, OutputRole::Sent);
+        assert_eq!(deserialized.output_details[1].role, OutputRole::Change);
+    }
 }

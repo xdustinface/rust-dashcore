@@ -1502,4 +1502,69 @@ mod tests {
         assert_eq!(record_after.output_details.len(), output_count_before);
         assert_eq!(record_after.output_details[0].role, OutputRole::Received);
     }
+
+    /// Outgoing transaction with no change output (wallet sweep): all funds go to external.
+    #[tokio::test]
+    async fn test_record_details_outgoing_no_change() {
+        let mut ctx = TestWalletContext::new_random();
+        let funding_value = 1_000_000u64;
+
+        // Fund the wallet
+        let funding_tx = Transaction::dummy(&ctx.receive_address, 0..1, &[funding_value]);
+        let funding_context = TransactionContext::InBlock(BlockInfo::new(
+            10,
+            BlockHash::from_slice(&[1u8; 32]).expect("hash"),
+            1_700_000_000,
+        ));
+        let funding_result = ctx.check_transaction(&funding_tx, funding_context).await;
+        assert!(funding_result.is_relevant);
+
+        // Build sweep tx: spend entire UTXO to external address, no change output
+        let external_address = Address::p2pkh(
+            &dashcore::PublicKey::from_slice(&[0x02; 33]).expect("pubkey"),
+            Network::Testnet,
+        );
+        let fee = 1_000u64;
+        let sweep_tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: funding_tx.txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+                witness: dashcore::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: funding_value - fee,
+                script_pubkey: external_address.script_pubkey(),
+            }],
+            special_transaction_payload: None,
+        };
+
+        let sweep_context = TransactionContext::InBlock(BlockInfo::new(
+            11,
+            BlockHash::from_slice(&[2u8; 32]).expect("hash"),
+            1_700_000_100,
+        ));
+        let sweep_result = ctx.check_transaction(&sweep_tx, sweep_context).await;
+        assert!(sweep_result.is_relevant);
+
+        let record = ctx.transaction(&sweep_tx.txid());
+        assert_eq!(record.direction, TransactionDirection::Outgoing);
+
+        // Input detail: our spent UTXO
+        assert_eq!(record.input_details.len(), 1);
+        assert_eq!(record.input_details[0].value, funding_value);
+
+        // Only Sent output details, no Change
+        assert_eq!(record.output_details.len(), 1);
+        assert_eq!(record.output_details[0].role, OutputRole::Sent);
+        assert!(
+            !record.output_details.iter().any(|d| d.role == OutputRole::Change),
+            "Sweep tx should have no Change output details"
+        );
+    }
 }

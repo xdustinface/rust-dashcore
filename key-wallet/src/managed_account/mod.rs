@@ -465,6 +465,11 @@ impl ManagedCoreAccount {
             }
         }
 
+        // Use both UTXO-based input details and `account_match.sent` as signals
+        // that we created this transaction. The UTXO set may be partial, so
+        // `account_match.sent > 0` serves as a secondary indicator.
+        let has_inputs = !input_details.is_empty() || account_match.sent > 0;
+
         // Build output details — only annotate relevant outputs
         let mut output_details = Vec::new();
         for (idx, output) in tx.output.iter().enumerate() {
@@ -479,8 +484,8 @@ impl ManagedCoreAccount {
                         index: idx as u32,
                         role: OutputRole::Change,
                     });
-                } else if !input_details.is_empty() {
-                    // Only mark as Sent if we created this tx (have inputs)
+                } else if has_inputs {
+                    // Only mark as Sent if we created this tx
                     output_details.push(OutputDetail {
                         index: idx as u32,
                         role: OutputRole::Sent,
@@ -496,9 +501,9 @@ impl ManagedCoreAccount {
             .any(|d| d.role == OutputRole::Received || d.role == OutputRole::Change);
         let direction = if transaction_type == TransactionType::CoinJoin {
             TransactionDirection::CoinJoin
-        } else if !has_sent && !input_details.is_empty() && has_our_outputs {
+        } else if !has_sent && has_inputs && has_our_outputs {
             TransactionDirection::Internal
-        } else if !input_details.is_empty() {
+        } else if has_inputs {
             TransactionDirection::Outgoing
         } else {
             TransactionDirection::Incoming
