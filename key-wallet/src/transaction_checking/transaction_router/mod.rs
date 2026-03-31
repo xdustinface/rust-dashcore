@@ -10,10 +10,11 @@ use dashcore::blockdata::transaction::special_transaction::TransactionPayload;
 use dashcore::blockdata::transaction::Transaction;
 
 /// Classification of transaction types for routing
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TransactionType {
     /// Standard payment transaction
+    #[default]
     Standard,
     /// CoinJoin mixing transaction
     CoinJoin,

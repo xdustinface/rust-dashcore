@@ -52,10 +52,11 @@ pub enum OutputRole {
 }
 
 /// Direction of a transaction from the wallet's perspective
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum TransactionDirection {
     /// Received funds from external source
+    #[default]
     Incoming,
     /// Sent funds to external address
     Outgoing,
@@ -76,12 +77,16 @@ pub struct TransactionRecord {
     /// The context in which this transaction was last seen
     pub context: TransactionContext,
     /// Classification of the transaction type
+    #[cfg_attr(feature = "serde", serde(default))]
     pub transaction_type: TransactionType,
     /// Direction of the transaction from the wallet's perspective
+    #[cfg_attr(feature = "serde", serde(default))]
     pub direction: TransactionDirection,
     /// Wallet-relevant input details
+    #[cfg_attr(feature = "serde", serde(default))]
     pub input_details: Vec<InputDetail>,
     /// Wallet-relevant output details
+    #[cfg_attr(feature = "serde", serde(default))]
     pub output_details: Vec<OutputDetail>,
     /// Net amount for this account
     pub net_amount: i64,
