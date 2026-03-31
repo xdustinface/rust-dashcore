@@ -466,8 +466,9 @@ impl ManagedCoreAccount {
         }
 
         // Use both UTXO-based input details and `account_match.sent` as signals
-        // that we created this transaction. The UTXO set may be partial, so
-        // `account_match.sent > 0` serves as a secondary indicator.
+        // that we created this transaction. The UTXO set may be incomplete
+        // (e.g., partial rescan) so `account_match.sent > 0` catches cases where
+        // the transaction still spent our funds even without matching UTXOs.
         let has_inputs = !input_details.is_empty() || account_match.sent > 0;
 
         // Build output details — annotate every output with its role

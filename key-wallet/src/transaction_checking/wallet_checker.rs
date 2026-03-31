@@ -1280,6 +1280,15 @@ mod tests {
             record.output_details.iter().any(|d| d.role == OutputRole::Received),
             "Internal tx should have a Received output detail"
         );
+        assert_eq!(
+            record.output_details.len(),
+            2,
+            "Internal tx should have Received + Change output details"
+        );
+        assert!(
+            record.output_details.iter().any(|d| d.role == OutputRole::Change),
+            "Internal tx should have a Change output detail"
+        );
     }
 
     /// CoinJoin transaction: direction should be `CoinJoin` regardless of output roles.
