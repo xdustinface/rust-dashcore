@@ -623,6 +623,25 @@ mod tests {
     }
 
     #[test]
+    fn test_ffi_transaction_context_from_in_block() {
+        use key_wallet::transaction_checking::BlockInfo;
+        let hash = dashcore::BlockHash::from_byte_array([0xab; 32]);
+        let block_info = BlockInfo::new(1000, hash, 1700000000);
+        let ctx = FFITransactionContext::from(TransactionContext::InBlock(block_info));
+        assert!(matches!(ctx.context_type, FFITransactionContextType::InBlock));
+        assert_eq!(ctx.block_info.height, 1000);
+        assert_eq!(ctx.block_info.block_hash, [0xab; 32]);
+        assert_eq!(ctx.block_info.timestamp, 1700000000);
+    }
+
+    #[test]
+    fn test_ffi_transaction_context_from_mempool() {
+        let ctx = FFITransactionContext::from(TransactionContext::Mempool);
+        assert!(matches!(ctx.context_type, FFITransactionContextType::Mempool));
+        assert_eq!(ctx.block_info.block_hash, [0u8; 32]);
+    }
+
+    #[test]
     fn test_ffi_output_role_from() {
         assert!(matches!(FFIOutputRole::from(OutputRole::Received), FFIOutputRole::Received));
         assert!(matches!(FFIOutputRole::from(OutputRole::Change), FFIOutputRole::Change));
@@ -1060,7 +1079,7 @@ impl From<OutputRole> for FFIOutputRole {
 pub struct FFIInputDetail {
     pub index: u32,
     pub value: u64,
-    pub address: *const std::os::raw::c_char,
+    pub address: *mut std::os::raw::c_char,
 }
 
 /// FFI-compatible output detail

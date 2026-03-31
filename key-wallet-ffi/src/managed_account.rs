@@ -744,18 +744,16 @@ pub unsafe extern "C" fn managed_core_account_get_transactions(
         ffi_record.fee = record.fee.unwrap_or(0);
 
         // Serialize transaction bytes
-        let mut tx_vec = dashcore::consensus::serialize(&record.transaction);
-        ffi_record.tx_len = tx_vec.len();
-        ffi_record.tx_data = if tx_vec.is_empty() {
+        let tx_slice = dashcore::consensus::serialize(&record.transaction).into_boxed_slice();
+        ffi_record.tx_len = tx_slice.len();
+        ffi_record.tx_data = if tx_slice.is_empty() {
             std::ptr::null_mut()
         } else {
-            let p = tx_vec.as_mut_ptr();
-            std::mem::forget(tx_vec);
-            p
+            Box::into_raw(tx_slice) as *mut u8
         };
 
         // Input details
-        let mut input_vec: Vec<FFIInputDetail> = record
+        let input_slice: Box<[FFIInputDetail]> = record
             .input_details
             .iter()
             .map(|d| {
@@ -763,35 +761,33 @@ pub unsafe extern "C" fn managed_core_account_get_transactions(
                 FFIInputDetail {
                     index: d.index,
                     value: d.value,
-                    address: addr.into_raw() as *const _,
+                    address: addr.into_raw(),
                 }
             })
-            .collect();
-        ffi_record.input_details_count = input_vec.len();
-        ffi_record.input_details = if input_vec.is_empty() {
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        ffi_record.input_details_count = input_slice.len();
+        ffi_record.input_details = if input_slice.is_empty() {
             std::ptr::null_mut()
         } else {
-            let p = input_vec.as_mut_ptr();
-            std::mem::forget(input_vec);
-            p
+            Box::into_raw(input_slice) as *mut FFIInputDetail
         };
 
         // Output details
-        let mut output_vec: Vec<FFIOutputDetail> = record
+        let output_slice: Box<[FFIOutputDetail]> = record
             .output_details
             .iter()
             .map(|d| FFIOutputDetail {
                 index: d.index,
                 role: FFIOutputRole::from(d.role),
             })
-            .collect();
-        ffi_record.output_details_count = output_vec.len();
-        ffi_record.output_details = if output_vec.is_empty() {
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        ffi_record.output_details_count = output_slice.len();
+        ffi_record.output_details = if output_slice.is_empty() {
             std::ptr::null_mut()
         } else {
-            let p = output_vec.as_mut_ptr();
-            std::mem::forget(output_vec);
-            p
+            Box::into_raw(output_slice) as *mut FFIOutputDetail
         };
     }
 
@@ -819,33 +815,29 @@ pub unsafe extern "C" fn managed_core_account_free_transactions(
     for i in 0..count {
         let record = &*transactions.add(i);
 
-        // Free input detail addresses and array
+        // Free input detail addresses first, then the array
         if !record.input_details.is_null() && record.input_details_count > 0 {
-            for j in 0..record.input_details_count {
-                let detail = &*record.input_details.add(j);
+            let slice =
+                std::slice::from_raw_parts_mut(record.input_details, record.input_details_count);
+            for detail in slice.iter() {
                 if !detail.address.is_null() {
-                    drop(std::ffi::CString::from_raw(detail.address as *mut _));
+                    drop(std::ffi::CString::from_raw(detail.address));
                 }
             }
-            drop(Vec::from_raw_parts(
-                record.input_details,
-                record.input_details_count,
-                record.input_details_count,
-            ));
+            drop(Box::from_raw(slice as *mut [FFIInputDetail]));
         }
 
-        // Free output details array
+        // Free output details
         if !record.output_details.is_null() && record.output_details_count > 0 {
-            drop(Vec::from_raw_parts(
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 record.output_details,
                 record.output_details_count,
-                record.output_details_count,
-            ));
+            )));
         }
 
         // Free tx data
         if !record.tx_data.is_null() && record.tx_len > 0 {
-            drop(Vec::from_raw_parts(record.tx_data, record.tx_len, record.tx_len));
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(record.tx_data, record.tx_len)));
         }
     }
 
@@ -2014,29 +2006,28 @@ mod tests {
 
             // Create input details
             let addr = std::ffi::CString::new("XtestAddress123").unwrap();
-            let mut inputs = vec![FFIInputDetail {
+            let input_slice = vec![FFIInputDetail {
                 index: 0,
                 value: 100000,
-                address: addr.into_raw() as *const _,
-            }];
-            r0.input_details_count = inputs.len();
-            r0.input_details = inputs.as_mut_ptr();
-            std::mem::forget(inputs);
+                address: addr.into_raw(),
+            }]
+            .into_boxed_slice();
+            r0.input_details_count = input_slice.len();
+            r0.input_details = Box::into_raw(input_slice) as *mut FFIInputDetail;
 
             // Create output details
-            let mut outputs = vec![FFIOutputDetail {
+            let output_slice = vec![FFIOutputDetail {
                 index: 0,
                 role: FFIOutputRole::Received,
-            }];
-            r0.output_details_count = outputs.len();
-            r0.output_details = outputs.as_mut_ptr();
-            std::mem::forget(outputs);
+            }]
+            .into_boxed_slice();
+            r0.output_details_count = output_slice.len();
+            r0.output_details = Box::into_raw(output_slice) as *mut FFIOutputDetail;
 
             // Create tx data
-            let mut tx_data = vec![0u8; 10];
-            r0.tx_len = tx_data.len();
-            r0.tx_data = tx_data.as_mut_ptr();
-            std::mem::forget(tx_data);
+            let tx_slice = vec![0u8; 10].into_boxed_slice();
+            r0.tx_len = tx_slice.len();
+            r0.tx_data = Box::into_raw(tx_slice) as *mut u8;
 
             // Second record: empty sub-arrays
             let r1 = &mut *records.add(1);
