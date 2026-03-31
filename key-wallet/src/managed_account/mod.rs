@@ -327,6 +327,12 @@ impl ManagedCoreAccount {
             | ManagedAccountType::DashpayExternalAccount {
                 ..
             } => {
+                debug_assert_eq!(
+                    resolved_outputs.len(),
+                    tx.output.len(),
+                    "resolved_outputs length must match tx.output length"
+                );
+
                 let involved_addrs: BTreeSet<_> = account_match
                     .account_type_match
                     .all_involved_addresses()

@@ -1168,4 +1168,101 @@ mod tests {
 
         assert_eq!(bip32_match.account_index(), Some(1));
     }
+
+    /// Create a dummy `AddressInfo` for testing with a unique index
+    fn make_test_address_info(index: u32) -> AddressInfo {
+        use crate::bip32::{ChildNumber, DerivationPath};
+        use alloc::collections::BTreeMap;
+
+        let pubkey = dashcore::PublicKey::from_slice(&[0x02; 33]).expect("valid compressed pubkey");
+        let address = dashcore::Address::p2pkh(&pubkey, dashcore::Network::Testnet);
+        let script_pubkey = address.script_pubkey();
+        AddressInfo {
+            address,
+            script_pubkey,
+            public_key: Some(PublicKeyType::ECDSA(pubkey.to_bytes())),
+            index,
+            path: DerivationPath::from(vec![
+                ChildNumber::Hardened {
+                    index: 44,
+                },
+                ChildNumber::Hardened {
+                    index: 5,
+                },
+                ChildNumber::Hardened {
+                    index: 0,
+                },
+                ChildNumber::Normal {
+                    index: 0,
+                },
+                ChildNumber::Normal {
+                    index,
+                },
+            ]),
+            used: false,
+            generated_at: 0,
+            used_at: None,
+            tx_count: 0,
+            total_received: 0,
+            total_sent: 0,
+            balance: 0,
+            label: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_standard_bip44_involved_receive_and_change_addresses() {
+        let recv_addr = make_test_address_info(0);
+        let change_addr = make_test_address_info(1);
+
+        let m = CoreAccountTypeMatch::StandardBIP44 {
+            account_index: 0,
+            involved_receive_addresses: vec![recv_addr.clone()],
+            involved_change_addresses: vec![change_addr.clone()],
+        };
+
+        assert_eq!(m.involved_receive_addresses().len(), 1);
+        assert_eq!(m.involved_receive_addresses()[0].index, 0);
+
+        assert_eq!(m.involved_change_addresses().len(), 1);
+        assert_eq!(m.involved_change_addresses()[0].index, 1);
+
+        let all = m.all_involved_addresses();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_coinjoin_involved_addresses_all_returned_as_receive() {
+        let addr_a = make_test_address_info(0);
+        let addr_b = make_test_address_info(1);
+
+        let m = CoreAccountTypeMatch::CoinJoin {
+            account_index: 5,
+            involved_addresses: vec![addr_a.clone(), addr_b.clone()],
+        };
+
+        // CoinJoin has no change pool, so all addresses are receive
+        assert_eq!(m.involved_receive_addresses().len(), 2);
+        assert!(m.involved_change_addresses().is_empty());
+
+        let all = m.all_involved_addresses();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_identity_involved_addresses_all_returned_as_receive() {
+        let addr = make_test_address_info(0);
+
+        let m = CoreAccountTypeMatch::IdentityRegistration {
+            involved_addresses: vec![addr.clone()],
+        };
+
+        // Identity accounts have no change pool
+        assert_eq!(m.involved_receive_addresses().len(), 1);
+        assert!(m.involved_change_addresses().is_empty());
+
+        let all = m.all_involved_addresses();
+        assert_eq!(all.len(), 1);
+    }
 }
