@@ -3,11 +3,15 @@
 //! These events are emitted by the WalletManager when significant wallet
 //! operations occur, allowing consumers to receive push-based notifications.
 
-use crate::manager::WalletId;
-use crate::transaction_checking::TransactionContext;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use dashcore::blockdata::transaction::Transaction;
 use dashcore::{Address, Amount, SignedAmount, Txid};
+
+use crate::manager::WalletId;
+use crate::transaction_checking::TransactionContext;
 
 /// Events emitted by the wallet manager.
 ///
@@ -29,6 +33,8 @@ pub enum WalletEvent {
         amount: i64,
         /// Addresses involved in the transaction.
         addresses: Vec<Address>,
+        /// The full transaction.
+        transaction: Box<Transaction>,
     },
     /// The confirmation status of a previously seen transaction has changed.
     TransactionStatusChanged {

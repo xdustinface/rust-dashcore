@@ -26,6 +26,7 @@ use crate::wallet::managed_wallet_info::{ManagedWalletInfo, TransactionRecord};
 use crate::Utxo;
 use crate::{Account, AccountType, Address, ExtendedPrivKey, Mnemonic, Network, Wallet};
 use crate::{ExtendedPubKey, WalletCoreBalance};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -584,6 +585,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                     #[cfg(feature = "std")]
                     if check_result.is_new_transaction {
                         // First time seeing this transaction — emit TransactionReceived
+                        let tx_boxed = Box::new(tx.clone());
                         for account_match in &check_result.affected_accounts {
                             let Some(account_index) =
                                 account_match.account_type_match.account_index()
@@ -605,6 +607,7 @@ impl<T: WalletInfoInterface> WalletManager<T> {
                                 txid: tx.txid(),
                                 amount,
                                 addresses,
+                                transaction: tx_boxed.clone(),
                             };
                             let _ = self.event_sender.send(event);
                         }
