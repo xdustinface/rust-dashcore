@@ -59,7 +59,7 @@ pub enum TransactionDirection {
     Incoming,
     /// Sent funds to external address
     Outgoing,
-    /// Self-transfer or consolidation (all outputs are ours)
+    /// Self-transfer or consolidation (no outputs to external addresses; may include unspendable data outputs)
     Internal,
     /// CoinJoin mixing transaction
     CoinJoin,
@@ -160,14 +160,14 @@ impl TransactionRecord {
         self.context = context;
     }
 
-    /// Check if this is an incoming transaction (positive net amount)
+    /// Check if this is an incoming transaction
     pub fn is_incoming(&self) -> bool {
-        self.net_amount > 0
+        self.direction == TransactionDirection::Incoming
     }
 
-    /// Check if this is an outgoing transaction (negative net amount)
+    /// Check if this is an outgoing transaction
     pub fn is_outgoing(&self) -> bool {
-        self.net_amount < 0
+        self.direction == TransactionDirection::Outgoing
     }
 
     /// Get the absolute value of the net amount
@@ -247,7 +247,15 @@ mod tests {
         assert!(!incoming.is_outgoing());
         assert_eq!(incoming.amount(), 50000);
 
-        let outgoing = simple_record(tx.clone(), TransactionContext::Mempool, -50000);
+        let outgoing = TransactionRecord::new(
+            tx.clone(),
+            TransactionContext::Mempool,
+            TransactionType::Standard,
+            TransactionDirection::Outgoing,
+            Vec::new(),
+            Vec::new(),
+            -50000,
+        );
         assert!(!outgoing.is_incoming());
         assert!(outgoing.is_outgoing());
         assert_eq!(outgoing.amount(), 50000);

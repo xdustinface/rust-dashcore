@@ -478,7 +478,15 @@ impl ManagedCoreAccount {
                 Ok(addr) if change_addrs.contains(&addr) => OutputRole::Change,
                 Ok(_) if has_inputs => OutputRole::Sent,
                 Ok(_) => continue,
-                Err(_) => OutputRole::Unspendable,
+                Err(_) => {
+                    if output.script_pubkey.is_provably_unspendable() {
+                        OutputRole::Unspendable
+                    } else if has_inputs {
+                        OutputRole::Sent
+                    } else {
+                        continue;
+                    }
+                }
             };
             output_details.push(OutputDetail {
                 index: idx as u32,

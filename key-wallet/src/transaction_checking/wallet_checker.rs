@@ -1179,6 +1179,7 @@ mod tests {
 
         let record = ctx.transaction(&spend_tx.txid());
         assert_eq!(record.direction, TransactionDirection::Outgoing);
+        assert_eq!(record.transaction_type, TransactionType::Standard);
 
         // Input detail: our spent UTXO
         assert_eq!(record.input_details.len(), 1);
@@ -1264,6 +1265,7 @@ mod tests {
 
         let record = ctx.transaction(&internal_tx.txid());
         assert_eq!(record.direction, TransactionDirection::Internal);
+        assert_eq!(record.transaction_type, TransactionType::Standard);
 
         // Should have input details (we are spending)
         assert_eq!(record.input_details.len(), 1);
@@ -1554,6 +1556,7 @@ mod tests {
 
         let record = ctx.transaction(&sweep_tx.txid());
         assert_eq!(record.direction, TransactionDirection::Outgoing);
+        assert_eq!(record.transaction_type, TransactionType::Standard);
 
         // Input detail: our spent UTXO
         assert_eq!(record.input_details.len(), 1);
@@ -1651,5 +1654,56 @@ mod tests {
 
         assert!(change.is_some(), "Should have a Change output detail");
         assert_eq!(change.unwrap().index, 2);
+    }
+
+    /// Outgoing transaction where the only output is OP_RETURN (all-burn spend).
+    #[tokio::test]
+    async fn test_record_details_outgoing_op_return_only() {
+        let mut ctx = TestWalletContext::new_random();
+        let funding_value = 1_000_000u64;
+
+        // Fund the wallet
+        let funding_tx = Transaction::dummy(&ctx.receive_address, 0..1, &[funding_value]);
+        let funding_context = TransactionContext::InBlock(BlockInfo::new(
+            10,
+            BlockHash::from_slice(&[1u8; 32]).expect("hash"),
+            1_700_000_000,
+        ));
+        let funding_result = ctx.check_transaction(&funding_tx, funding_context).await;
+        assert!(funding_result.is_relevant);
+
+        // Build tx that spends the UTXO entirely to an OP_RETURN output
+        let spend_tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: funding_tx.txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+                witness: dashcore::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: 0,
+                script_pubkey: ScriptBuf::new_op_return(&[0x01]),
+            }],
+            special_transaction_payload: None,
+        };
+
+        let spend_context = TransactionContext::InBlock(BlockInfo::new(
+            11,
+            BlockHash::from_slice(&[2u8; 32]).expect("hash"),
+            1_700_000_100,
+        ));
+        let spend_result = ctx.check_transaction(&spend_tx, spend_context).await;
+        assert!(spend_result.is_relevant);
+
+        let record = ctx.transaction(&spend_tx.txid());
+        assert_eq!(record.direction, TransactionDirection::Outgoing);
+        assert_eq!(record.input_details.len(), 1);
+        assert_eq!(record.output_details.len(), 1);
+        assert_eq!(record.output_details[0].role, OutputRole::Unspendable);
     }
 }
