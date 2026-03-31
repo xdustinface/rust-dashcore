@@ -168,7 +168,7 @@ impl TestContext {
             .all_accounts()
             .iter()
             .any(|account| account.transactions.contains_key(txid))
-            || wallet_info.immature_transactions().contains(txid)
+            || wallet_info.immature_txids().contains(txid)
     }
 
     /// Validate that the context wallet matches the expected baseline from dashd.
@@ -200,7 +200,7 @@ impl TestContext {
                 spv_txids.insert(txid.to_string());
             }
         }
-        for txid in wallet_info.immature_transactions() {
+        for txid in wallet_info.immature_txids() {
             spv_txids.insert(txid.to_string());
         }
 
@@ -309,7 +309,7 @@ pub(super) async fn client_has_transaction(
         .all_accounts()
         .iter()
         .any(|account| account.transactions.contains_key(txid))
-        || wallet_info.immature_transactions().contains(txid)
+        || wallet_info.immature_txids().contains(txid)
 }
 
 /// Creates a new SPV client and starts it with a `TestEventHandler`.

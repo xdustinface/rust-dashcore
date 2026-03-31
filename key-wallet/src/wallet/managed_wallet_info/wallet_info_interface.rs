@@ -81,8 +81,8 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// Get accounts (immutable)
     fn accounts(&self) -> &ManagedAccountCollection;
 
-    /// Get immature transaction IDs
-    fn immature_transactions(&self) -> BTreeSet<Txid>;
+    /// Get immature coinbase transaction IDs
+    fn immature_txids(&self) -> BTreeSet<Txid>;
 
     /// Return the last fully processed height of the wallet.
     fn synced_height(&self) -> CoreBlockHeight;
@@ -209,7 +209,7 @@ impl WalletInfoInterface for ManagedWalletInfo {
         &self.accounts
     }
 
-    fn immature_transactions(&self) -> BTreeSet<Txid> {
+    fn immature_txids(&self) -> BTreeSet<Txid> {
         let mut immature_txids = BTreeSet::new();
         for account in self.accounts.all_accounts() {
             for utxo in account.utxos.values() {

@@ -411,8 +411,8 @@ mod tests {
         let utxo = managed_account.utxos.values().next().expect("Should have UTXO");
         assert!(utxo.is_coinbase, "UTXO should be marked as coinbase");
 
-        // Coinbase should be in immature_transactions() since it hasn't matured
-        let immature_txs = managed_wallet.immature_transactions();
+        // Coinbase should be in immature_txids() since it hasn't matured
+        let immature_txs = managed_wallet.immature_txids();
         assert_eq!(immature_txs.len(), 1, "Should have one immature transaction");
         assert!(immature_txs.contains(&coinbase_tx.txid()));
 
@@ -566,8 +566,8 @@ mod tests {
         assert!(utxo.is_coinbase, "UTXO should be marked as coinbase");
         assert_eq!(utxo.height, block_height);
 
-        // Coinbase is in immature_transactions() since it hasn't matured
-        let immature_txs = managed_wallet.immature_transactions();
+        // Coinbase is in immature_txids() since it hasn't matured
+        let immature_txs = managed_wallet.immature_txids();
         assert_eq!(immature_txs.len(), 1, "Should have one immature transaction");
 
         // Immature balance should reflect the coinbase value
@@ -596,8 +596,8 @@ mod tests {
             "Coinbase should still be in regular transactions"
         );
 
-        // Coinbase is no longer in immature_transactions()
-        let immature_txs = managed_wallet.immature_transactions();
+        // Coinbase is no longer in immature_txids()
+        let immature_txs = managed_wallet.immature_txids();
         assert!(immature_txs.is_empty(), "Matured coinbase should not be in immature transactions");
 
         // Immature balance should now be zero
