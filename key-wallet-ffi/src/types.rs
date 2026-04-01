@@ -3,28 +3,72 @@
 use dashcore::hashes::Hash;
 use key_wallet::transaction_checking::{BlockInfo, TransactionContext};
 use key_wallet::{Network, Wallet};
-use std::os::raw::{c_char, c_uint};
+use std::os::raw::c_char;
 use std::sync::Arc;
 
-/// Convert FFI block parameters to a `BlockInfo`.
+/// FFI-compatible block metadata (height, hash, timestamp).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FFIBlockInfo {
+    /// Block height
+    pub height: u32,
+    /// Block hash (32 bytes)
+    pub block_hash: [u8; 32],
+    /// Unix timestamp
+    pub timestamp: u32,
+}
+
+impl FFIBlockInfo {
+    /// All-zeros placeholder used for unconfirmed contexts.
+    pub fn empty() -> Self {
+        Self {
+            height: 0,
+            block_hash: [0u8; 32],
+            timestamp: 0,
+        }
+    }
+
+    /// Convert to native `BlockInfo`.
+    pub fn to_block_info(&self) -> BlockInfo {
+        let block_hash = dashcore::BlockHash::from_byte_array(self.block_hash);
+        BlockInfo::new(self.height, block_hash, self.timestamp)
+    }
+}
+
+impl From<BlockInfo> for FFIBlockInfo {
+    fn from(info: BlockInfo) -> Self {
+        Self {
+            height: info.height(),
+            block_hash: info.block_hash().to_byte_array(),
+            timestamp: info.timestamp(),
+        }
+    }
+}
+
+/// Convert an `FFIBlockInfo` and context type to a native `TransactionContext`.
 ///
-/// # Safety
-///
-/// If `block_hash` is non-null it must point to 32 readable bytes.
-pub(crate) unsafe fn block_info_from_ffi(
-    height: u32,
-    block_hash: *const u8,
-    timestamp: u64,
-) -> BlockInfo {
-    let block_hash = if !block_hash.is_null() {
-        let hash_bytes = std::slice::from_raw_parts(block_hash, 32);
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(hash_bytes);
-        dashcore::BlockHash::from_byte_array(arr)
-    } else {
-        dashcore::BlockHash::all_zeros()
-    };
-    BlockInfo::new(height, block_hash, timestamp as u32)
+/// Returns `None` when block info is all-zeros for confirmed contexts (`InBlock`,
+/// `InChainLockedBlock`), indicating invalid input from the FFI caller.
+pub(crate) fn transaction_context_from_ffi(
+    context_type: FFITransactionContext,
+    block_info: &FFIBlockInfo,
+) -> Option<TransactionContext> {
+    match context_type {
+        FFITransactionContext::Mempool => Some(TransactionContext::Mempool),
+        FFITransactionContext::InstantSend => Some(TransactionContext::InstantSend),
+        FFITransactionContext::InBlock => {
+            if block_info.block_hash == [0u8; 32] && block_info.timestamp == 0 {
+                return None;
+            }
+            Some(TransactionContext::InBlock(block_info.to_block_info()))
+        }
+        FFITransactionContext::InChainLockedBlock => {
+            if block_info.block_hash == [0u8; 32] && block_info.timestamp == 0 {
+                return None;
+            }
+            Some(TransactionContext::InChainLockedBlock(block_info.to_block_info()))
+        }
+    }
 }
 
 /// FFI Network type (single network)
@@ -392,6 +436,14 @@ impl FFIAccountType {
 mod tests {
     use super::*;
 
+    fn valid_block_info() -> FFIBlockInfo {
+        FFIBlockInfo {
+            height: 1000,
+            block_hash: [0xab; 32],
+            timestamp: 1700000000,
+        }
+    }
+
     #[test]
     #[should_panic(expected = "DashpayReceivingFunds cannot be converted to AccountType")]
     fn test_dashpay_receiving_funds_to_account_type_panics() {
@@ -461,6 +513,57 @@ mod tests {
         let (ffi_type, index, _) = FFIAccountType::from_account_type(&standard_bip44);
         assert_eq!(ffi_type, FFIAccountType::StandardBIP44);
         assert_eq!(index, 5);
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_mempool_with_empty_block_info() {
+        let result =
+            transaction_context_from_ffi(FFITransactionContext::Mempool, &FFIBlockInfo::empty());
+        assert!(matches!(result, Some(TransactionContext::Mempool)));
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_instant_send_with_empty_block_info() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContext::InstantSend,
+            &FFIBlockInfo::empty(),
+        );
+        assert!(matches!(result, Some(TransactionContext::InstantSend)));
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_in_block_with_empty_block_info() {
+        let result =
+            transaction_context_from_ffi(FFITransactionContext::InBlock, &FFIBlockInfo::empty());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_in_chain_locked_block_with_empty_block_info() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContext::InChainLockedBlock,
+            &FFIBlockInfo::empty(),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_in_block_with_valid_block_info() {
+        let block_info = valid_block_info();
+        let result = transaction_context_from_ffi(FFITransactionContext::InBlock, &block_info);
+        let ctx = result.expect("should return Some for InBlock with valid block info");
+        assert!(matches!(ctx, TransactionContext::InBlock(info) if info.height() == 1000));
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_in_chain_locked_block_with_valid_block_info() {
+        let block_info = valid_block_info();
+        let result =
+            transaction_context_from_ffi(FFITransactionContext::InChainLockedBlock, &block_info);
+        let ctx = result.expect("should return Some for InChainLockedBlock with valid block info");
+        assert!(
+            matches!(ctx, TransactionContext::InChainLockedBlock(info) if info.height() == 1000)
+        );
     }
 }
 
@@ -760,62 +863,53 @@ impl From<TransactionContext> for FFITransactionContext {
 pub struct FFITransactionContextDetails {
     /// The context type
     pub context_type: FFITransactionContext,
-    /// Block height (0 for mempool)
-    pub height: c_uint,
-    /// Block hash (32 bytes, null for mempool or if unknown)
-    pub block_hash: *const u8,
-    /// Timestamp (0 if unknown)
-    pub timestamp: c_uint,
+    /// Block info (zeroed for mempool/instant-send contexts)
+    pub block_info: FFIBlockInfo,
 }
 
 impl FFITransactionContextDetails {
     /// Create a mempool context
     pub fn mempool() -> Self {
-        FFITransactionContextDetails {
+        Self {
             context_type: FFITransactionContext::Mempool,
-            height: 0,
-            block_hash: std::ptr::null(),
-            timestamp: 0,
+            block_info: FFIBlockInfo::empty(),
         }
     }
 
     /// Create an in-block context
-    pub fn in_block(height: c_uint, block_hash: *const u8, timestamp: c_uint) -> Self {
-        FFITransactionContextDetails {
+    pub fn in_block(block_info: FFIBlockInfo) -> Self {
+        Self {
             context_type: FFITransactionContext::InBlock,
-            height,
-            block_hash,
-            timestamp,
+            block_info,
         }
     }
 
     /// Create a chain-locked block context
-    pub fn in_chain_locked_block(height: c_uint, block_hash: *const u8, timestamp: c_uint) -> Self {
-        FFITransactionContextDetails {
+    pub fn in_chain_locked_block(block_info: FFIBlockInfo) -> Self {
+        Self {
             context_type: FFITransactionContext::InChainLockedBlock,
-            height,
-            block_hash,
-            timestamp,
+            block_info,
         }
     }
 
-    /// Convert to the native TransactionContext
-    pub fn to_transaction_context(&self) -> TransactionContext {
-        match self.context_type {
-            FFITransactionContext::Mempool => TransactionContext::Mempool,
-            FFITransactionContext::InBlock => {
-                let info = unsafe {
-                    block_info_from_ffi(self.height, self.block_hash, self.timestamp as u64)
-                };
-                TransactionContext::InBlock(info)
-            }
-            FFITransactionContext::InChainLockedBlock => {
-                let info = unsafe {
-                    block_info_from_ffi(self.height, self.block_hash, self.timestamp as u64)
-                };
-                TransactionContext::InChainLockedBlock(info)
-            }
-            FFITransactionContext::InstantSend => TransactionContext::InstantSend,
+    /// Convert to the native `TransactionContext`.
+    ///
+    /// Returns `None` when block info is all-zeros for confirmed contexts.
+    pub fn to_transaction_context(&self) -> Option<TransactionContext> {
+        transaction_context_from_ffi(self.context_type, &self.block_info)
+    }
+}
+
+impl From<TransactionContext> for FFITransactionContextDetails {
+    fn from(ctx: TransactionContext) -> Self {
+        let context_type = FFITransactionContext::from(ctx);
+        let block_info = ctx
+            .block_info()
+            .map(|info| FFIBlockInfo::from(*info))
+            .unwrap_or_else(FFIBlockInfo::empty);
+        Self {
+            context_type,
+            block_info,
         }
     }
 }
