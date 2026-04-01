@@ -30,6 +30,15 @@ pub struct FFIDashSpvClient {
     shutdown_token: CancellationToken,
 }
 
+impl FFIDashSpvClient {
+    /// Returns the shared masternode list engine, if initialized.
+    pub fn masternode_list_engine(
+        &self,
+    ) -> Option<Arc<tokio::sync::RwLock<dash_spv::MasternodeListEngine>>> {
+        self.inner.masternode_list_engine().ok()
+    }
+}
+
 /// Create a new SPV client and return an opaque pointer.
 ///
 /// # Safety
