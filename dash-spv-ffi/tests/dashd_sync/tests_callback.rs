@@ -212,20 +212,13 @@ fn test_all_callbacks_during_sync() {
         );
 
         // Validate transaction data from initial sync
-        let received_txids = tracker.received_txids.lock().unwrap();
-        assert!(!received_txids.is_empty(), "should have received transaction txids during sync");
-        drop(received_txids);
-
-        let received_amounts = tracker.received_amounts.lock().unwrap();
+        let received_txs = tracker.received_transactions.lock().unwrap();
+        assert!(!received_txs.is_empty(), "should have received transactions during sync");
         assert!(
-            !received_amounts.is_empty(),
-            "should have received transaction amounts during sync"
-        );
-        assert!(
-            received_amounts.iter().any(|&a| a != 0),
+            received_txs.iter().any(|&(_, amount)| amount != 0),
             "at least one received transaction amount should be non-zero"
         );
-        drop(received_amounts);
+        drop(received_txs);
 
         // Masternodes are disabled in test config, so these should not fire
         let masternode_updated = tracker.masternode_state_updated_count.load(Ordering::SeqCst);
@@ -308,23 +301,27 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             tx_received_after
         );
 
-        // Verify the sent txid appears in the callback data
+        // Verify the sent txid appears in the callback data with a non-zero
+        // net_amount.  The SPV wallet and dashd share the same mnemonic so the
+        // transaction is an internal transfer (wallet owns both inputs and
+        // outputs); net_amount therefore equals approximately -fee, not the
+        // nominal send amount.
         let sent_txid_bytes = *txid.as_byte_array();
-        let received_txids = tracker.received_txids.lock().unwrap();
+        let received_txs = tracker.received_transactions.lock().unwrap();
+        let sent_entry = received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
         assert!(
-            received_txids.contains(&sent_txid_bytes),
-            "sent txid should appear in received_txids callback data"
+            sent_entry.is_some(),
+            "sent txid should appear in received transaction callback data"
         );
-        drop(received_txids);
-
-        // Verify 1 DASH (100_000_000 satoshis) appears in received amounts
-        let received_amounts = tracker.received_amounts.lock().unwrap();
+        let &(_, net_amount) = sent_entry.unwrap();
+        // Internal transfer: net_amount = received - sent = (send_amount + change) - input = -fee.
+        // The fee must be negative, non-zero, and small (< 0.001 DASH).
         assert!(
-            received_amounts.contains(&100_000_000),
-            "1 DASH (100_000_000 sat) should appear in received_amounts: {:?}",
-            *received_amounts
+            net_amount < 0 && net_amount > -100_000,
+            "internal transfer net_amount should equal -fee (small negative), got: {}",
+            net_amount
         );
-        drop(received_amounts);
+        drop(received_txs);
 
         let balance_updated_after = tracker.balance_updated_count.load(Ordering::SeqCst);
         tracing::info!(
