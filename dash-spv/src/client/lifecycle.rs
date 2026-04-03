@@ -8,14 +8,12 @@
 //! - Genesis block initialization
 //! - Wallet data loading
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use super::{ClientConfig, DashSpvClient, EventHandler};
 use crate::chain::checkpoints::{mainnet_checkpoints, testnet_checkpoints, CheckpointManager};
 use crate::error::{Result, SpvError};
-use crate::mempool_filter::MempoolFilter;
 use crate::network::NetworkManager;
 use crate::storage::{
     PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
@@ -25,7 +23,6 @@ use crate::sync::{
     BlockHeadersManager, BlocksManager, ChainLockManager, FilterHeadersManager, FiltersManager,
     InstantSendManager, Managers, MasternodesManager, MempoolManager, SyncCoordinator,
 };
-use crate::types::MempoolState;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
 use dashcore_hashes::Hash;
 use key_wallet_manager::WalletInterface;
@@ -125,13 +122,13 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager, H: EventHandler>
             managers.instantsend = Some(InstantSendManager::new(masternode_list_engine.clone()));
         }
 
-        // Create mempool state and build mempool manager if tracking is enabled
-        let mempool_state = Arc::new(RwLock::new(MempoolState::default()));
+        // Build mempool manager if tracking is enabled
         if config.enable_mempool_tracking {
+            let mempool_state = Arc::new(RwLock::new(Default::default()));
             let initial_revision = wallet.read().await.monitor_revision();
             managers.mempool = Some(MempoolManager::new(
                 wallet.clone(),
-                mempool_state.clone(),
+                mempool_state,
                 config.mempool_strategy,
                 config.max_mempool_transactions,
                 initial_revision,
@@ -151,8 +148,6 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager, H: EventHandler>
             masternode_engine,
             sync_coordinator: Arc::new(Mutex::new(sync_coordinator)),
             running: Arc::new(RwLock::new(false)),
-            mempool_state,
-            mempool_filter: Arc::new(RwLock::new(None)),
             event_handler,
         };
 
@@ -162,35 +157,6 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager, H: EventHandler>
         // Emit initial progress so callers get immediate feedback
         let initial_progress = client.sync_coordinator.lock().await.progress().clone();
         client.event_handler.on_progress(&initial_progress);
-
-        // Initialize mempool filter if mempool tracking is enabled
-        {
-            let config = client.config.read().await;
-            if config.enable_mempool_tracking {
-                let filter = Arc::new(MempoolFilter::new(
-                    config.mempool_strategy,
-                    config.max_mempool_transactions,
-                    client.mempool_state.clone(),
-                    HashSet::new(), // TODO: populate from wallet's monitored addresses
-                    config.network,
-                ));
-                *client.mempool_filter.write().await = Some(filter);
-
-                // Load mempool state from storage if persistence is enabled
-                if config.persist_mempool {
-                    if let Some(state) = client
-                        .storage
-                        .lock()
-                        .await
-                        .load_mempool_state()
-                        .await
-                        .map_err(SpvError::Storage)?
-                    {
-                        *client.mempool_state.write().await = state;
-                    }
-                }
-            }
-        }
 
         Ok(client)
     }
