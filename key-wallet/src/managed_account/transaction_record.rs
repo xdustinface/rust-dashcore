@@ -90,7 +90,7 @@ pub struct TransactionRecord {
     /// Fee paid (if we created it)
     pub fee: Option<u64>,
     /// Transaction label
-    pub label: Option<String>,
+    pub label: String,
 }
 
 impl TransactionRecord {
@@ -115,7 +115,7 @@ impl TransactionRecord {
             output_details,
             net_amount,
             fee: None,
-            label: None,
+            label: String::new(),
         }
     }
 
@@ -154,20 +154,15 @@ impl TransactionRecord {
 
     /// Set the label for this transaction.
     ///
-    /// Empty strings clear the label. Returns an error if the label
-    /// exceeds [`MAX_LABEL_LENGTH`] bytes.
+    /// Returns an error if the label exceeds [`MAX_LABEL_LENGTH`] bytes.
     pub fn set_label(&mut self, label: String) -> Result<(), Error> {
-        if label.is_empty() {
-            self.label = None;
-            return Ok(());
-        }
         if label.len() > MAX_LABEL_LENGTH {
             return Err(Error::InvalidParameter(format!(
                 "Label exceeds {} bytes",
                 MAX_LABEL_LENGTH
             )));
         }
-        self.label = Some(label);
+        self.label = label;
         Ok(())
     }
 
@@ -329,26 +324,26 @@ mod tests {
         let mut record = simple_record(tx, TransactionContext::Mempool, -50000);
 
         assert_eq!(record.fee, None);
-        assert_eq!(record.label, None);
+        assert!(record.label.is_empty());
 
         record.set_fee(226);
         record.set_label("Payment to Bob".to_string()).unwrap();
 
         assert_eq!(record.fee, Some(226));
-        assert_eq!(record.label, Some("Payment to Bob".to_string()));
+        assert_eq!(record.label, "Payment to Bob");
 
         // Empty string clears the label
         record.set_label(String::new()).unwrap();
-        assert_eq!(record.label, None);
+        assert!(record.label.is_empty());
 
         // Exceeding max length returns an error
         let long_label = "x".repeat(MAX_LABEL_LENGTH + 1);
         assert!(record.set_label(long_label).is_err());
-        assert_eq!(record.label, None); // unchanged
+        assert!(record.label.is_empty()); // unchanged
 
         // Exactly max length is fine
         let max_label = "x".repeat(MAX_LABEL_LENGTH);
         record.set_label(max_label.clone()).unwrap();
-        assert_eq!(record.label, Some(max_label));
+        assert_eq!(record.label, max_label);
     }
 }
