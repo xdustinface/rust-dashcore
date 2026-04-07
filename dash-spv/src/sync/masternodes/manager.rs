@@ -168,10 +168,10 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         &mut self,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
-        debug_assert!(
-            self.sync_state.mnlistdiff_pipeline.is_complete(),
-            "Pipeline must be complete before starting an incremental request"
-        );
+        if !self.sync_state.mnlistdiff_pipeline.is_complete() {
+            tracing::warn!("send_mnlistdiff_for_tip called with non-empty pipeline, skipping");
+            return Ok(vec![]);
+        }
 
         let storage = self.header_storage.read().await;
         let tip = match storage.get_tip().await {
@@ -289,6 +289,7 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                         // unverified state.
                         engine.masternode_lists.remove(&height);
                         drop(engine);
+                        self.sync_state.known_mn_list_heights.remove(&height);
                         return Ok(vec![]);
                     }
 
