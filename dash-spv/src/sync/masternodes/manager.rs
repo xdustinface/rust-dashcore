@@ -250,14 +250,12 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                 tracing::info!("All MnListDiff responses received");
                 self.verify_and_complete().await
             }
-            PipelineMode::Incremental {
-                target,
-            } => {
-                let target = *target;
-                self.sync_state.last_synced_block_hash = Some(target);
+            PipelineMode::Incremental { .. } => {
                 let engine = self.engine.read().await;
-                if let Some(&height) = engine.masternode_lists.keys().last() {
+                if let Some((&height, list)) = engine.masternode_lists.iter().next_back() {
+                    let last_hash = list.block_hash;
                     drop(engine);
+                    self.sync_state.last_synced_block_hash = Some(last_hash);
                     self.progress.update_current_height(height);
                     tracing::debug!("Incremental MnListDiff complete at height {}", height);
                     return Ok(vec![SyncEvent::MasternodeStateUpdated {
