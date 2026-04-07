@@ -26,7 +26,7 @@ pub(super) enum PipelineMode {
     /// Post-QRInfo quorum validation diffs. Run full `verify_and_complete()` on completion.
     #[default]
     QuorumValidation,
-    /// Per-block incremental masternode list update. Skip quorum verification on completion.
+    /// Per-block incremental masternode list update. Verifies non-rotating quorums on completion.
     Incremental,
 }
 
@@ -290,6 +290,7 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                         engine.masternode_lists.remove(&height);
                         drop(engine);
                         self.sync_state.known_mn_list_heights.remove(&height);
+                        self.sync_state.known_block_hashes.remove(&last_hash);
                         return Ok(vec![]);
                     }
 
