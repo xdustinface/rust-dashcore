@@ -27,9 +27,7 @@ pub(super) enum PipelineMode {
     #[default]
     QuorumValidation,
     /// Per-block incremental masternode list update. Skip quorum verification on completion.
-    Incremental {
-        target: BlockHash,
-    },
+    Incremental,
 }
 
 /// Sync state for masternode list synchronization.
@@ -181,9 +179,7 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                 BlockHash::all_zeros()
             });
 
-        self.sync_state.pipeline_mode = PipelineMode::Incremental {
-            target: tip_hash,
-        };
+        self.sync_state.pipeline_mode = PipelineMode::Incremental;
         self.sync_state.mnlistdiff_pipeline.queue_requests(vec![(base_hash, tip_hash)]);
         self.sync_state.mnlistdiff_pipeline.send_pending(requests)?;
 
@@ -254,7 +250,7 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                 tracing::info!("All MnListDiff responses received");
                 self.verify_and_complete().await
             }
-            PipelineMode::Incremental { .. } => {
+            PipelineMode::Incremental => {
                 let engine = self.engine.read().await;
                 if let Some((&height, list)) = engine.masternode_lists.iter().next_back() {
                     let last_hash = list.block_hash;
@@ -325,6 +321,8 @@ impl<H: BlockHeaderStorage> std::fmt::Debug for MasternodesManager<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dashcore::sml::masternode_list::MasternodeList;
+
     use crate::network::MessageType;
     use crate::storage::{DiskStorageManager, PersistentBlockHeaderStorage, StorageManager};
     use crate::sync::sync_manager::SyncManager;
@@ -405,10 +403,39 @@ mod tests {
     #[tokio::test]
     async fn test_clear_pending_resets_pipeline_mode() {
         let mut manager = create_test_manager().await;
-        manager.sync_state.pipeline_mode = PipelineMode::Incremental {
-            target: BlockHash::all_zeros(),
-        };
+        manager.sync_state.pipeline_mode = PipelineMode::Incremental;
+        manager.sync_state.chainlock_retry_after = Some(Instant::now());
         manager.sync_state.clear_pending();
         assert!(matches!(manager.sync_state.pipeline_mode, PipelineMode::QuorumValidation));
+        assert!(manager.sync_state.chainlock_retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_complete_pipeline_incremental_emits_event() {
+        let mut manager = create_test_manager().await;
+        let fake_hash = BlockHash::all_zeros();
+
+        // Insert a fake masternode list at height 100 into the engine
+        let mn_list = MasternodeList::empty(fake_hash, 100);
+        manager.engine.write().await.masternode_lists.insert(100, mn_list);
+
+        manager.sync_state.pipeline_mode = PipelineMode::Incremental;
+        let events = manager.complete_pipeline().await.unwrap();
+
+        // `last_synced_block_hash` should be derived from the engine's actual state
+        assert_eq!(manager.sync_state.last_synced_block_hash, Some(fake_hash));
+        assert_eq!(manager.progress.current_height(), 100);
+        assert!(events.iter().any(|e| matches!(e, SyncEvent::MasternodeStateUpdated { height: 100 })));
+    }
+
+    #[tokio::test]
+    async fn test_complete_pipeline_incremental_no_op_when_engine_empty() {
+        let mut manager = create_test_manager().await;
+        manager.sync_state.pipeline_mode = PipelineMode::Incremental;
+        let events = manager.complete_pipeline().await.unwrap();
+
+        // Engine has no masternode lists, so nothing should be emitted or advanced
+        assert!(events.is_empty());
+        assert!(manager.sync_state.last_synced_block_hash.is_none());
     }
 }
