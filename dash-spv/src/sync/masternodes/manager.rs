@@ -59,8 +59,14 @@ impl MasternodeSyncState {
         Self::default()
     }
 
+    pub(super) fn is_incremental(&self) -> bool {
+        matches!(self.pipeline_mode, PipelineMode::Incremental)
+    }
+
     pub(super) fn has_pending_requests(&self) -> bool {
-        !self.mnlistdiff_pipeline.is_complete() || self.waiting_for_qrinfo
+        !self.mnlistdiff_pipeline.is_complete()
+            || self.waiting_for_qrinfo
+            || self.chainlock_retry_after.is_some()
     }
 
     pub(super) fn clear_pending(&mut self) {
@@ -278,6 +284,10 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                             height,
                             e
                         );
+                        // Remove unverified entry so the engine stays consistent with
+                        // `last_synced_block_hash` and future diffs don't build on
+                        // unverified state.
+                        engine.masternode_lists.remove(&height);
                         drop(engine);
                         return Ok(vec![]);
                     }
