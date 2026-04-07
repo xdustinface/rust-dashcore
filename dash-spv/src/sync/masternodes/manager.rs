@@ -162,6 +162,11 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         &mut self,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        debug_assert!(
+            self.sync_state.mnlistdiff_pipeline.is_complete(),
+            "Pipeline must be complete before starting an incremental request"
+        );
+
         let storage = self.header_storage.read().await;
         let tip = match storage.get_tip().await {
             Some(tip) => tip,
@@ -178,6 +183,14 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                 tracing::warn!("No last synced block hash or genesis hash available, falling back to all-zeros hash");
                 BlockHash::all_zeros()
             });
+
+        if base_hash == tip_hash {
+            tracing::debug!(
+                "Skipping incremental MnListDiff: base and tip are the same ({})",
+                tip_hash
+            );
+            return Ok(vec![]);
+        }
 
         self.sync_state.pipeline_mode = PipelineMode::Incremental;
         self.sync_state.mnlistdiff_pipeline.queue_requests(vec![(base_hash, tip_hash)]);
@@ -339,10 +352,15 @@ impl<H: BlockHeaderStorage> std::fmt::Debug for MasternodesManager<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dashcore::block::Header;
+    use dashcore::network::message::NetworkMessage;
     use dashcore::sml::masternode_list::MasternodeList;
+    use tokio::sync::mpsc;
 
-    use crate::network::MessageType;
-    use crate::storage::{DiskStorageManager, PersistentBlockHeaderStorage, StorageManager};
+    use crate::network::{MessageType, NetworkRequest, RequestSender};
+    use crate::storage::{
+        BlockHeaderStorage, DiskStorageManager, PersistentBlockHeaderStorage, StorageManager,
+    };
     use crate::sync::sync_manager::SyncManager;
     use crate::sync::{ManagerIdentifier, SyncManagerProgress};
 
@@ -460,5 +478,78 @@ mod tests {
         // Engine has no masternode lists, so nothing should be emitted or advanced
         assert!(events.is_empty());
         assert!(manager.sync_state.last_synced_block_hash.is_none());
+    }
+
+    fn create_test_request_sender() -> (RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (RequestSender::new(tx), rx)
+    }
+
+    #[tokio::test]
+    async fn test_send_mnlistdiff_for_tip_uses_last_synced_hash() {
+        let mut manager = create_test_manager().await;
+        let (requests, mut rx) = create_test_request_sender();
+
+        // Store a header so `get_tip()` returns something
+        let header = Header::dummy(100);
+        let tip_hash = header.block_hash();
+        manager.header_storage.write().await.store_headers_at_height(&[header], 100).await.unwrap();
+
+        // Set last_synced_block_hash to simulate a previous sync
+        let base_hash = BlockHash::from_byte_array([0xAA; 32]);
+        manager.sync_state.last_synced_block_hash = Some(base_hash);
+
+        manager.send_mnlistdiff_for_tip(&requests).await.unwrap();
+
+        assert!(matches!(manager.sync_state.pipeline_mode, PipelineMode::Incremental));
+        assert!(!manager.sync_state.mnlistdiff_pipeline.is_complete());
+
+        // Verify the sent message uses last_synced_block_hash as base
+        let msg = rx.try_recv().unwrap();
+        if let NetworkRequest::SendMessage(NetworkMessage::GetMnListD(get_diff)) = msg {
+            assert_eq!(get_diff.base_block_hash, base_hash);
+            assert_eq!(get_diff.block_hash, tip_hash);
+        } else {
+            panic!("Expected GetMnListD message");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_mnlistdiff_for_tip_falls_back_to_genesis() {
+        let mut manager = create_test_manager().await;
+        let (requests, mut rx) = create_test_request_sender();
+
+        // Store a header so `get_tip()` returns something
+        let header = Header::dummy(100);
+        let tip_hash = header.block_hash();
+        manager.header_storage.write().await.store_headers_at_height(&[header], 100).await.unwrap();
+
+        // No last_synced_block_hash set, should fall back to genesis
+        assert!(manager.sync_state.last_synced_block_hash.is_none());
+
+        manager.send_mnlistdiff_for_tip(&requests).await.unwrap();
+
+        assert!(matches!(manager.sync_state.pipeline_mode, PipelineMode::Incremental));
+
+        // Verify the sent message uses the genesis hash as base
+        let genesis_hash = dashcore::Network::Testnet.known_genesis_block_hash().unwrap();
+        let msg = rx.try_recv().unwrap();
+        if let NetworkRequest::SendMessage(NetworkMessage::GetMnListD(get_diff)) = msg {
+            assert_eq!(get_diff.base_block_hash, genesis_hash);
+            assert_eq!(get_diff.block_hash, tip_hash);
+        } else {
+            panic!("Expected GetMnListD message");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_mnlistdiff_for_tip_no_op_without_headers() {
+        let mut manager = create_test_manager().await;
+        let (requests, _rx) = create_test_request_sender();
+
+        // No headers stored, should return empty
+        let events = manager.send_mnlistdiff_for_tip(&requests).await.unwrap();
+        assert!(events.is_empty());
+        assert!(manager.sync_state.mnlistdiff_pipeline.is_complete());
     }
 }
