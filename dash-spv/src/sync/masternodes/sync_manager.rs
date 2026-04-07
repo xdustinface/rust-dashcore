@@ -404,6 +404,12 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                         // forever (which would cause timeout -> requeue -> fail loops)
                         self.sync_state.mnlistdiff_pipeline.receive(diff);
                         if self.sync_state.mnlistdiff_pipeline.is_complete() {
+                            // In Incremental mode, a failed apply means the engine
+                            // state is unchanged — skip completion to avoid emitting a
+                            // spurious MasternodeStateUpdated for stale state.
+                            if self.sync_state.is_incremental() {
+                                return Ok(vec![]);
+                            }
                             return self.complete_pipeline().await;
                         }
                         return Ok(vec![]);
