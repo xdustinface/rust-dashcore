@@ -251,9 +251,24 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
                 self.verify_and_complete().await
             }
             PipelineMode::Incremental => {
-                let engine = self.engine.read().await;
+                // The engine maintains a single latest list for incremental updates,
+                // so reading from the engine's last entry gives us the result of the
+                // diff we just applied.
+                let mut engine = self.engine.write().await;
                 if let Some((&height, list)) = engine.masternode_lists.iter().next_back() {
                     let last_hash = list.block_hash;
+
+                    if let Err(e) = engine.verify_non_rotating_masternode_list_quorums(height, &[])
+                    {
+                        tracing::warn!(
+                            "Incremental quorum verification failed at height {}: {}",
+                            height,
+                            e
+                        );
+                        drop(engine);
+                        return Ok(vec![]);
+                    }
+
                     drop(engine);
                     self.sync_state.last_synced_block_hash = Some(last_hash);
                     self.progress.update_current_height(height);
