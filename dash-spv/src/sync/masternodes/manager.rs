@@ -425,7 +425,12 @@ mod tests {
         // `last_synced_block_hash` should be derived from the engine's actual state
         assert_eq!(manager.sync_state.last_synced_block_hash, Some(fake_hash));
         assert_eq!(manager.progress.current_height(), 100);
-        assert!(events.iter().any(|e| matches!(e, SyncEvent::MasternodeStateUpdated { height: 100 })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SyncEvent::MasternodeStateUpdated {
+                height: 100
+            }
+        )));
     }
 
     #[tokio::test]
