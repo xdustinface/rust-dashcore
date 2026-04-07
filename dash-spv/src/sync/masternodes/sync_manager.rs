@@ -400,6 +400,8 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                             target_height,
                             e
                         );
+                        drop(engine);
+                        return Ok(vec![]);
                     }
                 }
                 drop(engine);
