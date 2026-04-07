@@ -152,6 +152,9 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
             return true;
         }
         let interval = self.network.isd_llmq_type().params().dkg_params.interval;
+        if interval == 0 {
+            return true;
+        }
         tip_height / interval > last / interval
     }
 
