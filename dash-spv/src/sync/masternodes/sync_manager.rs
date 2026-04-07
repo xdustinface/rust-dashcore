@@ -335,10 +335,9 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                 self.sync_state.mnlistdiff_pipeline.queue_requests(request_pairs);
                 self.sync_state.mnlistdiff_pipeline.send_pending(requests)?;
 
-                // Track last processed block hash
+                // Track processed block hash for future known-hash lists
                 let block_hash = qr_info.mn_list_diff_h.block_hash;
                 self.sync_state.known_block_hashes.insert(block_hash);
-                self.sync_state.last_synced_block_hash = Some(block_hash);
 
                 self.progress.bump_last_activity();
 

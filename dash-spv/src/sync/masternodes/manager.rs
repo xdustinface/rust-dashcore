@@ -278,7 +278,9 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         let mut engine = self.engine.write().await;
 
         // Get the latest height from the engine and verify at that height
-        if let Some(&height) = engine.masternode_lists.keys().last() {
+        if let Some((&height, list)) = engine.masternode_lists.iter().next_back() {
+            let last_hash = list.block_hash;
+
             if let Err(e) = engine.verify_non_rotating_masternode_list_quorums(height, &[]) {
                 drop(engine);
                 self.set_state(SyncState::Error);
@@ -290,6 +292,7 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
 
             tracing::info!("Non-rotating quorum verification completed at height {}", height);
 
+            self.sync_state.last_synced_block_hash = Some(last_hash);
             self.progress.update_current_height(height);
 
             events.push(SyncEvent::MasternodeStateUpdated {
