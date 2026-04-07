@@ -400,6 +400,12 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                             e
                         );
                         drop(engine);
+                        // Mark as received so the pipeline slot doesn't stay in-flight
+                        // forever (which would cause timeout -> requeue -> fail loops)
+                        self.sync_state.mnlistdiff_pipeline.receive(diff);
+                        if self.sync_state.mnlistdiff_pipeline.is_complete() {
+                            return self.complete_pipeline().await;
+                        }
                         return Ok(vec![]);
                     }
                 }
