@@ -69,6 +69,7 @@ impl MasternodeSyncState {
         self.mnlistdiff_pipeline.clear();
         self.waiting_for_qrinfo = false;
         self.qrinfo_wait_start = None;
+        self.chainlock_retry_after = None;
         self.pipeline_mode = PipelineMode::QuorumValidation;
     }
 
