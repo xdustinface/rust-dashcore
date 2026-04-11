@@ -98,6 +98,14 @@ pub enum QuorumValidationError {
     #[error("Required quorum index not present for quorum hash: {0}")]
     RequiredQuorumIndexNotPresent(QuorumHash),
 
+    #[error(
+        "Too many rotated quorums in cycle for {llmq_type}: cap is {cap}, attempted to insert another"
+    )]
+    TooManyRotatedQuorumsInCycle {
+        llmq_type: LLMQType,
+        cap: usize,
+    },
+
     #[error("Corrupted code execution: {0}")]
     CorruptedCodeExecution(String),
     #[error("Expected only rotated quorums, but got quorum {0} of type {1}")]
