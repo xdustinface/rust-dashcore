@@ -129,6 +129,24 @@ where
     Ok(v)
 }
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 1_000;
+
+fn clamp_peer_consecutive_failures<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut v = u32::deserialize(deserializer)?;
+
+    if v > MAX_CONSECUTIVE_FAILURES {
+        tracing::warn!(
+            "Peer has excessive consecutive failures {v}, clamping to {MAX_CONSECUTIVE_FAILURES}"
+        );
+        v = MAX_CONSECUTIVE_FAILURES
+    }
+
+    Ok(v)
+}
+
 /// Peer reputation entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
@@ -176,6 +194,7 @@ pub struct PeerReputation {
     pub last_tried: Option<SystemTime>,
 
     /// Failures since the last success. Resets to 0 on a successful handshake.
+    #[serde(deserialize_with = "clamp_peer_consecutive_failures")]
     pub consecutive_failures: u32,
 }
 
