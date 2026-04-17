@@ -147,6 +147,18 @@ where
     Ok(v)
 }
 
+/// Clock-drift tolerance for future timestamps: up to 10 seconds ahead is accepted.
+const FUTURE_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(10);
+
+fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<SystemTime>::deserialize(d)?;
+    let deadline = SystemTime::now() + FUTURE_TIMESTAMP_TOLERANCE;
+    Ok(opt.filter(|t| *t <= deadline))
+}
+
 /// Peer reputation entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
@@ -186,11 +198,13 @@ pub struct PeerReputation {
     pub last_connection: Option<Instant>,
 
     /// Wall-clock time of the last successful handshake with this peer.
+    #[serde(default, deserialize_with = "clamp_future_system_time")]
     pub last_success: Option<SystemTime>,
 
     /// Wall-clock time of the last attempted connection to this peer (persisted across
     /// restarts). The canonical source for cooldown and backoff decisions that must
     /// survive process restarts. Distinct from `last_connection`, which is session-only.
+    #[serde(default, deserialize_with = "clamp_future_system_time")]
     pub last_tried: Option<SystemTime>,
 
     /// Failures since the last success. Resets to 0 on a successful handshake.
@@ -445,12 +459,18 @@ impl PeerReputationManager {
 
     /// Record a connection failure and apply a reputation penalty in a single write-lock
     /// acquisition. Returns `true` if the peer was banned by this call.
+    ///
+    /// `score_change` must be non-negative. Failure paths apply penalties (positive delta), not rewards.
     pub async fn record_failure_with_penalty(
         &self,
         peer: SocketAddr,
         score_change: i32,
         reason: &str,
     ) -> bool {
+        debug_assert!(
+            score_change >= 0,
+            "record_failure_with_penalty expects non-negative score change"
+        );
         let should_ban = {
             let mut reputations = self.reputations.write().await;
             let reputation = reputations.entry(peer).or_default();
