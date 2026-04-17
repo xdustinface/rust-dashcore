@@ -19,6 +19,7 @@ use crate::network::pool::PeerPool;
 use crate::network::reputation::{
     misbehavior_scores, positive_scores, PeerReputationManager, ReputationAware,
 };
+use crate::network::required_services::RequiredServices;
 use crate::network::{
     HandshakeManager, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
     NetworkRequest, Peer, RequestSender,
@@ -62,6 +63,12 @@ pub struct PeerNetworkManager {
     user_agent: Option<String>,
     /// Exclusive mode: restrict to configured peers only (no DNS or peer store)
     exclusive_mode: bool,
+    /// Services peers must advertise to be eligible for selection.
+    required_services: RequiredServices,
+    /// Set of explicit peer addresses from `ClientConfig.peers`. These bypass the
+    /// `required_services` hard-filter because their real services are not known until
+    /// after handshake.
+    explicit_peers: HashSet<SocketAddr>,
     /// Cached count of currently connected peers for fast, non-blocking queries
     connected_peer_count: Arc<AtomicUsize>,
     /// Disable headers2 after decompression failure
@@ -111,6 +118,8 @@ impl PeerNetworkManager {
             data_dir,
             user_agent: config.user_agent.clone(),
             exclusive_mode,
+            required_services: RequiredServices::from_config(config),
+            explicit_peers: config.peers.iter().copied().collect(),
             connected_peer_count: Arc::new(AtomicUsize::new(0)),
             headers2_disabled: Arc::new(Mutex::new(HashSet::new())),
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
@@ -888,8 +897,18 @@ impl PeerNetworkManager {
                 // Try known addresses first, sorted by reputation
                 let known = self.addrv2_handler.get_known_addresses().await;
                 let needed = TARGET_PEERS.saturating_sub(count);
-                // Select best peers based on reputation
-                let best_peers = self.reputation_manager.select_best_peers(known, needed * 2).await;
+                // Capability-aware reputation-ranked selection. If no peers survive the
+                // hard filters, the maintenance tick ends empty-handed so DNS discovery can
+                // replenish known addresses on a subsequent cycle.
+                let best_peers = self
+                    .reputation_manager
+                    .select_best_peers(
+                        self.required_services,
+                        known,
+                        needed * 2,
+                        &self.explicit_peers,
+                    )
+                    .await;
                 let mut attempted = 0;
 
                 for addr in best_peers {
@@ -1283,6 +1302,8 @@ impl Clone for PeerNetworkManager {
             data_dir: self.data_dir.clone(),
             user_agent: self.user_agent.clone(),
             exclusive_mode: self.exclusive_mode,
+            required_services: self.required_services,
+            explicit_peers: self.explicit_peers.clone(),
             connected_peer_count: self.connected_peer_count.clone(),
             headers2_disabled: self.headers2_disabled.clone(),
             message_dispatcher: self.message_dispatcher.clone(),

@@ -5,13 +5,15 @@
 //! implements automatic banning for excessive misbehavior, and provides reputation
 //! decay over time for recovery.
 
+use crate::network::required_services::RequiredServices;
 use crate::storage::PeerStorage;
 use dashcore::network::address::AddrV2Message;
+use dashcore::network::constants::ServiceFlags;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 /// Misbehavior score thresholds for different violations
@@ -149,6 +151,35 @@ where
 
 /// Clock-drift tolerance for future timestamps: up to 10 seconds ahead is accepted.
 const FUTURE_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(10);
+
+/// Exponential backoff steps applied after repeated connection failures. Indexed
+/// by `consecutive_failures - 1`, clamped to the last entry once the streak
+/// exceeds the table length.
+pub(crate) const COOLDOWN_STEPS: [Duration; 5] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(2 * 60 * 60),
+];
+
+/// Tunables for the capability-aware peer-selection score. Lower composite score is
+/// better, matching the existing reputation convention.
+mod scoring_weights {
+    /// Weight applied to the success ratio (successful / attempts). Subtracted from
+    /// the composite score so peers with a high historical success rate rank ahead
+    /// of peers at the same reputation score.
+    pub(super) const SUCCESS_RATIO_WEIGHT: f64 = 30.0;
+
+    /// Seconds of `AddrV2.time` staleness per 1 point of penalty.
+    pub(super) const STALENESS_SECS_PER_POINT: f64 = 600.0;
+
+    /// Cap on the staleness penalty so a very old address cannot dominate the score.
+    pub(super) const STALENESS_CAP: f64 = 50.0;
+
+    /// Bonus subtracted when the peer advertises `NODE_HEADERS_COMPRESSED`.
+    pub(super) const PREFERRED_SERVICES_BONUS: f64 = 15.0;
+}
 
 fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
 where
@@ -306,6 +337,32 @@ impl PeerReputation {
         }
 
         should_ban
+    }
+
+    /// Return the backoff duration that should apply after `last_tried` given
+    /// the current `consecutive_failures` streak. `None` means no cooldown is
+    /// imposed, either because there are no failures or because there is no
+    /// temporal anchor in `last_tried`.
+    pub(crate) fn cooldown(&self) -> Option<Duration> {
+        if self.consecutive_failures == 0 {
+            return None;
+        }
+        let idx =
+            (self.consecutive_failures as usize).saturating_sub(1).min(COOLDOWN_STEPS.len() - 1);
+        Some(COOLDOWN_STEPS[idx])
+    }
+
+    /// True when `now` still falls inside the cooldown window anchored at
+    /// `last_tried`. Returns false if either the streak is zero or `last_tried`
+    /// is missing (e.g. discarded on load).
+    pub(crate) fn in_cooldown(&self, now: SystemTime) -> bool {
+        match (self.last_tried, self.cooldown()) {
+            (Some(last), Some(cd)) => match last.checked_add(cd) {
+                Some(deadline) => deadline > now,
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     /// Apply reputation decay
@@ -606,13 +663,47 @@ impl PeerReputationManager {
     }
 }
 
+/// Combine reputation score, historical success ratio, gossip staleness and the
+/// preferred-services bonus into a single score. Lower is better.
+fn composite_score(reputation: &PeerReputation, addr: &AddrV2Message, now_epoch_secs: u64) -> f64 {
+    let mut score = reputation.score as f64;
+
+    let attempts = reputation.connection_attempts.max(1) as f64;
+    let success_ratio = (reputation.successful_connections as f64 / attempts).clamp(0.0, 1.0);
+    score -= success_ratio * scoring_weights::SUCCESS_RATIO_WEIGHT;
+
+    // Clamp addr.time to at most now so a peer-controlled future timestamp cannot
+    // zero out the staleness penalty.
+    let addr_time = (addr.time as u64).min(now_epoch_secs);
+    let staleness_secs = now_epoch_secs.saturating_sub(addr_time) as f64;
+    let staleness_penalty = (staleness_secs / scoring_weights::STALENESS_SECS_PER_POINT)
+        .min(scoring_weights::STALENESS_CAP);
+    score += staleness_penalty;
+
+    if addr.services.has(ServiceFlags::NODE_HEADERS_COMPRESSED) {
+        score -= scoring_weights::PREFERRED_SERVICES_BONUS;
+    }
+
+    score
+}
+
 /// Helper trait for reputation-aware peer selection
-pub trait ReputationAware {
-    /// Select best peers based on reputation
+pub(crate) trait ReputationAware {
+    /// Select best peers that satisfy `required` services and are not banned.
+    ///
+    /// Peers whose address appears in `explicit_peers` bypass the `required` services
+    /// hard-filter (they are still subject to ban and cooldown filters). This allows
+    /// user-configured peers to be selected even when their services are not yet known
+    /// (services are learned only after handshake).
+    ///
+    /// An empty return value indicates no capable survivors, allowing callers
+    /// to fall back to DNS discovery rather than connecting to an incapable peer.
     fn select_best_peers(
         &self,
+        required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
+        explicit_peers: &HashSet<SocketAddr>,
     ) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
 
     /// Check if we should connect to a peer based on reputation
@@ -625,31 +716,67 @@ pub trait ReputationAware {
 impl ReputationAware for PeerReputationManager {
     async fn select_best_peers(
         &self,
+        required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
+        explicit_peers: &HashSet<SocketAddr>,
     ) -> Vec<SocketAddr> {
-        let mut peer_scores = Vec::new();
-        let mut reputations = self.reputations.write().await;
-
-        for peer in available_peers {
-            let Ok(socket_addr) = peer.socket_addr() else {
-                tracing::warn!("Skip invalid peer address: {:?}", peer);
-                continue;
-            };
-
-            let reputation = reputations.entry(socket_addr).or_default();
-            reputation.apply_decay();
-
-            if !reputation.is_banned() {
-                peer_scores.push((socket_addr, reputation.score));
-            }
+        if count == 0 {
+            return Vec::new();
         }
 
-        // Sort by score (lower is better)
-        peer_scores.sort_by_key(|(_, score)| *score);
+        let now_system = SystemTime::now();
+        let now_epoch_secs =
+            now_system.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
-        // Return the best peers
-        peer_scores.into_iter().take(count).map(|(peer, _)| peer).collect()
+        // Collect candidates under the write lock: apply decay and clone reputation data.
+        // The lock is held only for this gathering phase, not for the sort that follows.
+        let candidates: Vec<(SocketAddr, PeerReputation, AddrV2Message)> = {
+            let mut reputations = self.reputations.write().await;
+            let mut out = Vec::with_capacity(available_peers.len());
+
+            for peer in available_peers {
+                let Ok(socket_addr) = peer.socket_addr() else {
+                    tracing::warn!("Skip invalid peer address: {:?}", peer);
+                    continue;
+                };
+
+                // Explicit peers bypass the services hard-filter; all others must satisfy it.
+                if !explicit_peers.contains(&socket_addr)
+                    && !required.is_satisfied_by(peer.services)
+                {
+                    continue;
+                }
+
+                // Read reputation without inserting a default entry for unknown peers.
+                let mut rep = reputations.get(&socket_addr).cloned().unwrap_or_default();
+                rep.apply_decay();
+
+                // Persist decay back only for peers that already have an entry.
+                if let Some(stored) = reputations.get_mut(&socket_addr) {
+                    stored.apply_decay();
+                }
+
+                if rep.is_banned() {
+                    continue;
+                }
+
+                if rep.in_cooldown(now_system) {
+                    continue;
+                }
+
+                out.push((socket_addr, rep, peer));
+            }
+            out
+        };
+
+        let mut scored: Vec<(SocketAddr, f64)> = candidates
+            .into_iter()
+            .map(|(addr, rep, peer)| (addr, composite_score(&rep, &peer, now_epoch_secs)))
+            .collect();
+
+        scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(count).map(|(peer, _)| peer).collect()
     }
 
     async fn should_connect_to_peer(&self, peer: &SocketAddr) -> bool {
