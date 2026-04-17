@@ -379,4 +379,39 @@ mod tests {
         assert!(rep.last_success.is_some(), "success sets last_success");
         assert_eq!(rep.consecutive_failures, 0);
     }
+
+    #[tokio::test]
+    async fn test_normalize_after_load_via_storage_round_trip() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Write a reputations.json directly so we can embed a future `last_tried`
+        // that `clamp_future_system_time` will discard on load, and a non-zero
+        // `consecutive_failures` that `normalize_after_load` must then reset to 0.
+        let peers_dir = temp_dir.path().join("peers");
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        let reputation_file = peers_dir.join("reputations.json");
+
+        let future_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3_600;
+        let json = format!(
+            r#"{{"127.0.0.1:9202":{{"score":0,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":3,"successful_connections":2,"last_success":null,"last_tried":{{"secs_since_epoch":{future_secs},"nanos_since_epoch":0}},"consecutive_failures":5}}}}"#
+        );
+        std::fs::write(&reputation_file, json).unwrap();
+
+        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
+            .await
+            .expect("Failed to open PersistentPeerStorage");
+
+        let manager = PeerReputationManager::new();
+        manager.load_from_storage(&peer_storage).await.unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:9202".parse().unwrap();
+        let reputations = manager.get_all_reputations().await;
+        let rep = reputations.get(&peer).expect("peer must be present after load");
+
+        assert!(rep.last_tried.is_none(), "future last_tried must be discarded by clamp");
+        assert_eq!(
+            rep.consecutive_failures, 0,
+            "normalize_after_load must reset streak when last_tried is absent"
+        );
+    }
 }
