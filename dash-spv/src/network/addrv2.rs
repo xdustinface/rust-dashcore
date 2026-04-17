@@ -261,6 +261,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mark_seen_evicts_when_at_capacity() {
+        let handler = AddrV2Handler::new();
+
+        for i in 0..MAX_ADDR_TO_STORE {
+            let addr: SocketAddr = format!("10.{}.{}.1:9999", i / 256, i % 256).parse().unwrap();
+            handler.add_known_address(addr, ServiceFlags::NETWORK).await;
+        }
+
+        assert_eq!(handler.get_known_addresses().await.len(), MAX_ADDR_TO_STORE);
+
+        let new_addr: SocketAddr = "192.168.99.99:9999".parse().unwrap();
+        handler.mark_seen(new_addr, ServiceFlags::NETWORK).await;
+
+        let known = handler.get_known_addresses().await;
+        assert!(known.len() <= MAX_ADDR_TO_STORE);
+        assert!(known.iter().any(|m| m.socket_addr().ok() == Some(new_addr)));
+    }
+
+    #[tokio::test]
     async fn test_addrv2_timestamp_validation() {
         let handler = AddrV2Handler::new();
         let now = SystemTime::now()

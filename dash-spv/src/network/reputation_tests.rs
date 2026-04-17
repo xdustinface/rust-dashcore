@@ -241,6 +241,15 @@ mod tests {
         let manager = PeerReputationManager::new();
         let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
 
+        manager.record_successful_connection(peer).await;
+        let success_ts = manager
+            .get_all_reputations()
+            .await
+            .get(&peer)
+            .expect("peer exists")
+            .last_success
+            .expect("last_success should be set after successful connection");
+
         let banned = manager
             .record_failure_with_penalty(peer, misbehavior_scores::INVALID_MESSAGE, "test")
             .await;
@@ -250,6 +259,11 @@ mod tests {
         let rep = &reputations[&peer];
         assert_eq!(rep.consecutive_failures, 1);
         assert_eq!(rep.score, misbehavior_scores::INVALID_MESSAGE);
+        assert_eq!(
+            rep.last_success,
+            Some(success_ts),
+            "record_failure_with_penalty must not clear last_success"
+        );
     }
 
     #[tokio::test]
@@ -299,6 +313,13 @@ mod tests {
         assert!(second, "second call should trigger a ban");
         assert!(manager.is_banned(&peer).await);
         assert_eq!(manager.get_all_reputations().await[&peer].consecutive_failures, 2);
+    }
+
+    #[test]
+    fn test_consecutive_failures_clamped_on_deserialize() {
+        let json = r#"{"score":0,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":0,"successful_connections":0,"last_success":null,"last_tried":null,"consecutive_failures":99999}"#;
+        let rep: PeerReputation = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(rep.consecutive_failures, MAX_CONSECUTIVE_FAILURES);
     }
 
     #[tokio::test]
