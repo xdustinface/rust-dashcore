@@ -166,15 +166,12 @@ pub struct PeerReputation {
     pub last_connection: Option<Instant>,
 
     /// Wall-clock time of the last successful handshake with this peer.
-    #[serde(default)]
     pub last_success: Option<SystemTime>,
 
     /// Wall-clock time of the last attempted connection to this peer.
-    #[serde(default)]
     pub last_tried: Option<SystemTime>,
 
     /// Failures since the last success. Resets to 0 on a successful handshake.
-    #[serde(default)]
     pub consecutive_failures: u32,
 }
 

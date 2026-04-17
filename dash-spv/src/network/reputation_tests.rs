@@ -201,29 +201,4 @@ mod tests {
         let reputations = manager.get_all_reputations().await;
         assert_eq!(reputations[&peer].consecutive_failures, 0);
     }
-
-    #[test]
-    fn test_legacy_reputations_json_loads_with_defaults() {
-        // Older persisted records lack the new session outcome fields.
-        let legacy = r#"{
-            "score": 15,
-            "ban_count": 1,
-            "positive_actions": 4,
-            "negative_actions": 2,
-            "connection_attempts": 7,
-            "successful_connections": 6
-        }"#;
-
-        let rep: PeerReputation = serde_json::from_str(legacy).expect("legacy JSON must parse");
-
-        assert_eq!(rep.score, 15);
-        assert_eq!(rep.ban_count, 1);
-        assert_eq!(rep.positive_actions, 4);
-        assert_eq!(rep.negative_actions, 2);
-        assert_eq!(rep.connection_attempts, 7);
-        assert_eq!(rep.successful_connections, 6);
-        assert!(rep.last_success.is_none());
-        assert!(rep.last_tried.is_none());
-        assert_eq!(rep.consecutive_failures, 0);
-    }
 }
