@@ -2,11 +2,17 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::network::required_services::RequiredServices;
     use crate::storage::{PersistentPeerStorage, PersistentStorage};
 
     use super::super::*;
+    use dashcore::network::constants::ServiceFlags;
     use std::net::SocketAddr;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn network_required() -> RequiredServices {
+        RequiredServices::from_flags(ServiceFlags::NETWORK)
+    }
 
     #[tokio::test]
     async fn test_basic_reputation_operations() {
@@ -82,9 +88,12 @@ mod tests {
     async fn test_peer_selection() {
         let manager = PeerReputationManager::new();
 
-        let good_peer = AddrV2Message::dummy(0, "1.1.1.1".parse().unwrap(), 8333);
-        let neutral_peer = AddrV2Message::dummy(0, "2.2.2.2".parse().unwrap(), 8333);
-        let bad_peer = AddrV2Message::dummy(0, "3.3.3.3".parse().unwrap(), 8333);
+        let mut good_peer = AddrV2Message::dummy(0, "1.1.1.1".parse().unwrap(), 8333);
+        good_peer.services = ServiceFlags::NETWORK;
+        let mut neutral_peer = AddrV2Message::dummy(0, "2.2.2.2".parse().unwrap(), 8333);
+        neutral_peer.services = ServiceFlags::NETWORK;
+        let mut bad_peer = AddrV2Message::dummy(0, "3.3.3.3".parse().unwrap(), 8333);
+        bad_peer.services = ServiceFlags::NETWORK;
 
         // Set different reputations
         manager.update_reputation(good_peer.socket_addr().unwrap(), -20, "Very good").await;
@@ -92,7 +101,7 @@ mod tests {
         // neutral_peer has default score of 0
 
         let all_peers = vec![good_peer.clone(), neutral_peer.clone(), bad_peer.clone()];
-        let selected = manager.select_best_peers(all_peers, 2).await;
+        let selected = manager.select_best_peers(network_required(), all_peers, 2).await;
 
         // Should select good_peer first, then neutral_peer
         assert_eq!(selected.len(), 2);

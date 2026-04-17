@@ -5,6 +5,7 @@
 //! implements automatic banning for excessive misbehavior, and provides reputation
 //! decay over time for recovery.
 
+use crate::network::required_services::RequiredServices;
 use crate::storage::PeerStorage;
 use dashcore::network::address::AddrV2Message;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -607,10 +608,13 @@ impl PeerReputationManager {
 }
 
 /// Helper trait for reputation-aware peer selection
-pub trait ReputationAware {
-    /// Select best peers based on reputation
+pub(crate) trait ReputationAware {
+    /// Select best peers that satisfy `required` services and are not banned.
+    /// An empty return value indicates no capable survivors, allowing callers
+    /// to fall back to DNS discovery rather than connecting to an incapable peer.
     fn select_best_peers(
         &self,
+        required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
     ) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
@@ -625,9 +629,14 @@ pub trait ReputationAware {
 impl ReputationAware for PeerReputationManager {
     async fn select_best_peers(
         &self,
+        required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
     ) -> Vec<SocketAddr> {
+        if count == 0 {
+            return Vec::new();
+        }
+
         let mut peer_scores = Vec::new();
         let mut reputations = self.reputations.write().await;
 
@@ -636,6 +645,10 @@ impl ReputationAware for PeerReputationManager {
                 tracing::warn!("Skip invalid peer address: {:?}", peer);
                 continue;
             };
+
+            if !required.is_satisfied_by(peer.services) {
+                continue;
+            }
 
             let reputation = reputations.entry(socket_addr).or_default();
             reputation.apply_decay();

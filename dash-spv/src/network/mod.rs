@@ -10,6 +10,7 @@ mod message_dispatcher;
 pub mod peer;
 pub mod pool;
 pub mod reputation;
+pub(crate) mod required_services;
 
 mod message_type;
 #[cfg(test)]
