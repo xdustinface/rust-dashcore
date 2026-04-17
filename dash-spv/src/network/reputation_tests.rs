@@ -6,6 +6,7 @@ mod tests {
 
     use super::super::*;
     use std::net::SocketAddr;
+    use std::time::SystemTime;
 
     #[tokio::test]
     async fn test_basic_reputation_operations() {
@@ -114,5 +115,115 @@ mod tests {
 
         assert_eq!(rep.connection_attempts, 2);
         assert_eq!(rep.successful_connections, 1);
+    }
+
+    #[test]
+    fn test_default_session_outcomes_are_empty() {
+        let rep = PeerReputation::default();
+
+        assert!(rep.last_success.is_none());
+        assert!(rep.last_tried.is_none());
+        assert_eq!(rep.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_record_connection_attempt_sets_last_tried() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+
+        let before = SystemTime::now();
+        manager.record_connection_attempt(peer).await;
+        let after = SystemTime::now();
+
+        let reputations = manager.get_all_reputations().await;
+        let rep = &reputations[&peer];
+
+        let last_tried = rep.last_tried.expect("last_tried should be set");
+        assert!(last_tried >= before);
+        assert!(last_tried <= after);
+        assert!(rep.last_success.is_none());
+        assert_eq!(rep.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_record_successful_connection_sets_last_success_and_resets_failures() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:2222".parse().unwrap();
+
+        // Seed a non-zero failure streak first to verify the reset behaviour.
+        manager.record_connection_failure(peer).await;
+        manager.record_connection_failure(peer).await;
+        manager.record_connection_failure(peer).await;
+        {
+            let reputations = manager.get_all_reputations().await;
+            assert_eq!(reputations[&peer].consecutive_failures, 3);
+        }
+
+        let before = SystemTime::now();
+        manager.record_successful_connection(peer).await;
+        let after = SystemTime::now();
+
+        let reputations = manager.get_all_reputations().await;
+        let rep = &reputations[&peer];
+
+        let last_success = rep.last_success.expect("last_success should be set");
+        assert!(last_success >= before);
+        assert!(last_success <= after);
+        assert_eq!(rep.consecutive_failures, 0);
+        assert_eq!(rep.successful_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn test_record_connection_failure_increments_without_clearing_last_success() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:3333".parse().unwrap();
+
+        manager.record_successful_connection(peer).await;
+        let last_success_before = manager
+            .get_all_reputations()
+            .await
+            .get(&peer)
+            .expect("peer exists")
+            .last_success
+            .expect("last_success should be set");
+
+        manager.record_connection_failure(peer).await;
+        manager.record_connection_failure(peer).await;
+
+        let reputations = manager.get_all_reputations().await;
+        let rep = &reputations[&peer];
+
+        assert_eq!(rep.consecutive_failures, 2);
+        assert_eq!(rep.last_success, Some(last_success_before));
+
+        // A subsequent success clears the streak.
+        manager.record_successful_connection(peer).await;
+        let reputations = manager.get_all_reputations().await;
+        assert_eq!(reputations[&peer].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_legacy_reputations_json_loads_with_defaults() {
+        // Older persisted records lack the new session outcome fields.
+        let legacy = r#"{
+            "score": 15,
+            "ban_count": 1,
+            "positive_actions": 4,
+            "negative_actions": 2,
+            "connection_attempts": 7,
+            "successful_connections": 6
+        }"#;
+
+        let rep: PeerReputation = serde_json::from_str(legacy).expect("legacy JSON must parse");
+
+        assert_eq!(rep.score, 15);
+        assert_eq!(rep.ban_count, 1);
+        assert_eq!(rep.positive_actions, 4);
+        assert_eq!(rep.negative_actions, 2);
+        assert_eq!(rep.connection_attempts, 7);
+        assert_eq!(rep.successful_connections, 6);
+        assert!(rep.last_success.is_none());
+        assert!(rep.last_tried.is_none());
+        assert_eq!(rep.consecutive_failures, 0);
     }
 }
