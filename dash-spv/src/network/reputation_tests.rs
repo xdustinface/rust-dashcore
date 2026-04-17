@@ -6,7 +6,7 @@ mod tests {
 
     use super::super::*;
     use std::net::SocketAddr;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn test_basic_reputation_operations() {
@@ -309,6 +309,52 @@ mod tests {
             .expect("last_tried still set after failure");
 
         assert!(after_failure > attempt_time, "failure should update last_tried");
+    }
+
+    fn make_reputation_json(
+        last_tried_secs: Option<u64>,
+        last_success_secs: Option<u64>,
+    ) -> String {
+        let last_tried = match last_tried_secs {
+            Some(s) => format!(r#"{{"secs_since_epoch":{s},"nanos_since_epoch":0}}"#),
+            None => "null".to_string(),
+        };
+        let last_success = match last_success_secs {
+            Some(s) => format!(r#"{{"secs_since_epoch":{s},"nanos_since_epoch":0}}"#),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"score":0,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":0,"successful_connections":0,"last_success":{last_success},"last_tried":{last_tried},"consecutive_failures":0}}"#
+        )
+    }
+
+    #[test]
+    fn test_clamp_future_system_time_rejects_future() {
+        let future_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+        let json = make_reputation_json(Some(future_secs), Some(future_secs));
+        let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
+        assert!(rep.last_tried.is_none(), "future last_tried must be nulled");
+        assert!(rep.last_success.is_none(), "future last_success must be nulled");
+    }
+
+    #[test]
+    fn test_clamp_future_system_time_rejects_epoch_zero() {
+        let json = make_reputation_json(Some(0), Some(0));
+        let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
+        assert!(rep.last_tried.is_none(), "epoch-zero last_tried must be nulled");
+        assert!(rep.last_success.is_none(), "epoch-zero last_success must be nulled");
+    }
+
+    #[test]
+    fn test_clamp_future_system_time_accepts_recent_past() {
+        let recent_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 10;
+        let json = make_reputation_json(Some(recent_secs), Some(recent_secs));
+        let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
+        assert!(rep.last_tried.is_some(), "recent last_tried must be preserved");
+        assert!(rep.last_success.is_some(), "recent last_success must be preserved");
+        let expected = UNIX_EPOCH + Duration::from_secs(recent_secs);
+        assert_eq!(rep.last_tried.unwrap(), expected);
+        assert_eq!(rep.last_success.unwrap(), expected);
     }
 
     #[tokio::test]
