@@ -475,8 +475,10 @@ impl PeerReputationManager {
     /// Record a connection failure and apply a reputation penalty in a single write-lock
     /// acquisition. Returns `true` if the peer was banned by this call.
     ///
-    /// Any negative `score_change` is clamped to 0 (panics in debug). Failure paths must not
-    /// reward peers.
+    /// `score_change` must be non-negative. A value of `0` records the failure (increments
+    /// `consecutive_failures`, updates `last_tried`) without applying a reputation penalty,
+    /// which is useful for tracking failures whose root cause doesn't warrant a ban contribution.
+    /// Any negative `score_change` is clamped to 0 (panics in debug).
     pub async fn record_failure_with_penalty(
         &self,
         peer: SocketAddr,
