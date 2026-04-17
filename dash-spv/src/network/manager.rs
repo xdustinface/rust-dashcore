@@ -265,6 +265,11 @@ impl PeerNetworkManager {
                                 tracing::warn!("Failed to send GetAddr to {}: {}", addr, e);
                             }
 
+                            // Capture peer-advertised services before the peer is moved into the pool.
+                            let peer_services = handshake_manager
+                                .peer_services()
+                                .unwrap_or(ServiceFlags::NETWORK);
+
                             // Record successful connection
                             reputation_manager.record_successful_connection(addr).await;
 
@@ -290,8 +295,9 @@ impl PeerNetworkManager {
                                 best_height,
                             });
 
-                            // Bump the AddrV2 time on direct observation
-                            addrv2_handler.mark_seen(addr, ServiceFlags::NETWORK).await;
+                            // Bump the AddrV2 time on direct observation, using the peer's
+                            // actual advertised services from the version message.
+                            addrv2_handler.mark_seen(addr, peer_services).await;
 
                             // // Start message reader for this peer
                             Self::start_peer_reader(
