@@ -201,4 +201,116 @@ mod tests {
         let reputations = manager.get_all_reputations().await;
         assert_eq!(reputations[&peer].consecutive_failures, 0);
     }
+
+    #[tokio::test]
+    async fn test_record_connection_failure_always_updates_last_tried() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
+
+        let before_first = SystemTime::now();
+        manager.record_connection_failure(peer).await;
+        let after_first = SystemTime::now();
+
+        let first_tried = manager
+            .get_all_reputations()
+            .await
+            .get(&peer)
+            .expect("peer exists")
+            .last_tried
+            .expect("last_tried should be set after first failure");
+        assert!(first_tried >= before_first);
+        assert!(first_tried <= after_first);
+
+        let before_second = SystemTime::now();
+        manager.record_connection_failure(peer).await;
+        let after_second = SystemTime::now();
+
+        let second_tried = manager
+            .get_all_reputations()
+            .await
+            .get(&peer)
+            .expect("peer exists")
+            .last_tried
+            .expect("last_tried should still be set");
+        assert!(second_tried >= before_second);
+        assert!(second_tried <= after_second);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_with_penalty_increments_streak_and_applies_score() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+
+        let banned = manager
+            .record_failure_with_penalty(peer, misbehavior_scores::INVALID_MESSAGE, "test")
+            .await;
+        assert!(!banned);
+
+        let reputations = manager.get_all_reputations().await;
+        let rep = &reputations[&peer];
+        assert_eq!(rep.consecutive_failures, 1);
+        assert_eq!(rep.score, misbehavior_scores::INVALID_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_with_penalty_always_sets_last_tried() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:6666".parse().unwrap();
+
+        let before = SystemTime::now();
+        manager.record_failure_with_penalty(peer, 5, "test").await;
+        let after = SystemTime::now();
+
+        let reputations = manager.get_all_reputations().await;
+        let last_tried = reputations[&peer].last_tried.expect("last_tried should be set");
+        assert!(last_tried >= before);
+        assert!(last_tried <= after);
+
+        let before_second = SystemTime::now();
+        manager.record_failure_with_penalty(peer, 5, "test again").await;
+        let after_second = SystemTime::now();
+
+        let second_tried = manager
+            .get_all_reputations()
+            .await
+            .get(&peer)
+            .unwrap()
+            .last_tried
+            .expect("last_tried should be updated");
+        assert!(second_tried >= before_second);
+        assert!(second_tried <= after_second);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_with_penalty_triggers_ban() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+
+        // Apply enough score to bring the peer to the ban threshold.
+        // INVALID_HEADER = 50, so two calls reach 100 = MAX_MISBEHAVIOR_SCORE.
+        let first = manager
+            .record_failure_with_penalty(peer, misbehavior_scores::INVALID_HEADER, "bad header 1")
+            .await;
+        assert!(!first);
+
+        let second = manager
+            .record_failure_with_penalty(peer, misbehavior_scores::INVALID_HEADER, "bad header 2")
+            .await;
+        assert!(second, "second call should trigger a ban");
+        assert!(manager.is_banned(&peer).await);
+        assert_eq!(manager.get_all_reputations().await[&peer].consecutive_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_with_penalty_streak_keeps_incrementing() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:8888".parse().unwrap();
+
+        // Each call should increment the streak independently, never resetting.
+        for expected in 1u32..=5 {
+            manager.record_failure_with_penalty(peer, 1, "extra failure").await;
+            let reputations = manager.get_all_reputations().await;
+            assert_eq!(reputations[&peer].consecutive_failures, expected);
+        }
+    }
 }
