@@ -417,6 +417,9 @@ impl PeerReputationManager {
     pub async fn record_connection_failure(&self, peer: SocketAddr) {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
+        if reputation.last_tried.is_none() {
+            reputation.last_tried = Some(SystemTime::now());
+        }
         reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
     }
 
