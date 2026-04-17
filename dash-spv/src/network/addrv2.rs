@@ -153,10 +153,10 @@ impl AddrV2Handler {
     }
 
     /// Bump the stored `AddrV2.time` for `addr` to now after directly observing
-    /// the peer (e.g. a successful handshake). A first-hand observation is more
-    /// trustworthy than gossip, so we also refresh the entry if it is missing.
-    /// Existing services on a known entry are preserved. For a new entry the
-    /// provided `services` are used.
+    /// the peer (e.g. a successful handshake) and record the handshake-verified
+    /// `services`. A first-hand observation is authoritative, so both `time` and
+    /// `services` are overwritten on existing entries. If the entry is missing it
+    /// is created with the provided values.
     pub async fn mark_seen(&self, addr: SocketAddr, services: ServiceFlags) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -168,7 +168,10 @@ impl AddrV2Handler {
 
         let mut known_peers = self.known_peers.write().await;
         match known_peers.get_mut(&addr) {
-            Some(existing) => existing.time = now,
+            Some(existing) => {
+                existing.time = now;
+                existing.services = services;
+            }
             None => {
                 known_peers.insert(addr, make_addr_message(addr, services, now));
                 evict_if_needed(&mut known_peers);
@@ -213,12 +216,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_seen_bumps_time_and_preserves_services() {
+    async fn test_mark_seen_bumps_time_and_updates_services() {
         let handler = AddrV2Handler::new();
         let addr: SocketAddr = "10.0.0.5:9999".parse().unwrap();
 
         // Seed via AddrV2 gossip with a stale-but-valid timestamp and richer services.
-        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let gossip_services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
         let ipv4_addr = match addr.ip() {
             IpAddr::V4(v4) => v4,
             _ => panic!("test expects IPv4"),
@@ -229,20 +232,21 @@ mod tests {
         handler
             .handle_addrv2(vec![AddrV2Message {
                 time: stale_time,
-                services,
+                services: gossip_services,
                 addr: AddrV2::Ipv4(ipv4_addr),
                 port: addr.port(),
             }])
             .await;
 
-        // Observe the peer directly with a different (narrower) service set.
-        handler.mark_seen(addr, ServiceFlags::NETWORK).await;
+        // Observe the peer directly — handshake-verified services are authoritative.
+        let handshake_services = ServiceFlags::NETWORK;
+        handler.mark_seen(addr, handshake_services).await;
 
         let known = handler.get_known_addresses().await;
         let entry = known.iter().find(|m| m.socket_addr().ok() == Some(addr)).expect("entry");
         assert!(entry.time >= now);
         assert!(entry.time > stale_time);
-        assert_eq!(entry.services, services);
+        assert_eq!(entry.services, handshake_services);
     }
 
     #[tokio::test]
