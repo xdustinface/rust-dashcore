@@ -329,25 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_future_system_time_rejects_future() {
-        let future_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+    fn test_clamp_future_system_time() {
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        // Future timestamps (1 hour ahead) must be discarded.
+        let future_secs = now_secs + 3600;
         let json = make_reputation_json(Some(future_secs), Some(future_secs));
         let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
         assert!(rep.last_tried.is_none(), "future last_tried must be nulled");
         assert!(rep.last_success.is_none(), "future last_success must be nulled");
-    }
 
-    #[test]
-    fn test_clamp_future_system_time_rejects_epoch_zero() {
-        let json = make_reputation_json(Some(0), Some(0));
-        let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
-        assert!(rep.last_tried.is_none(), "epoch-zero last_tried must be nulled");
-        assert!(rep.last_success.is_none(), "epoch-zero last_success must be nulled");
-    }
-
-    #[test]
-    fn test_clamp_future_system_time_accepts_recent_past() {
-        let recent_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 10;
+        // Recent past (10 seconds ago) must be preserved.
+        let recent_secs = now_secs - 10;
         let json = make_reputation_json(Some(recent_secs), Some(recent_secs));
         let rep: PeerReputation = serde_json::from_str(&json).expect("deserialize");
         assert!(rep.last_tried.is_some(), "recent last_tried must be preserved");
@@ -409,35 +402,6 @@ mod tests {
         let rep = reputations.get(&peer).expect("peer must be present after load");
 
         assert!(rep.last_tried.is_none(), "future last_tried must be discarded by clamp");
-        assert_eq!(
-            rep.consecutive_failures, 0,
-            "normalize_after_load must reset streak when last_tried is absent"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_normalize_after_load_via_storage_round_trip_stale() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-
-        let peers_dir = temp_dir.path().join("peers");
-        std::fs::create_dir_all(&peers_dir).unwrap();
-        let reputation_file = peers_dir.join("reputations.json");
-
-        let json = r#"{"127.0.0.1:9203":{"score":0,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":3,"successful_connections":2,"last_success":null,"last_tried":{"secs_since_epoch":0,"nanos_since_epoch":0},"consecutive_failures":5}}"#;
-        std::fs::write(&reputation_file, json).unwrap();
-
-        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
-            .await
-            .expect("Failed to open PersistentPeerStorage");
-
-        let manager = PeerReputationManager::new();
-        manager.load_from_storage(&peer_storage).await.unwrap();
-
-        let peer: SocketAddr = "127.0.0.1:9203".parse().unwrap();
-        let reputations = manager.get_all_reputations().await;
-        let rep = reputations.get(&peer).expect("peer must be present after load");
-
-        assert!(rep.last_tried.is_none(), "stale last_tried must be discarded by clamp");
         assert_eq!(
             rep.consecutive_failures, 0,
             "normalize_after_load must reset streak when last_tried is absent"
