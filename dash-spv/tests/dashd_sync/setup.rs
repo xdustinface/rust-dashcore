@@ -396,11 +396,18 @@ pub(super) async fn create_non_exclusive_test_config(
     peer_addr: std::net::SocketAddr,
 ) -> ClientConfig {
     let config = ClientConfig::regtest().with_storage_path(storage_path).without_masternodes();
-    // Seed the peer store so the client can discover our dashd node
+    // Seed the peer store so the client can discover our dashd node. Use the
+    // full regtest service flags so the peer survives the `RequiredServices`
+    // hard-filter in `select_best_peers`. Real services are re-learned via
+    // `addrv2_handler.mark_seen` after handshake; the seed only needs to be
+    // good enough to pass selection.
     let peer_store = PersistentPeerStorage::open(config.storage_path.clone())
         .await
         .expect("Failed to open peer storage");
-    let msg = AddrV2Message::new(peer_addr, ServiceFlags::NETWORK);
+    let msg = AddrV2Message::new(
+        peer_addr,
+        ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS,
+    );
     peer_store.save_peers(&[msg]).await.expect("Failed to seed peer store");
     config
 }
