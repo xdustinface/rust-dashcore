@@ -404,10 +404,7 @@ pub(super) async fn create_non_exclusive_test_config(
     let peer_store = PersistentPeerStorage::open(config.storage_path.clone())
         .await
         .expect("Failed to open peer storage");
-    let msg = AddrV2Message::new(
-        peer_addr,
-        ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS,
-    );
+    let msg = AddrV2Message::new(peer_addr, ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
     peer_store.save_peers(&[msg]).await.expect("Failed to seed peer store");
     config
 }
