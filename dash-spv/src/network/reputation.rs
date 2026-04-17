@@ -150,13 +150,18 @@ where
 /// Clock-drift tolerance for future timestamps: up to 10 seconds ahead is accepted.
 const FUTURE_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(10);
 
+/// Timestamps older than this are considered stale and discarded on load.
+const TIMESTAMP_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let opt = Option::<SystemTime>::deserialize(d)?;
-    let deadline = SystemTime::now() + FUTURE_TIMESTAMP_TOLERANCE;
-    Ok(opt.filter(|t| *t <= deadline))
+    let now = SystemTime::now();
+    let deadline = now + FUTURE_TIMESTAMP_TOLERANCE;
+    let floor = now - TIMESTAMP_MAX_AGE;
+    Ok(opt.filter(|t| *t >= floor && *t <= deadline))
 }
 
 /// Peer reputation entry
@@ -232,6 +237,16 @@ impl Default for PeerReputation {
 }
 
 impl PeerReputation {
+    /// Enforce internal consistency after loading from persistent storage. If
+    /// `last_tried` was discarded (e.g., because it was a future or stale
+    /// timestamp), `consecutive_failures` has no temporal anchor and must be
+    /// reset to 0 to avoid incorrect backoff behaviour.
+    fn normalize_after_load(&mut self) {
+        if self.last_tried.is_none() && self.consecutive_failures > 0 {
+            self.consecutive_failures = 0;
+        }
+    }
+
     /// Check if the peer is currently banned
     pub fn is_banned(&self) -> bool {
         self.banned_until.is_some_and(|until| Instant::now() < until)
@@ -567,6 +582,8 @@ impl PeerReputationManager {
             // Validate successful connections don't exceed attempts
             reputation.successful_connections =
                 reputation.successful_connections.min(reputation.connection_attempts);
+
+            reputation.normalize_after_load();
 
             // Skip entry if data appears corrupted
             if reputation.positive_actions > MAX_ACTION_COUNT
