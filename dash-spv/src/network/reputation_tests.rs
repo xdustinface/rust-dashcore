@@ -8,8 +8,13 @@ mod tests {
     use super::super::*;
     use dashcore::network::address::AddrV2;
     use dashcore::network::constants::ServiceFlags;
+    use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn no_explicit() -> HashSet<SocketAddr> {
+        HashSet::new()
+    }
 
     fn now_epoch_secs() -> u32 {
         SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_secs() as u32
@@ -116,7 +121,8 @@ mod tests {
         // neutral_peer has default score of 0
 
         let all_peers = vec![good_peer.clone(), neutral_peer.clone(), bad_peer.clone()];
-        let selected = manager.select_best_peers(network_required(), all_peers, 2).await;
+        let selected =
+            manager.select_best_peers(network_required(), all_peers, 2, &no_explicit()).await;
 
         // Should select good_peer first, then neutral_peer
         assert_eq!(selected.len(), 2);
@@ -445,7 +451,12 @@ mod tests {
         let required =
             RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
         let selected = manager
-            .select_best_peers(required, vec![capable.clone(), missing_filters, no_services], 10)
+            .select_best_peers(
+                required,
+                vec![capable.clone(), missing_filters, no_services],
+                10,
+                &no_explicit(),
+            )
             .await;
 
         assert_eq!(selected, vec![capable.socket_addr().unwrap()]);
@@ -478,8 +489,9 @@ mod tests {
             }
         }
 
-        let selected =
-            manager.select_best_peers(network_required(), msgs.clone(), addrs.len()).await;
+        let selected = manager
+            .select_best_peers(network_required(), msgs.clone(), addrs.len(), &no_explicit())
+            .await;
         assert!(selected.is_empty(), "every peer should be in cooldown");
 
         // Confirm streaks match expectations by probing cooldown() via reputations.
@@ -512,7 +524,8 @@ mod tests {
             r.last_tried = Some(SystemTime::now() - Duration::from_secs(120));
         }
 
-        let selected = manager.select_best_peers(network_required(), vec![msg], 1).await;
+        let selected =
+            manager.select_best_peers(network_required(), vec![msg], 1, &no_explicit()).await;
         assert_eq!(selected, vec![addr]);
     }
 
@@ -536,7 +549,7 @@ mod tests {
             addr_msg("10.1.1.1", 9999, ServiceFlags::NETWORK, now),
             addr_msg("10.1.1.2", 9999, ServiceFlags::NETWORK, now),
         ];
-        let selected = manager.select_best_peers(network_required(), msgs, 2).await;
+        let selected = manager.select_best_peers(network_required(), msgs, 2, &no_explicit()).await;
         assert_eq!(selected, vec![high, low]);
     }
 
@@ -554,7 +567,7 @@ mod tests {
             addr_msg("10.2.2.1", 9999, ServiceFlags::NETWORK, now),
             addr_msg("10.2.2.2", 9999, ServiceFlags::NETWORK, now),
         ];
-        let selected = manager.select_best_peers(network_required(), msgs, 2).await;
+        let selected = manager.select_best_peers(network_required(), msgs, 2, &no_explicit()).await;
         assert_eq!(selected, vec![better, worse]);
     }
 
@@ -569,7 +582,12 @@ mod tests {
         let stale = addr_msg("10.3.3.2", 9999, ServiceFlags::NETWORK, now.saturating_sub(7200));
 
         let selected = manager
-            .select_best_peers(network_required(), vec![stale.clone(), fresh.clone()], 2)
+            .select_best_peers(
+                network_required(),
+                vec![stale.clone(), fresh.clone()],
+                2,
+                &no_explicit(),
+            )
             .await;
         assert_eq!(selected, vec![fresh_addr, stale_addr]);
     }
@@ -590,7 +608,12 @@ mod tests {
         let plain = addr_msg("10.4.4.2", 9999, ServiceFlags::NETWORK, now);
 
         let selected = manager
-            .select_best_peers(network_required(), vec![plain.clone(), bonus.clone()], 2)
+            .select_best_peers(
+                network_required(),
+                vec![plain.clone(), bonus.clone()],
+                2,
+                &no_explicit(),
+            )
             .await;
         assert_eq!(selected, vec![bonus_addr, plain_addr]);
     }
@@ -602,8 +625,9 @@ mod tests {
         let a = addr_msg("10.5.5.1", 9999, ServiceFlags::NETWORK, now);
         let b = addr_msg("10.5.5.2", 9999, ServiceFlags::NETWORK, now);
 
-        let selected =
-            manager.select_best_peers(network_required(), vec![a.clone(), b.clone()], 5).await;
+        let selected = manager
+            .select_best_peers(network_required(), vec![a.clone(), b.clone()], 5, &no_explicit())
+            .await;
         let a_sa = a.socket_addr().unwrap();
         let b_sa = b.socket_addr().unwrap();
         assert_eq!(selected.len(), 2);
@@ -619,7 +643,8 @@ mod tests {
         let required =
             RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
 
-        let selected = manager.select_best_peers(required, vec![incapable], 5).await;
+        let selected =
+            manager.select_best_peers(required, vec![incapable], 5, &no_explicit()).await;
         assert!(selected.is_empty());
     }
 
@@ -632,7 +657,7 @@ mod tests {
             .map(|i| addr_msg(&format!("10.7.7.{i}"), 9999, ServiceFlags::NETWORK, now))
             .collect();
 
-        let selected = manager.select_best_peers(network_required(), msgs, 3).await;
+        let selected = manager.select_best_peers(network_required(), msgs, 3, &no_explicit()).await;
         assert_eq!(selected.len(), 3);
     }
 
@@ -642,7 +667,7 @@ mod tests {
         let now = now_epoch_secs();
 
         let msgs = vec![addr_msg("10.8.8.1", 9999, ServiceFlags::NETWORK, now)];
-        let selected = manager.select_best_peers(network_required(), msgs, 0).await;
+        let selected = manager.select_best_peers(network_required(), msgs, 0, &no_explicit()).await;
         assert!(selected.is_empty());
     }
 
@@ -663,7 +688,8 @@ mod tests {
             addr_msg("10.9.9.1", 9999, ServiceFlags::NETWORK, now),
             addr_msg("10.9.9.2", 9999, ServiceFlags::NETWORK, now),
         ];
-        let selected = manager.select_best_peers(network_required(), msgs, 10).await;
+        let selected =
+            manager.select_best_peers(network_required(), msgs, 10, &no_explicit()).await;
         assert_eq!(selected, vec![good_addr]);
     }
 
@@ -753,5 +779,84 @@ mod tests {
             rep.consecutive_failures, 3,
             "non-zero streak must be preserved when last_tried is valid"
         );
+    }
+
+    #[tokio::test]
+    async fn test_select_empty_available_peers_returns_empty() {
+        let manager = PeerReputationManager::new();
+        let required =
+            RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
+
+        let selected = manager.select_best_peers(required, vec![], 5, &no_explicit()).await;
+        assert!(selected.is_empty());
+
+        // Confirm no entries were inserted into the map as a side-effect of the call.
+        let reputations = manager.get_all_reputations().await;
+        assert!(reputations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_select_future_addr_time_does_not_panic_and_ranks_as_fresh() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        // Peer with a timestamp set one hour in the future (peer-controlled adversarial input).
+        let future_time = now.saturating_add(3600);
+        let future_peer = addr_msg("20.0.0.1", 9999, ServiceFlags::NETWORK, future_time);
+        // Peer with a timestamp one hour in the past.
+        let past_peer = addr_msg("20.0.0.2", 9999, ServiceFlags::NETWORK, now.saturating_sub(3600));
+
+        let selected = manager
+            .select_best_peers(
+                network_required(),
+                vec![past_peer.clone(), future_peer.clone()],
+                2,
+                &no_explicit(),
+            )
+            .await;
+
+        assert_eq!(selected.len(), 2);
+        // The future-timed peer gets staleness_secs = 0 (clamped), same as a peer seen just now.
+        // The past peer has staleness_secs > 0, so the future peer must rank first (lower score).
+        let future_sa = future_peer.socket_addr().unwrap();
+        let past_sa = past_peer.socket_addr().unwrap();
+        assert_eq!(
+            selected[0], future_sa,
+            "future-timed peer should rank first (treated as fresh)"
+        );
+        assert_eq!(selected[1], past_sa);
+    }
+
+    #[tokio::test]
+    async fn test_select_combined_services_and_cooldown_filters() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let missing_service_addr: SocketAddr = "30.0.0.1:9999".parse().unwrap();
+        let in_cooldown_addr: SocketAddr = "30.0.0.2:9999".parse().unwrap();
+        let good_addr: SocketAddr = "30.0.0.3:9999".parse().unwrap();
+
+        let required =
+            RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
+
+        // Peer A: advertises only NETWORK, missing COMPACT_FILTERS.
+        let peer_a = addr_msg("30.0.0.1", 9999, ServiceFlags::NETWORK, now);
+        // Peer B: advertises both required flags but is in active cooldown.
+        let peer_b =
+            addr_msg("30.0.0.2", 9999, ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS, now);
+        // Peer C: advertises both required flags and is not in cooldown.
+        let peer_c =
+            addr_msg("30.0.0.3", 9999, ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS, now);
+
+        // Put peer B into cooldown by recording a failure (streak = 1, cooldown = 30s).
+        manager.record_failure_with_penalty(in_cooldown_addr, 0, "seed").await;
+
+        let selected = manager
+            .select_best_peers(required, vec![peer_a, peer_b, peer_c], 5, &no_explicit())
+            .await;
+
+        assert_eq!(selected, vec![good_addr], "only peer C should survive both filters");
+        assert!(!selected.contains(&missing_service_addr));
+        assert!(!selected.contains(&in_cooldown_addr));
     }
 }
