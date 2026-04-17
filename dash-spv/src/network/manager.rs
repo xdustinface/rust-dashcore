@@ -290,8 +290,8 @@ impl PeerNetworkManager {
                                 best_height,
                             });
 
-                            // Add to known addresses
-                            addrv2_handler.add_known_address(addr, ServiceFlags::NETWORK).await;
+                            // Bump the AddrV2 time on direct observation
+                            addrv2_handler.mark_seen(addr, ServiceFlags::NETWORK).await;
 
                             // // Start message reader for this peer
                             Self::start_peer_reader(

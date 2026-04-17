@@ -151,6 +151,42 @@ impl AddrV2Handler {
         evict_if_needed(&mut known_peers);
     }
 
+    /// Bump the stored `AddrV2.time` for `addr` to now after directly observing
+    /// the peer (e.g. a successful handshake). A first-hand observation is more
+    /// trustworthy than gossip, so we also refresh the entry if it is missing.
+    /// Existing services on a known entry are preserved. For a new entry the
+    /// provided `services` are used.
+    pub async fn mark_seen(&self, addr: SocketAddr, services: ServiceFlags) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                tracing::error!("System time error in mark_seen: {}", e);
+                Duration::from_secs(0)
+            })
+            .as_secs() as u32;
+
+        let mut known_peers = self.known_peers.write().await;
+        match known_peers.get_mut(&addr) {
+            Some(existing) => existing.time = now,
+            None => {
+                let addr_v2 = match addr.ip() {
+                    std::net::IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
+                    std::net::IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
+                };
+                known_peers.insert(
+                    addr,
+                    AddrV2Message {
+                        time: now,
+                        services,
+                        addr: addr_v2,
+                        port: addr.port(),
+                    },
+                );
+                evict_if_needed(&mut known_peers);
+            }
+        }
+    }
+
     /// Build a GetAddr response message
     pub async fn build_addr_response(&self) -> NetworkMessage {
         let addresses = self.get_addresses_for_peer(23).await; // Bitcoin typically sends ~23 addresses
@@ -185,6 +221,54 @@ mod tests {
         let known = handler.get_known_addresses().await;
         assert_eq!(known.len(), 1);
         assert_eq!(known[0].socket_addr().unwrap(), addr);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_bumps_time_and_preserves_services() {
+        let handler = AddrV2Handler::new();
+        let addr: SocketAddr = "10.0.0.5:9999".parse().unwrap();
+
+        // Seed via AddrV2 gossip with a stale-but-valid timestamp and richer services.
+        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let ipv4_addr = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("test expects IPv4"),
+        };
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_secs() as u32;
+        let stale_time = now.saturating_sub(3600);
+        handler
+            .handle_addrv2(vec![AddrV2Message {
+                time: stale_time,
+                services,
+                addr: AddrV2::Ipv4(ipv4_addr),
+                port: addr.port(),
+            }])
+            .await;
+
+        // Observe the peer directly with a different (narrower) service set.
+        handler.mark_seen(addr, ServiceFlags::NETWORK).await;
+
+        let known = handler.get_known_addresses().await;
+        let entry = known.iter().find(|m| m.socket_addr().ok() == Some(addr)).expect("entry");
+        assert!(entry.time >= now);
+        assert!(entry.time > stale_time);
+        assert_eq!(entry.services, services);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_inserts_new_entry() {
+        let handler = AddrV2Handler::new();
+        let addr: SocketAddr = "10.0.0.6:9999".parse().unwrap();
+
+        assert!(handler.get_known_addresses().await.is_empty());
+
+        handler.mark_seen(addr, ServiceFlags::NETWORK).await;
+
+        let known = handler.get_known_addresses().await;
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].socket_addr().unwrap(), addr);
+        assert_eq!(known[0].services, ServiceFlags::NETWORK);
     }
 
     #[tokio::test]
