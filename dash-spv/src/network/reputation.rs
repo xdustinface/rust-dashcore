@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 
 /// Misbehavior score thresholds for different violations
@@ -164,6 +164,18 @@ pub struct PeerReputation {
     /// Last connection time
     #[serde(skip)]
     pub last_connection: Option<Instant>,
+
+    /// Wall-clock time of the last successful handshake with this peer.
+    #[serde(default)]
+    pub last_success: Option<SystemTime>,
+
+    /// Wall-clock time of the last attempted connection to this peer.
+    #[serde(default)]
+    pub last_tried: Option<SystemTime>,
+
+    /// Failures since the last success. Resets to 0 on a successful handshake.
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 impl Default for PeerReputation {
@@ -178,6 +190,9 @@ impl Default for PeerReputation {
             connection_attempts: 0,
             successful_connections: 0,
             last_connection: None,
+            last_success: None,
+            last_tried: None,
+            consecutive_failures: 0,
         }
     }
 }
@@ -383,6 +398,7 @@ impl PeerReputationManager {
         let reputation = reputations.entry(peer).or_default();
         reputation.connection_attempts += 1;
         reputation.last_connection = Some(Instant::now());
+        reputation.last_tried = Some(SystemTime::now());
     }
 
     /// Record a successful connection
@@ -390,6 +406,17 @@ impl PeerReputationManager {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
         reputation.successful_connections += 1;
+        reputation.last_success = Some(SystemTime::now());
+        reputation.consecutive_failures = 0;
+    }
+
+    /// Record a connection or handshake failure. Increments the streak of
+    /// consecutive failures without touching `last_success`, so callers can
+    /// drive cooldown/backoff from the streak length.
+    pub async fn record_connection_failure(&self, peer: SocketAddr) {
+        let mut reputations = self.reputations.write().await;
+        let reputation = reputations.entry(peer).or_default();
+        reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
     }
 
     /// Get all peer reputations
