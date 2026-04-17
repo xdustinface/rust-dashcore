@@ -154,10 +154,11 @@ mod tests {
         manager.record_failure_with_penalty(peer, 1, "seed").await;
         manager.record_failure_with_penalty(peer, 1, "seed").await;
         manager.record_failure_with_penalty(peer, 1, "seed").await;
-        {
+        let last_tried_before_success = {
             let reputations = manager.get_all_reputations().await;
             assert_eq!(reputations[&peer].consecutive_failures, 3);
-        }
+            reputations[&peer].last_tried.expect("last_tried set by failure seeds")
+        };
 
         let before = SystemTime::now();
         manager.record_successful_connection(peer).await;
@@ -171,6 +172,11 @@ mod tests {
         assert!(last_success <= after);
         assert_eq!(rep.consecutive_failures, 0);
         assert_eq!(rep.successful_connections, 1);
+        assert_eq!(
+            rep.last_tried,
+            Some(last_tried_before_success),
+            "record_successful_connection must not clear last_tried"
+        );
     }
 
     #[tokio::test]
@@ -283,5 +289,25 @@ mod tests {
 
         let reputations = manager.get_all_reputations().await;
         assert_eq!(reputations[&peer].consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+    }
+
+    #[tokio::test]
+    async fn test_record_failure_with_penalty_updates_last_tried_after_attempt() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
+
+        manager.record_connection_attempt(peer).await;
+        let attempt_time = manager.get_all_reputations().await[&peer]
+            .last_tried
+            .expect("last_tried set by attempt");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        manager
+            .record_failure_with_penalty(peer, misbehavior_scores::INVALID_MESSAGE, "test")
+            .await;
+        let after_failure = manager.get_all_reputations().await[&peer]
+            .last_tried
+            .expect("last_tried still set after failure");
+
+        assert!(after_failure > attempt_time, "failure should update last_tried");
     }
 }
