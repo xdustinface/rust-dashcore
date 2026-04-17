@@ -311,6 +311,7 @@ impl PeerNetworkManager {
                             tracing::warn!("Handshake failed with {}: {}", addr, e);
                             // Only clears connecting set. Peer was never added, so no count/event needed.
                             pool.remove_peer(&addr).await;
+                            reputation_manager.record_connection_failure(addr).await;
                             // Update reputation for handshake failure
                             reputation_manager
                                 .update_reputation(
@@ -328,6 +329,7 @@ impl PeerNetworkManager {
                     tracing::debug!("Failed to connect to {}: {}", addr, e);
                     // Only clears connecting set. Peer was never added, so no count/event needed.
                     pool.remove_peer(&addr).await;
+                    reputation_manager.record_connection_failure(addr).await;
                     // Minor reputation penalty for connection failure
                     reputation_manager
                         .update_reputation(
