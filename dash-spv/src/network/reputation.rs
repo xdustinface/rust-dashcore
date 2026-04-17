@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 
 /// Misbehavior score thresholds for different violations
@@ -129,6 +129,37 @@ where
     Ok(v)
 }
 
+const MAX_CONSECUTIVE_FAILURES: u32 = 1_000;
+
+fn clamp_peer_consecutive_failures<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut v = u32::deserialize(deserializer)?;
+
+    if v > MAX_CONSECUTIVE_FAILURES {
+        tracing::warn!(
+            "Peer has excessive consecutive failures {v}, clamping to {MAX_CONSECUTIVE_FAILURES}"
+        );
+        v = MAX_CONSECUTIVE_FAILURES
+    }
+
+    Ok(v)
+}
+
+/// Clock-drift tolerance for future timestamps: up to 10 seconds ahead is accepted.
+const FUTURE_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(10);
+
+fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<SystemTime>::deserialize(d)?;
+    let now = SystemTime::now();
+    let deadline = now.checked_add(FUTURE_TIMESTAMP_TOLERANCE).unwrap_or(now);
+    Ok(opt.filter(|t| *t <= deadline))
+}
+
 /// Peer reputation entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
@@ -161,9 +192,25 @@ pub struct PeerReputation {
     /// Successful connection count
     pub successful_connections: u64,
 
-    /// Last connection time
+    /// Monotonic instant of the last connection attempt within the current process session.
+    /// Resets to `None` on restart. Used for runtime decisions such as immediate
+    /// reconnect throttling. For persistent cooldown/backoff logic use `last_tried`.
     #[serde(skip)]
     pub last_connection: Option<Instant>,
+
+    /// Wall-clock time of the last successful handshake with this peer.
+    #[serde(default, deserialize_with = "clamp_future_system_time")]
+    pub last_success: Option<SystemTime>,
+
+    /// Wall-clock time of the last attempted connection to this peer (persisted across
+    /// restarts). The canonical source for cooldown and backoff decisions that must
+    /// survive process restarts. Distinct from `last_connection`, which is session-only.
+    #[serde(default, deserialize_with = "clamp_future_system_time")]
+    pub last_tried: Option<SystemTime>,
+
+    /// Failures since the last success. Resets to 0 on a successful handshake.
+    #[serde(deserialize_with = "clamp_peer_consecutive_failures")]
+    pub consecutive_failures: u32,
 }
 
 impl Default for PeerReputation {
@@ -178,11 +225,24 @@ impl Default for PeerReputation {
             connection_attempts: 0,
             successful_connections: 0,
             last_connection: None,
+            last_success: None,
+            last_tried: None,
+            consecutive_failures: 0,
         }
     }
 }
 
 impl PeerReputation {
+    /// Enforce internal consistency after loading from persistent storage. If
+    /// `last_tried` was discarded (e.g., because it was a future timestamp),
+    /// `consecutive_failures` has no temporal anchor and must be reset to 0 to
+    /// avoid incorrect backoff behaviour.
+    fn normalize_after_load(&mut self) {
+        if self.last_tried.is_none() && self.consecutive_failures > 0 {
+            self.consecutive_failures = 0;
+        }
+    }
+
     /// Check if the peer is currently banned
     pub fn is_banned(&self) -> bool {
         self.banned_until.is_some_and(|until| Instant::now() < until)
@@ -198,6 +258,54 @@ impl PeerReputation {
                 None
             }
         })
+    }
+
+    /// Apply the common fields updated on every failure: refresh `last_tried` and
+    /// increment `consecutive_failures`, clamped to `MAX_CONSECUTIVE_FAILURES`.
+    fn record_failure_fields(&mut self) {
+        self.last_tried = Some(SystemTime::now());
+        self.consecutive_failures =
+            self.consecutive_failures.saturating_add(1).min(MAX_CONSECUTIVE_FAILURES);
+    }
+
+    /// Apply a score change. Assumes decay has already been applied.
+    /// Returns `true` if the peer was banned by this call.
+    fn apply_score_change(&mut self, score_change: i32, peer: SocketAddr, reason: &str) -> bool {
+        let old_score = self.score;
+        self.score =
+            (self.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
+
+        if score_change > 0 {
+            self.negative_actions += 1;
+        } else if score_change < 0 {
+            self.positive_actions += 1;
+        }
+
+        let should_ban = self.score >= MAX_MISBEHAVIOR_SCORE && !self.is_banned();
+        if should_ban {
+            self.banned_until = Some(Instant::now() + BAN_DURATION);
+            self.ban_count += 1;
+            tracing::warn!(
+                "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
+                peer,
+                self.score,
+                self.ban_count,
+                reason
+            );
+        }
+
+        if score_change.abs() >= 10 || should_ban {
+            tracing::info!(
+                "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
+                peer,
+                old_score,
+                self.score,
+                score_change,
+                reason
+            );
+        }
+
+        should_ban
     }
 
     /// Apply reputation decay
@@ -270,48 +378,9 @@ impl PeerReputationManager {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
 
-        // Apply decay first
         reputation.apply_decay();
+        let should_ban = reputation.apply_score_change(score_change, peer, reason);
 
-        // Update score
-        let old_score = reputation.score;
-        reputation.score =
-            (reputation.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
-
-        // Track positive/negative actions
-        if score_change > 0 {
-            reputation.negative_actions += 1;
-        } else if score_change < 0 {
-            reputation.positive_actions += 1;
-        }
-
-        // Check if peer should be banned
-        let should_ban = reputation.score >= MAX_MISBEHAVIOR_SCORE && !reputation.is_banned();
-        if should_ban {
-            reputation.banned_until = Some(Instant::now() + BAN_DURATION);
-            reputation.ban_count += 1;
-            tracing::warn!(
-                "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
-                peer,
-                reputation.score,
-                reputation.ban_count,
-                reason
-            );
-        }
-
-        // Log significant changes
-        if score_change.abs() >= 10 || should_ban {
-            tracing::info!(
-                "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
-                peer,
-                old_score,
-                reputation.score,
-                score_change,
-                reason
-            );
-        }
-
-        // Record event
         let event = ReputationEvent {
             peer,
             change: score_change,
@@ -383,6 +452,7 @@ impl PeerReputationManager {
         let reputation = reputations.entry(peer).or_default();
         reputation.connection_attempts += 1;
         reputation.last_connection = Some(Instant::now());
+        reputation.last_tried = Some(SystemTime::now());
     }
 
     /// Record a successful connection
@@ -390,6 +460,47 @@ impl PeerReputationManager {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
         reputation.successful_connections += 1;
+        reputation.last_success = Some(SystemTime::now());
+        reputation.consecutive_failures = 0;
+    }
+
+    /// Record a connection failure and apply a reputation penalty in a single write-lock
+    /// acquisition. Returns `true` if the peer was banned by this call.
+    ///
+    /// `score_change` must be non-negative. A value of `0` records the failure (increments
+    /// `consecutive_failures`, updates `last_tried`) without applying a reputation penalty,
+    /// which is useful for tracking failures whose root cause doesn't warrant a ban contribution.
+    /// Any negative `score_change` is clamped to 0 (panics in debug).
+    pub async fn record_failure_with_penalty(
+        &self,
+        peer: SocketAddr,
+        score_change: i32,
+        reason: &str,
+    ) -> bool {
+        debug_assert!(
+            score_change >= 0,
+            "record_failure_with_penalty expects non-negative score change"
+        );
+        let score_change = score_change.max(0);
+        let should_ban = {
+            let mut reputations = self.reputations.write().await;
+            let reputation = reputations.entry(peer).or_default();
+
+            reputation.record_failure_fields();
+
+            reputation.apply_decay();
+            reputation.apply_score_change(score_change, peer, reason)
+        };
+
+        let event = ReputationEvent {
+            peer,
+            change: score_change,
+            reason: reason.to_string(),
+            timestamp: Instant::now(),
+        };
+        self.record_event(event).await;
+
+        should_ban
     }
 
     /// Get all peer reputations
@@ -465,6 +576,8 @@ impl PeerReputationManager {
             // Validate successful connections don't exceed attempts
             reputation.successful_connections =
                 reputation.successful_connections.min(reputation.connection_attempts);
+
+            reputation.normalize_after_load();
 
             // Skip entry if data appears corrupted
             if reputation.positive_actions > MAX_ACTION_COUNT
