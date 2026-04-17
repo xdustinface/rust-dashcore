@@ -2,7 +2,7 @@
 
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -24,6 +24,14 @@ fn evict_if_needed(peers: &mut HashMap<SocketAddr, AddrV2Message>) {
         entries.truncate(MAX_ADDR_TO_STORE);
         peers.extend(entries);
     }
+}
+
+fn make_addr_message(addr: SocketAddr, services: ServiceFlags, time: u32) -> AddrV2Message {
+    let addr_v2 = match addr.ip() {
+        IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
+        IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
+    };
+    AddrV2Message { time, services, addr: addr_v2, port: addr.port() }
 }
 
 /// Handler for AddrV2 peer exchange protocol
@@ -134,20 +142,8 @@ impl AddrV2Handler {
             })
             .as_secs() as u32;
 
-        let addr_v2 = match addr.ip() {
-            std::net::IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
-            std::net::IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
-        };
-
-        let addr_msg = AddrV2Message {
-            time: now,
-            services,
-            addr: addr_v2,
-            port: addr.port(),
-        };
-
         let mut known_peers = self.known_peers.write().await;
-        known_peers.insert(addr, addr_msg);
+        known_peers.insert(addr, make_addr_message(addr, services, now));
         evict_if_needed(&mut known_peers);
     }
 
@@ -169,19 +165,7 @@ impl AddrV2Handler {
         match known_peers.get_mut(&addr) {
             Some(existing) => existing.time = now,
             None => {
-                let addr_v2 = match addr.ip() {
-                    std::net::IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
-                    std::net::IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
-                };
-                known_peers.insert(
-                    addr,
-                    AddrV2Message {
-                        time: now,
-                        services,
-                        addr: addr_v2,
-                        port: addr.port(),
-                    },
-                );
+                known_peers.insert(addr, make_addr_message(addr, services, now));
                 evict_if_needed(&mut known_peers);
             }
         }
@@ -231,7 +215,7 @@ mod tests {
         // Seed via AddrV2 gossip with a stale-but-valid timestamp and richer services.
         let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
         let ipv4_addr = match addr.ip() {
-            std::net::IpAddr::V4(v4) => v4,
+            IpAddr::V4(v4) => v4,
             _ => panic!("test expects IPv4"),
         };
         let now =
@@ -283,7 +267,7 @@ mod tests {
         let addr: SocketAddr =
             "127.0.0.1:9999".parse().expect("Failed to parse test socket address");
         let ipv4_addr = match addr.ip() {
-            std::net::IpAddr::V4(v4) => v4,
+            IpAddr::V4(v4) => v4,
             _ => panic!("Test expects IPv4 address but got IPv6"),
         };
 
