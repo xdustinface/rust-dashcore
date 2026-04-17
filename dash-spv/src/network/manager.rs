@@ -65,6 +65,10 @@ pub struct PeerNetworkManager {
     exclusive_mode: bool,
     /// Services peers must advertise to be eligible for selection.
     required_services: RequiredServices,
+    /// Set of explicit peer addresses from `ClientConfig.peers`. These bypass the
+    /// `required_services` hard-filter because their real services are not known until
+    /// after handshake.
+    explicit_peers: HashSet<SocketAddr>,
     /// Cached count of currently connected peers for fast, non-blocking queries
     connected_peer_count: Arc<AtomicUsize>,
     /// Disable headers2 after decompression failure
@@ -115,6 +119,7 @@ impl PeerNetworkManager {
             user_agent: config.user_agent.clone(),
             exclusive_mode,
             required_services: RequiredServices::from_config(config),
+            explicit_peers: config.peers.iter().copied().collect(),
             connected_peer_count: Arc::new(AtomicUsize::new(0)),
             headers2_disabled: Arc::new(Mutex::new(HashSet::new())),
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
@@ -897,7 +902,12 @@ impl PeerNetworkManager {
                 // replenish known addresses on a subsequent cycle.
                 let best_peers = self
                     .reputation_manager
-                    .select_best_peers(self.required_services, known, needed * 2)
+                    .select_best_peers(
+                        self.required_services,
+                        known,
+                        needed * 2,
+                        &self.explicit_peers,
+                    )
                     .await;
                 let mut attempted = 0;
 
@@ -1293,6 +1303,7 @@ impl Clone for PeerNetworkManager {
             user_agent: self.user_agent.clone(),
             exclusive_mode: self.exclusive_mode,
             required_services: self.required_services,
+            explicit_peers: self.explicit_peers.clone(),
             connected_peer_count: self.connected_peer_count.clone(),
             headers2_disabled: self.headers2_disabled.clone(),
             message_dispatcher: self.message_dispatcher.clone(),

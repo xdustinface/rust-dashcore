@@ -10,7 +10,7 @@ use crate::storage::PeerStorage;
 use dashcore::network::address::AddrV2Message;
 use dashcore::network::constants::ServiceFlags;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -669,10 +669,13 @@ fn composite_score(reputation: &PeerReputation, addr: &AddrV2Message, now_epoch_
     let mut score = reputation.score as f64;
 
     let attempts = reputation.connection_attempts.max(1) as f64;
-    let success_ratio = reputation.successful_connections as f64 / attempts;
+    let success_ratio = (reputation.successful_connections as f64 / attempts).clamp(0.0, 1.0);
     score -= success_ratio * scoring_weights::SUCCESS_RATIO_WEIGHT;
 
-    let staleness_secs = now_epoch_secs.saturating_sub(addr.time as u64) as f64;
+    // Clamp addr.time to at most now so a peer-controlled future timestamp cannot
+    // zero out the staleness penalty.
+    let addr_time = (addr.time as u64).min(now_epoch_secs);
+    let staleness_secs = now_epoch_secs.saturating_sub(addr_time) as f64;
     let staleness_penalty = (staleness_secs / scoring_weights::STALENESS_SECS_PER_POINT)
         .min(scoring_weights::STALENESS_CAP);
     score += staleness_penalty;
@@ -687,6 +690,12 @@ fn composite_score(reputation: &PeerReputation, addr: &AddrV2Message, now_epoch_
 /// Helper trait for reputation-aware peer selection
 pub(crate) trait ReputationAware {
     /// Select best peers that satisfy `required` services and are not banned.
+    ///
+    /// Peers whose address appears in `explicit_peers` bypass the `required` services
+    /// hard-filter (they are still subject to ban and cooldown filters). This allows
+    /// user-configured peers to be selected even when their services are not yet known
+    /// (services are learned only after handshake).
+    ///
     /// An empty return value indicates no capable survivors, allowing callers
     /// to fall back to DNS discovery rather than connecting to an incapable peer.
     fn select_best_peers(
@@ -694,6 +703,7 @@ pub(crate) trait ReputationAware {
         required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
+        explicit_peers: &HashSet<SocketAddr>,
     ) -> impl std::future::Future<Output = Vec<SocketAddr>> + Send;
 
     /// Check if we should connect to a peer based on reputation
@@ -709,6 +719,7 @@ impl ReputationAware for PeerReputationManager {
         required: RequiredServices,
         available_peers: Vec<AddrV2Message>,
         count: usize,
+        explicit_peers: &HashSet<SocketAddr>,
     ) -> Vec<SocketAddr> {
         if count == 0 {
             return Vec::new();
@@ -718,32 +729,51 @@ impl ReputationAware for PeerReputationManager {
         let now_epoch_secs =
             now_system.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
-        let mut reputations = self.reputations.write().await;
-        let mut scored: Vec<(SocketAddr, f64)> = Vec::with_capacity(available_peers.len());
+        // Collect candidates under the write lock: apply decay and clone reputation data.
+        // The lock is held only for this gathering phase, not for the sort that follows.
+        let candidates: Vec<(SocketAddr, PeerReputation, AddrV2Message)> = {
+            let mut reputations = self.reputations.write().await;
+            let mut out = Vec::with_capacity(available_peers.len());
 
-        for peer in available_peers {
-            let Ok(socket_addr) = peer.socket_addr() else {
-                tracing::warn!("Skip invalid peer address: {:?}", peer);
-                continue;
-            };
+            for peer in available_peers {
+                let Ok(socket_addr) = peer.socket_addr() else {
+                    tracing::warn!("Skip invalid peer address: {:?}", peer);
+                    continue;
+                };
 
-            if !required.is_satisfied_by(peer.services) {
-                continue;
+                // Explicit peers bypass the services hard-filter; all others must satisfy it.
+                if !explicit_peers.contains(&socket_addr)
+                    && !required.is_satisfied_by(peer.services)
+                {
+                    continue;
+                }
+
+                // Read reputation without inserting a default entry for unknown peers.
+                let mut rep = reputations.get(&socket_addr).cloned().unwrap_or_default();
+                rep.apply_decay();
+
+                // Persist decay back only for peers that already have an entry.
+                if let Some(stored) = reputations.get_mut(&socket_addr) {
+                    stored.apply_decay();
+                }
+
+                if rep.is_banned() {
+                    continue;
+                }
+
+                if rep.in_cooldown(now_system) {
+                    continue;
+                }
+
+                out.push((socket_addr, rep, peer));
             }
+            out
+        };
 
-            let reputation = reputations.entry(socket_addr).or_default();
-            reputation.apply_decay();
-
-            if reputation.is_banned() {
-                continue;
-            }
-
-            if reputation.in_cooldown(now_system) {
-                continue;
-            }
-
-            scored.push((socket_addr, composite_score(reputation, &peer, now_epoch_secs)));
-        }
+        let mut scored: Vec<(SocketAddr, f64)> = candidates
+            .into_iter()
+            .map(|(addr, rep, peer)| (addr, composite_score(&rep, &peer, now_epoch_secs)))
+            .collect();
 
         scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         scored.into_iter().take(count).map(|(peer, _)| peer).collect()
