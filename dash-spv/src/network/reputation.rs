@@ -295,6 +295,50 @@ impl PeerReputationManager {
         }
     }
 
+    /// Apply a score change to a reputation entry. Assumes decay has already been applied.
+    /// Returns `true` if the peer was banned by this call.
+    fn apply_score_change(
+        rep: &mut PeerReputation,
+        score_change: i32,
+        peer: SocketAddr,
+        reason: &str,
+    ) -> bool {
+        let old_score = rep.score;
+        rep.score = (rep.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
+
+        if score_change > 0 {
+            rep.negative_actions += 1;
+        } else if score_change < 0 {
+            rep.positive_actions += 1;
+        }
+
+        let should_ban = rep.score >= MAX_MISBEHAVIOR_SCORE && !rep.is_banned();
+        if should_ban {
+            rep.banned_until = Some(Instant::now() + BAN_DURATION);
+            rep.ban_count += 1;
+            tracing::warn!(
+                "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
+                peer,
+                rep.score,
+                rep.ban_count,
+                reason
+            );
+        }
+
+        if score_change.abs() >= 10 || should_ban {
+            tracing::info!(
+                "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
+                peer,
+                old_score,
+                rep.score,
+                score_change,
+                reason
+            );
+        }
+
+        should_ban
+    }
+
     /// Update peer reputation
     pub async fn update_reputation(
         &self,
@@ -305,48 +349,9 @@ impl PeerReputationManager {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
 
-        // Apply decay first
         reputation.apply_decay();
+        let should_ban = Self::apply_score_change(reputation, score_change, peer, reason);
 
-        // Update score
-        let old_score = reputation.score;
-        reputation.score =
-            (reputation.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
-
-        // Track positive/negative actions
-        if score_change > 0 {
-            reputation.negative_actions += 1;
-        } else if score_change < 0 {
-            reputation.positive_actions += 1;
-        }
-
-        // Check if peer should be banned
-        let should_ban = reputation.score >= MAX_MISBEHAVIOR_SCORE && !reputation.is_banned();
-        if should_ban {
-            reputation.banned_until = Some(Instant::now() + BAN_DURATION);
-            reputation.ban_count += 1;
-            tracing::warn!(
-                "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
-                peer,
-                reputation.score,
-                reputation.ban_count,
-                reason
-            );
-        }
-
-        // Log significant changes
-        if score_change.abs() >= 10 || should_ban {
-            tracing::info!(
-                "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
-                peer,
-                old_score,
-                reputation.score,
-                score_change,
-                reason
-            );
-        }
-
-        // Record event
         let event = ReputationEvent {
             peer,
             change: score_change,
@@ -436,9 +441,7 @@ impl PeerReputationManager {
     pub async fn record_connection_failure(&self, peer: SocketAddr) {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
-        if reputation.last_tried.is_none() {
-            reputation.last_tried = Some(SystemTime::now());
-        }
+        reputation.last_tried = Some(SystemTime::now());
         reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
     }
 
@@ -456,48 +459,11 @@ impl PeerReputationManager {
             let mut reputations = self.reputations.write().await;
             let reputation = reputations.entry(peer).or_default();
 
-            if reputation.last_tried.is_none() {
-                reputation.last_tried = Some(SystemTime::now());
-            }
+            reputation.last_tried = Some(SystemTime::now());
             reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
 
             reputation.apply_decay();
-
-            let old_score = reputation.score;
-            reputation.score = (reputation.score + score_change)
-                .clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
-
-            if score_change > 0 {
-                reputation.negative_actions += 1;
-            } else if score_change < 0 {
-                reputation.positive_actions += 1;
-            }
-
-            let should_ban = reputation.score >= MAX_MISBEHAVIOR_SCORE && !reputation.is_banned();
-            if should_ban {
-                reputation.banned_until = Some(Instant::now() + BAN_DURATION);
-                reputation.ban_count += 1;
-                tracing::warn!(
-                    "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
-                    peer,
-                    reputation.score,
-                    reputation.ban_count,
-                    reason
-                );
-            }
-
-            if score_change.abs() >= 10 || should_ban {
-                tracing::info!(
-                    "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
-                    peer,
-                    old_score,
-                    reputation.score,
-                    score_change,
-                    reason
-                );
-            }
-
-            should_ban
+            Self::apply_score_change(reputation, score_change, peer, reason)
         };
 
         let event = ReputationEvent {
