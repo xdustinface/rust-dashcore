@@ -2,7 +2,7 @@
 
 use rand::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -23,6 +23,19 @@ fn evict_if_needed(peers: &mut HashMap<SocketAddr, AddrV2Message>) {
         entries.sort_by_key(|(_, msg)| std::cmp::Reverse(msg.time));
         entries.truncate(MAX_ADDR_TO_STORE);
         peers.extend(entries);
+    }
+}
+
+fn make_addr_message(addr: SocketAddr, services: ServiceFlags, time: u32) -> AddrV2Message {
+    let addr_v2 = match addr.ip() {
+        IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
+        IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
+    };
+    AddrV2Message {
+        time,
+        services,
+        addr: addr_v2,
+        port: addr.port(),
     }
 }
 
@@ -134,21 +147,36 @@ impl AddrV2Handler {
             })
             .as_secs() as u32;
 
-        let addr_v2 = match addr.ip() {
-            std::net::IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
-            std::net::IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
-        };
+        let mut known_peers = self.known_peers.write().await;
+        known_peers.insert(addr, make_addr_message(addr, services, now));
+        evict_if_needed(&mut known_peers);
+    }
 
-        let addr_msg = AddrV2Message {
-            time: now,
-            services,
-            addr: addr_v2,
-            port: addr.port(),
-        };
+    /// Bump the stored `AddrV2.time` for `addr` to now after directly observing
+    /// the peer (e.g. a successful handshake) and record the handshake-verified
+    /// `services`. A first-hand observation is authoritative, so both `time` and
+    /// `services` are overwritten on existing entries. If the entry is missing it
+    /// is created with the provided values.
+    pub async fn mark_seen(&self, addr: SocketAddr, services: ServiceFlags) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|e| {
+                tracing::error!("System time error in mark_seen: {}", e);
+                Duration::from_secs(0)
+            })
+            .as_secs() as u32;
 
         let mut known_peers = self.known_peers.write().await;
-        known_peers.insert(addr, addr_msg);
-        evict_if_needed(&mut known_peers);
+        match known_peers.get_mut(&addr) {
+            Some(existing) => {
+                existing.time = now;
+                existing.services = services;
+            }
+            None => {
+                known_peers.insert(addr, make_addr_message(addr, services, now));
+                evict_if_needed(&mut known_peers);
+            }
+        }
     }
 
     /// Build a GetAddr response message
@@ -188,6 +216,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mark_seen_bumps_time_and_updates_services() {
+        let handler = AddrV2Handler::new();
+        let addr: SocketAddr = "10.0.0.5:9999".parse().unwrap();
+
+        // Seed via AddrV2 gossip with a stale-but-valid timestamp and richer services.
+        let gossip_services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let ipv4_addr = match addr.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => panic!("test expects IPv4"),
+        };
+        let now =
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_secs() as u32;
+        let stale_time = now.saturating_sub(3600);
+        handler
+            .handle_addrv2(vec![AddrV2Message {
+                time: stale_time,
+                services: gossip_services,
+                addr: AddrV2::Ipv4(ipv4_addr),
+                port: addr.port(),
+            }])
+            .await;
+
+        // Observe the peer directly — handshake-verified services are authoritative.
+        let handshake_services = ServiceFlags::NETWORK;
+        handler.mark_seen(addr, handshake_services).await;
+
+        let known = handler.get_known_addresses().await;
+        let entry = known.iter().find(|m| m.socket_addr().ok() == Some(addr)).expect("entry");
+        assert!(entry.time >= now);
+        assert!(entry.time > stale_time);
+        assert_eq!(entry.services, handshake_services);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_inserts_new_entry() {
+        let handler = AddrV2Handler::new();
+        let addr: SocketAddr = "10.0.0.6:9999".parse().unwrap();
+
+        assert!(handler.get_known_addresses().await.is_empty());
+
+        handler.mark_seen(addr, ServiceFlags::NETWORK).await;
+
+        let known = handler.get_known_addresses().await;
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].socket_addr().unwrap(), addr);
+        assert_eq!(known[0].services, ServiceFlags::NETWORK);
+    }
+
+    #[tokio::test]
+    async fn test_mark_seen_evicts_when_at_capacity() {
+        let handler = AddrV2Handler::new();
+
+        // Use staggered timestamps strictly older than the mark_seen call below so
+        // the new entry is definitively the freshest and survives eviction.
+        let base_time =
+            (SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_secs() as u32)
+                .saturating_sub(ONE_WEEK / 2);
+
+        let msgs: Vec<AddrV2Message> = (0..MAX_ADDR_TO_STORE)
+            .map(|i| {
+                let addr: SocketAddr =
+                    format!("10.{}.{}.1:9999", i / 256, i % 256).parse().unwrap();
+                make_addr_message(addr, ServiceFlags::NETWORK, base_time - i as u32)
+            })
+            .collect();
+        handler.handle_addrv2(msgs).await;
+
+        assert_eq!(handler.get_known_addresses().await.len(), MAX_ADDR_TO_STORE);
+
+        let new_addr: SocketAddr = "192.168.99.99:9999".parse().unwrap();
+        handler.mark_seen(new_addr, ServiceFlags::NETWORK).await;
+
+        let known = handler.get_known_addresses().await;
+        assert_eq!(known.len(), MAX_ADDR_TO_STORE);
+        assert!(known.iter().any(|m| m.socket_addr().ok() == Some(new_addr)));
+    }
+
+    #[tokio::test]
     async fn test_addrv2_timestamp_validation() {
         let handler = AddrV2Handler::new();
         let now = SystemTime::now()
@@ -199,7 +305,7 @@ mod tests {
         let addr: SocketAddr =
             "127.0.0.1:9999".parse().expect("Failed to parse test socket address");
         let ipv4_addr = match addr.ip() {
-            std::net::IpAddr::V4(v4) => v4,
+            IpAddr::V4(v4) => v4,
             _ => panic!("Test expects IPv4 address but got IPv6"),
         };
 

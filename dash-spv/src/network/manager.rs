@@ -265,6 +265,10 @@ impl PeerNetworkManager {
                                 tracing::warn!("Failed to send GetAddr to {}: {}", addr, e);
                             }
 
+                            // Capture peer-advertised services before the peer is moved into the pool.
+                            let peer_services =
+                                handshake_manager.peer_services().unwrap_or(ServiceFlags::NETWORK);
+
                             // Record successful connection
                             reputation_manager.record_successful_connection(addr).await;
 
@@ -290,8 +294,9 @@ impl PeerNetworkManager {
                                 best_height,
                             });
 
-                            // Add to known addresses
-                            addrv2_handler.add_known_address(addr, ServiceFlags::NETWORK).await;
+                            // Bump the AddrV2 time on direct observation, using the peer's
+                            // actual advertised services from the version message.
+                            addrv2_handler.mark_seen(addr, peer_services).await;
 
                             // // Start message reader for this peer
                             Self::start_peer_reader(
@@ -311,9 +316,8 @@ impl PeerNetworkManager {
                             tracing::warn!("Handshake failed with {}: {}", addr, e);
                             // Only clears connecting set. Peer was never added, so no count/event needed.
                             pool.remove_peer(&addr).await;
-                            // Update reputation for handshake failure
                             reputation_manager
-                                .update_reputation(
+                                .record_failure_with_penalty(
                                     addr,
                                     misbehavior_scores::INVALID_MESSAGE,
                                     "Handshake failed",
@@ -328,9 +332,8 @@ impl PeerNetworkManager {
                     tracing::debug!("Failed to connect to {}: {}", addr, e);
                     // Only clears connecting set. Peer was never added, so no count/event needed.
                     pool.remove_peer(&addr).await;
-                    // Minor reputation penalty for connection failure
                     reputation_manager
-                        .update_reputation(
+                        .record_failure_with_penalty(
                             addr,
                             misbehavior_scores::TIMEOUT / 2,
                             "Connection failed",

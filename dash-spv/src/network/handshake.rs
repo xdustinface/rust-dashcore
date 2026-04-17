@@ -301,6 +301,11 @@ impl HandshakeManager {
         self.peer_version
     }
 
+    /// Get the service flags advertised by the peer in its version message.
+    pub fn peer_services(&self) -> Option<ServiceFlags> {
+        self.peer_services
+    }
+
     /// Check if peer supports headers2 compression.
     pub fn peer_supports_headers2(&self) -> bool {
         self.peer_services.map(|services| services.has(NODE_HEADERS_COMPRESSED)).unwrap_or(false)
