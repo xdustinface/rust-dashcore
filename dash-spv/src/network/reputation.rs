@@ -435,14 +435,21 @@ impl PeerReputationManager {
         reputation.consecutive_failures = 0;
     }
 
+    /// Apply the common fields updated on every failure: refresh `last_tried` and
+    /// increment `consecutive_failures`, clamped to `MAX_CONSECUTIVE_FAILURES`.
+    fn record_failure_fields(reputation: &mut PeerReputation) {
+        reputation.last_tried = Some(SystemTime::now());
+        reputation.consecutive_failures =
+            reputation.consecutive_failures.saturating_add(1).min(MAX_CONSECUTIVE_FAILURES);
+    }
+
     /// Record a connection or handshake failure. Increments the streak of
     /// consecutive failures without touching `last_success`, so callers can
     /// drive cooldown/backoff from the streak length.
     pub async fn record_connection_failure(&self, peer: SocketAddr) {
         let mut reputations = self.reputations.write().await;
         let reputation = reputations.entry(peer).or_default();
-        reputation.last_tried = Some(SystemTime::now());
-        reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
+        Self::record_failure_fields(reputation);
     }
 
     /// Record a connection failure and apply a reputation penalty in a single write-lock
@@ -459,8 +466,7 @@ impl PeerReputationManager {
             let mut reputations = self.reputations.write().await;
             let reputation = reputations.entry(peer).or_default();
 
-            reputation.last_tried = Some(SystemTime::now());
-            reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
+            Self::record_failure_fields(reputation);
 
             reputation.apply_decay();
             Self::apply_score_change(reputation, score_change, peer, reason)
