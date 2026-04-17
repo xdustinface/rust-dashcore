@@ -423,6 +423,75 @@ impl PeerReputationManager {
         reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
     }
 
+    /// Record a connection failure and apply a reputation penalty in a single write-lock
+    /// acquisition. Equivalent to calling `record_connection_failure` followed by
+    /// `update_reputation`, but without the race window between two separate locks.
+    /// Returns `true` if the peer was banned by this call.
+    pub async fn record_failure_with_penalty(
+        &self,
+        peer: SocketAddr,
+        score_change: i32,
+        reason: &str,
+    ) -> bool {
+        let should_ban = {
+            let mut reputations = self.reputations.write().await;
+            let reputation = reputations.entry(peer).or_default();
+
+            if reputation.last_tried.is_none() {
+                reputation.last_tried = Some(SystemTime::now());
+            }
+            reputation.consecutive_failures = reputation.consecutive_failures.saturating_add(1);
+
+            reputation.apply_decay();
+
+            let old_score = reputation.score;
+            reputation.score =
+                (reputation.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
+
+            if score_change > 0 {
+                reputation.negative_actions += 1;
+            } else if score_change < 0 {
+                reputation.positive_actions += 1;
+            }
+
+            let should_ban = reputation.score >= MAX_MISBEHAVIOR_SCORE && !reputation.is_banned();
+            if should_ban {
+                reputation.banned_until = Some(Instant::now() + BAN_DURATION);
+                reputation.ban_count += 1;
+                tracing::warn!(
+                    "Peer {} banned for misbehavior (score: {}, ban #{}, reason: {})",
+                    peer,
+                    reputation.score,
+                    reputation.ban_count,
+                    reason
+                );
+            }
+
+            if score_change.abs() >= 10 || should_ban {
+                tracing::info!(
+                    "Peer {} reputation changed: {} -> {} (change: {}, reason: {})",
+                    peer,
+                    old_score,
+                    reputation.score,
+                    score_change,
+                    reason
+                );
+            }
+
+            should_ban
+        };
+
+        let event = ReputationEvent {
+            peer,
+            change: score_change,
+            reason: reason.to_string(),
+            timestamp: Instant::now(),
+        };
+        self.record_event(event).await;
+
+        should_ban
+    }
+
     /// Get all peer reputations
     pub async fn get_all_reputations(&self) -> HashMap<SocketAddr, PeerReputation> {
         let mut reputations = self.reputations.write().await;
