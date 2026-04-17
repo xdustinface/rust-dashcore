@@ -443,19 +443,8 @@ impl PeerReputationManager {
             reputation.consecutive_failures.saturating_add(1).min(MAX_CONSECUTIVE_FAILURES);
     }
 
-    /// Record a connection or handshake failure. Increments the streak of
-    /// consecutive failures without touching `last_success`, so callers can
-    /// drive cooldown/backoff from the streak length.
-    pub async fn record_connection_failure(&self, peer: SocketAddr) {
-        let mut reputations = self.reputations.write().await;
-        let reputation = reputations.entry(peer).or_default();
-        Self::record_failure_fields(reputation);
-    }
-
     /// Record a connection failure and apply a reputation penalty in a single write-lock
-    /// acquisition. Equivalent to calling `record_connection_failure` followed by
-    /// `update_reputation`, but without the race window between two separate locks.
-    /// Returns `true` if the peer was banned by this call.
+    /// acquisition. Returns `true` if the peer was banned by this call.
     pub async fn record_failure_with_penalty(
         &self,
         peer: SocketAddr,

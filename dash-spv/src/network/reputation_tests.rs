@@ -151,9 +151,9 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:2222".parse().unwrap();
 
         // Seed a non-zero failure streak first to verify the reset behaviour.
-        manager.record_connection_failure(peer).await;
-        manager.record_connection_failure(peer).await;
-        manager.record_connection_failure(peer).await;
+        manager.record_failure_with_penalty(peer, 1, "seed").await;
+        manager.record_failure_with_penalty(peer, 1, "seed").await;
+        manager.record_failure_with_penalty(peer, 1, "seed").await;
         {
             let reputations = manager.get_all_reputations().await;
             assert_eq!(reputations[&peer].consecutive_failures, 3);
@@ -171,69 +171,6 @@ mod tests {
         assert!(last_success <= after);
         assert_eq!(rep.consecutive_failures, 0);
         assert_eq!(rep.successful_connections, 1);
-    }
-
-    #[tokio::test]
-    async fn test_record_connection_failure_increments_without_clearing_last_success() {
-        let manager = PeerReputationManager::new();
-        let peer: SocketAddr = "127.0.0.1:3333".parse().unwrap();
-
-        manager.record_successful_connection(peer).await;
-        let last_success_before = manager
-            .get_all_reputations()
-            .await
-            .get(&peer)
-            .expect("peer exists")
-            .last_success
-            .expect("last_success should be set");
-
-        manager.record_connection_failure(peer).await;
-        manager.record_connection_failure(peer).await;
-
-        let reputations = manager.get_all_reputations().await;
-        let rep = &reputations[&peer];
-
-        assert_eq!(rep.consecutive_failures, 2);
-        assert_eq!(rep.last_success, Some(last_success_before));
-
-        // A subsequent success clears the streak.
-        manager.record_successful_connection(peer).await;
-        let reputations = manager.get_all_reputations().await;
-        assert_eq!(reputations[&peer].consecutive_failures, 0);
-    }
-
-    #[tokio::test]
-    async fn test_record_connection_failure_always_updates_last_tried() {
-        let manager = PeerReputationManager::new();
-        let peer: SocketAddr = "127.0.0.1:4444".parse().unwrap();
-
-        let before_first = SystemTime::now();
-        manager.record_connection_failure(peer).await;
-        let after_first = SystemTime::now();
-
-        let first_tried = manager
-            .get_all_reputations()
-            .await
-            .get(&peer)
-            .expect("peer exists")
-            .last_tried
-            .expect("last_tried should be set after first failure");
-        assert!(first_tried >= before_first);
-        assert!(first_tried <= after_first);
-
-        let before_second = SystemTime::now();
-        manager.record_connection_failure(peer).await;
-        let after_second = SystemTime::now();
-
-        let second_tried = manager
-            .get_all_reputations()
-            .await
-            .get(&peer)
-            .expect("peer exists")
-            .last_tried
-            .expect("last_tried should still be set");
-        assert!(second_tried >= before_second);
-        assert!(second_tried <= after_second);
     }
 
     #[tokio::test]
@@ -333,5 +270,18 @@ mod tests {
             let reputations = manager.get_all_reputations().await;
             assert_eq!(reputations[&peer].consecutive_failures, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_consecutive_failures_saturates_at_runtime() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:9191".parse().unwrap();
+
+        for _ in 0..=MAX_CONSECUTIVE_FAILURES {
+            manager.record_failure_with_penalty(peer, 1, "flood").await;
+        }
+
+        let reputations = manager.get_all_reputations().await;
+        assert_eq!(reputations[&peer].consecutive_failures, MAX_CONSECUTIVE_FAILURES);
     }
 }
