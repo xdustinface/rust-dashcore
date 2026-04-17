@@ -151,6 +151,17 @@ where
 /// Clock-drift tolerance for future timestamps: up to 10 seconds ahead is accepted.
 const FUTURE_TIMESTAMP_TOLERANCE: Duration = Duration::from_secs(10);
 
+/// Exponential backoff steps applied after repeated connection failures. Indexed
+/// by `consecutive_failures - 1`, clamped to the last entry once the streak
+/// exceeds the table length.
+pub(crate) const COOLDOWN_STEPS: [Duration; 5] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(2 * 60 * 60),
+];
+
 fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
 where
     D: Deserializer<'de>,
@@ -307,6 +318,32 @@ impl PeerReputation {
         }
 
         should_ban
+    }
+
+    /// Return the backoff duration that should apply after `last_tried` given
+    /// the current `consecutive_failures` streak. `None` means no cooldown is
+    /// imposed, either because there are no failures or because there is no
+    /// temporal anchor in `last_tried`.
+    pub(crate) fn cooldown(&self) -> Option<Duration> {
+        if self.consecutive_failures == 0 {
+            return None;
+        }
+        let idx =
+            (self.consecutive_failures as usize).saturating_sub(1).min(COOLDOWN_STEPS.len() - 1);
+        Some(COOLDOWN_STEPS[idx])
+    }
+
+    /// True when `now` still falls inside the cooldown window anchored at
+    /// `last_tried`. Returns false if either the streak is zero or `last_tried`
+    /// is missing (e.g. discarded on load).
+    pub(crate) fn in_cooldown(&self, now: SystemTime) -> bool {
+        match (self.last_tried, self.cooldown()) {
+            (Some(last), Some(cd)) => match last.checked_add(cd) {
+                Some(deadline) => deadline > now,
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     /// Apply reputation decay
@@ -637,6 +674,7 @@ impl ReputationAware for PeerReputationManager {
             return Vec::new();
         }
 
+        let now = SystemTime::now();
         let mut peer_scores = Vec::new();
         let mut reputations = self.reputations.write().await;
 
@@ -653,9 +691,15 @@ impl ReputationAware for PeerReputationManager {
             let reputation = reputations.entry(socket_addr).or_default();
             reputation.apply_decay();
 
-            if !reputation.is_banned() {
-                peer_scores.push((socket_addr, reputation.score));
+            if reputation.is_banned() {
+                continue;
             }
+
+            if reputation.in_cooldown(now) {
+                continue;
+            }
+
+            peer_scores.push((socket_addr, reputation.score));
         }
 
         // Sort by score (lower is better)

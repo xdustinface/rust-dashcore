@@ -417,6 +417,62 @@ mod tests {
         );
     }
 
+    fn rep_with_streak(failures: u32, last_tried: Option<SystemTime>) -> PeerReputation {
+        PeerReputation {
+            consecutive_failures: failures,
+            last_tried,
+            ..PeerReputation::default()
+        }
+    }
+
+    #[test]
+    fn test_cooldown_none_when_no_failures() {
+        let rep = PeerReputation::default();
+        assert!(rep.cooldown().is_none());
+        assert!(!rep.in_cooldown(SystemTime::now()));
+    }
+
+    #[test]
+    fn test_cooldown_steps_match_exponential_backoff() {
+        let expected = [
+            (1, Duration::from_secs(30)),
+            (2, Duration::from_secs(60)),
+            (3, Duration::from_secs(5 * 60)),
+            (4, Duration::from_secs(30 * 60)),
+            (5, Duration::from_secs(2 * 60 * 60)),
+        ];
+        for (failures, duration) in expected {
+            let rep = rep_with_streak(failures, Some(SystemTime::now()));
+            assert_eq!(rep.cooldown(), Some(duration));
+        }
+    }
+
+    #[test]
+    fn test_cooldown_saturates_past_table_length() {
+        let rep = rep_with_streak(50, Some(SystemTime::now()));
+        assert_eq!(rep.cooldown(), Some(Duration::from_secs(2 * 60 * 60)));
+    }
+
+    #[test]
+    fn test_in_cooldown_true_within_window() {
+        let now = SystemTime::now();
+        let rep = rep_with_streak(1, Some(now - Duration::from_secs(10)));
+        assert!(rep.in_cooldown(now));
+    }
+
+    #[test]
+    fn test_in_cooldown_false_after_window() {
+        let now = SystemTime::now();
+        let rep = rep_with_streak(1, Some(now - Duration::from_secs(31)));
+        assert!(!rep.in_cooldown(now));
+    }
+
+    #[test]
+    fn test_in_cooldown_false_without_last_tried() {
+        let rep = rep_with_streak(3, None);
+        assert!(!rep.in_cooldown(SystemTime::now()));
+    }
+
     #[tokio::test]
     async fn test_normalize_after_load_preserves_failures_when_last_tried_valid() {
         let temp_dir = tempfile::TempDir::new().unwrap();
