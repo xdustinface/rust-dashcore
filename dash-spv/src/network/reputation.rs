@@ -8,11 +8,12 @@
 use crate::network::required_services::RequiredServices;
 use crate::storage::PeerStorage;
 use dashcore::network::address::AddrV2Message;
+use dashcore::network::constants::ServiceFlags;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 /// Misbehavior score thresholds for different violations
@@ -161,6 +162,24 @@ pub(crate) const COOLDOWN_STEPS: [Duration; 5] = [
     Duration::from_secs(30 * 60),
     Duration::from_secs(2 * 60 * 60),
 ];
+
+/// Tunables for the capability-aware peer-selection score. Lower composite score is
+/// better, matching the existing reputation convention.
+mod scoring_weights {
+    /// Weight applied to the success ratio (successful / attempts). Subtracted from
+    /// the composite score so peers with a high historical success rate rank ahead
+    /// of peers at the same reputation score.
+    pub(super) const SUCCESS_RATIO_WEIGHT: f64 = 30.0;
+
+    /// Seconds of `AddrV2.time` staleness per 1 point of penalty.
+    pub(super) const STALENESS_SECS_PER_POINT: f64 = 600.0;
+
+    /// Cap on the staleness penalty so a very old address cannot dominate the score.
+    pub(super) const STALENESS_CAP: f64 = 50.0;
+
+    /// Bonus subtracted when the peer advertises `NODE_HEADERS_COMPRESSED`.
+    pub(super) const PREFERRED_SERVICES_BONUS: f64 = 15.0;
+}
 
 fn clamp_future_system_time<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
 where
@@ -644,6 +663,27 @@ impl PeerReputationManager {
     }
 }
 
+/// Combine reputation score, historical success ratio, gossip staleness and the
+/// preferred-services bonus into a single score. Lower is better.
+fn composite_score(reputation: &PeerReputation, addr: &AddrV2Message, now_epoch_secs: u64) -> f64 {
+    let mut score = reputation.score as f64;
+
+    let attempts = reputation.connection_attempts.max(1) as f64;
+    let success_ratio = reputation.successful_connections as f64 / attempts;
+    score -= success_ratio * scoring_weights::SUCCESS_RATIO_WEIGHT;
+
+    let staleness_secs = now_epoch_secs.saturating_sub(addr.time as u64) as f64;
+    let staleness_penalty = (staleness_secs / scoring_weights::STALENESS_SECS_PER_POINT)
+        .min(scoring_weights::STALENESS_CAP);
+    score += staleness_penalty;
+
+    if addr.services.has(ServiceFlags::NODE_HEADERS_COMPRESSED) {
+        score -= scoring_weights::PREFERRED_SERVICES_BONUS;
+    }
+
+    score
+}
+
 /// Helper trait for reputation-aware peer selection
 pub(crate) trait ReputationAware {
     /// Select best peers that satisfy `required` services and are not banned.
@@ -674,9 +714,12 @@ impl ReputationAware for PeerReputationManager {
             return Vec::new();
         }
 
-        let now = SystemTime::now();
-        let mut peer_scores = Vec::new();
+        let now_system = SystemTime::now();
+        let now_epoch_secs =
+            now_system.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
         let mut reputations = self.reputations.write().await;
+        let mut scored: Vec<(SocketAddr, f64)> = Vec::with_capacity(available_peers.len());
 
         for peer in available_peers {
             let Ok(socket_addr) = peer.socket_addr() else {
@@ -695,18 +738,15 @@ impl ReputationAware for PeerReputationManager {
                 continue;
             }
 
-            if reputation.in_cooldown(now) {
+            if reputation.in_cooldown(now_system) {
                 continue;
             }
 
-            peer_scores.push((socket_addr, reputation.score));
+            scored.push((socket_addr, composite_score(reputation, &peer, now_epoch_secs)));
         }
 
-        // Sort by score (lower is better)
-        peer_scores.sort_by_key(|(_, score)| *score);
-
-        // Return the best peers
-        peer_scores.into_iter().take(count).map(|(peer, _)| peer).collect()
+        scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        scored.into_iter().take(count).map(|(peer, _)| peer).collect()
     }
 
     async fn should_connect_to_peer(&self, peer: &SocketAddr) -> bool {

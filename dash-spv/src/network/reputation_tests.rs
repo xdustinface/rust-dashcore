@@ -6,9 +6,24 @@ mod tests {
     use crate::storage::{PersistentPeerStorage, PersistentStorage};
 
     use super::super::*;
+    use dashcore::network::address::AddrV2;
     use dashcore::network::constants::ServiceFlags;
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn now_epoch_secs() -> u32 {
+        SystemTime::now().duration_since(UNIX_EPOCH).expect("system time").as_secs() as u32
+    }
+
+    fn addr_msg(ip: &str, port: u16, services: ServiceFlags, time: u32) -> AddrV2Message {
+        let ipv4: Ipv4Addr = ip.parse().expect("ipv4");
+        AddrV2Message {
+            time,
+            services,
+            addr: AddrV2::Ipv4(ipv4),
+            port,
+        }
+    }
 
     fn network_required() -> RequiredServices {
         RequiredServices::from_flags(ServiceFlags::NETWORK)
@@ -415,6 +430,241 @@ mod tests {
             rep.consecutive_failures, 0,
             "normalize_after_load must reset streak when last_tried is absent"
         );
+    }
+
+    #[tokio::test]
+    async fn test_select_filters_out_peers_missing_required_services() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let capable =
+            addr_msg("1.2.3.4", 9999, ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS, now);
+        let missing_filters = addr_msg("5.6.7.8", 9999, ServiceFlags::NETWORK, now);
+        let no_services = addr_msg("9.9.9.9", 9999, ServiceFlags::NONE, now);
+
+        let required =
+            RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
+        let selected = manager
+            .select_best_peers(required, vec![capable.clone(), missing_filters, no_services], 10)
+            .await;
+
+        assert_eq!(selected, vec![capable.socket_addr().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_select_filters_out_peers_in_cooldown() {
+        let manager = PeerReputationManager::new();
+        let now_secs = now_epoch_secs();
+
+        let addrs: Vec<SocketAddr> =
+            (1..=5).map(|i| format!("10.0.0.{i}:9999").parse::<SocketAddr>().unwrap()).collect();
+        let msgs: Vec<AddrV2Message> = addrs
+            .iter()
+            .map(|sa| match sa {
+                SocketAddr::V4(v4) => AddrV2Message {
+                    time: now_secs,
+                    services: ServiceFlags::NETWORK,
+                    addr: AddrV2::Ipv4(*v4.ip()),
+                    port: v4.port(),
+                },
+                _ => unreachable!("IPv4 only"),
+            })
+            .collect();
+
+        // Assign streaks 1..=5 with a fresh last_tried so every peer is in cooldown.
+        for (i, addr) in addrs.iter().enumerate() {
+            for _ in 0..=i {
+                manager.record_failure_with_penalty(*addr, 0, "seed").await;
+            }
+        }
+
+        let selected =
+            manager.select_best_peers(network_required(), msgs.clone(), addrs.len()).await;
+        assert!(selected.is_empty(), "every peer should be in cooldown");
+
+        // Confirm streaks match expectations by probing cooldown() via reputations.
+        let reps = manager.get_all_reputations().await;
+        let expected = [
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(5 * 60),
+            Duration::from_secs(30 * 60),
+            Duration::from_secs(2 * 60 * 60),
+        ];
+        for (i, addr) in addrs.iter().enumerate() {
+            assert_eq!(reps[addr].cooldown(), Some(expected[i]));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_includes_peer_whose_cooldown_expired() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+        let addr: SocketAddr = "192.168.10.10:9999".parse().unwrap();
+        let msg = addr_msg("192.168.10.10", 9999, ServiceFlags::NETWORK, now);
+
+        // One failure gives a 30s cooldown. Rewind last_tried past that window so
+        // the peer is no longer in cooldown.
+        manager.record_failure_with_penalty(addr, 0, "seed").await;
+        {
+            let mut reps = manager.reputations.write().await;
+            let r = reps.get_mut(&addr).unwrap();
+            r.last_tried = Some(SystemTime::now() - Duration::from_secs(120));
+        }
+
+        let selected = manager.select_best_peers(network_required(), vec![msg], 1).await;
+        assert_eq!(selected, vec![addr]);
+    }
+
+    #[tokio::test]
+    async fn test_select_ranking_prefers_higher_success_ratio() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+        let low: SocketAddr = "10.1.1.1:9999".parse().unwrap();
+        let high: SocketAddr = "10.1.1.2:9999".parse().unwrap();
+
+        // Equal reputation scores, differing success histories.
+        for _ in 0..10 {
+            manager.record_connection_attempt(low).await;
+            manager.record_connection_attempt(high).await;
+        }
+        for _ in 0..9 {
+            manager.record_successful_connection(high).await;
+        }
+
+        let msgs = vec![
+            addr_msg("10.1.1.1", 9999, ServiceFlags::NETWORK, now),
+            addr_msg("10.1.1.2", 9999, ServiceFlags::NETWORK, now),
+        ];
+        let selected = manager.select_best_peers(network_required(), msgs, 2).await;
+        assert_eq!(selected, vec![high, low]);
+    }
+
+    #[tokio::test]
+    async fn test_select_ranking_prefers_lower_reputation_score() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+        let better: SocketAddr = "10.2.2.1:9999".parse().unwrap();
+        let worse: SocketAddr = "10.2.2.2:9999".parse().unwrap();
+
+        manager.update_reputation(better, -10, "good").await;
+        manager.update_reputation(worse, 20, "bad").await;
+
+        let msgs = vec![
+            addr_msg("10.2.2.1", 9999, ServiceFlags::NETWORK, now),
+            addr_msg("10.2.2.2", 9999, ServiceFlags::NETWORK, now),
+        ];
+        let selected = manager.select_best_peers(network_required(), msgs, 2).await;
+        assert_eq!(selected, vec![better, worse]);
+    }
+
+    #[tokio::test]
+    async fn test_select_ranking_prefers_fresher_addrv2_time() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let fresh_addr: SocketAddr = "10.3.3.1:9999".parse().unwrap();
+        let stale_addr: SocketAddr = "10.3.3.2:9999".parse().unwrap();
+        let fresh = addr_msg("10.3.3.1", 9999, ServiceFlags::NETWORK, now);
+        let stale = addr_msg("10.3.3.2", 9999, ServiceFlags::NETWORK, now.saturating_sub(7200));
+
+        let selected = manager
+            .select_best_peers(network_required(), vec![stale.clone(), fresh.clone()], 2)
+            .await;
+        assert_eq!(selected, vec![fresh_addr, stale_addr]);
+    }
+
+    #[tokio::test]
+    async fn test_select_ranking_prefers_compressed_headers_bonus() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let bonus_addr: SocketAddr = "10.4.4.1:9999".parse().unwrap();
+        let plain_addr: SocketAddr = "10.4.4.2:9999".parse().unwrap();
+        let bonus = addr_msg(
+            "10.4.4.1",
+            9999,
+            ServiceFlags::NETWORK | ServiceFlags::NODE_HEADERS_COMPRESSED,
+            now,
+        );
+        let plain = addr_msg("10.4.4.2", 9999, ServiceFlags::NETWORK, now);
+
+        let selected = manager
+            .select_best_peers(network_required(), vec![plain.clone(), bonus.clone()], 2)
+            .await;
+        assert_eq!(selected, vec![bonus_addr, plain_addr]);
+    }
+
+    #[tokio::test]
+    async fn test_select_ties_preserve_all_survivors() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+        let a = addr_msg("10.5.5.1", 9999, ServiceFlags::NETWORK, now);
+        let b = addr_msg("10.5.5.2", 9999, ServiceFlags::NETWORK, now);
+
+        let selected =
+            manager.select_best_peers(network_required(), vec![a.clone(), b.clone()], 5).await;
+        let a_sa = a.socket_addr().unwrap();
+        let b_sa = b.socket_addr().unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&a_sa) && selected.contains(&b_sa));
+    }
+
+    #[tokio::test]
+    async fn test_select_returns_empty_when_all_filtered() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let incapable = addr_msg("10.6.6.1", 9999, ServiceFlags::NETWORK, now);
+        let required =
+            RequiredServices::from_flags(ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS);
+
+        let selected = manager.select_best_peers(required, vec![incapable], 5).await;
+        assert!(selected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_select_does_not_exceed_requested_count() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let msgs: Vec<AddrV2Message> = (0..10)
+            .map(|i| addr_msg(&format!("10.7.7.{i}"), 9999, ServiceFlags::NETWORK, now))
+            .collect();
+
+        let selected = manager.select_best_peers(network_required(), msgs, 3).await;
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_select_zero_count_returns_empty() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+
+        let msgs = vec![addr_msg("10.8.8.1", 9999, ServiceFlags::NETWORK, now)];
+        let selected = manager.select_best_peers(network_required(), msgs, 0).await;
+        assert!(selected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_select_filters_out_banned_peers() {
+        let manager = PeerReputationManager::new();
+        let now = now_epoch_secs();
+        let banned_addr: SocketAddr = "10.9.9.1:9999".parse().unwrap();
+        let good_addr: SocketAddr = "10.9.9.2:9999".parse().unwrap();
+
+        // Push score past ban threshold.
+        manager
+            .update_reputation(banned_addr, misbehavior_scores::INVALID_MESSAGE * 10, "bad")
+            .await;
+        assert!(manager.is_banned(&banned_addr).await);
+
+        let msgs = vec![
+            addr_msg("10.9.9.1", 9999, ServiceFlags::NETWORK, now),
+            addr_msg("10.9.9.2", 9999, ServiceFlags::NETWORK, now),
+        ];
+        let selected = manager.select_best_peers(network_required(), msgs, 10).await;
+        assert_eq!(selected, vec![good_addr]);
     }
 
     fn rep_with_streak(failures: u32, last_tried: Option<SystemTime>) -> PeerReputation {
