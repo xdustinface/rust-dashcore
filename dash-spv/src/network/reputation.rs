@@ -445,8 +445,8 @@ impl PeerReputationManager {
             reputation.apply_decay();
 
             let old_score = reputation.score;
-            reputation.score =
-                (reputation.score + score_change).clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
+            reputation.score = (reputation.score + score_change)
+                .clamp(MIN_MISBEHAVIOR_SCORE, MAX_MISBEHAVIOR_SCORE);
 
             if score_change > 0 {
                 reputation.negative_actions += 1;

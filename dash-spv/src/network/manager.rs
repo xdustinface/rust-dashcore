@@ -266,9 +266,8 @@ impl PeerNetworkManager {
                             }
 
                             // Capture peer-advertised services before the peer is moved into the pool.
-                            let peer_services = handshake_manager
-                                .peer_services()
-                                .unwrap_or(ServiceFlags::NETWORK);
+                            let peer_services =
+                                handshake_manager.peer_services().unwrap_or(ServiceFlags::NETWORK);
 
                             // Record successful connection
                             reputation_manager.record_successful_connection(addr).await;

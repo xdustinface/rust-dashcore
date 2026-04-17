@@ -31,7 +31,12 @@ fn make_addr_message(addr: SocketAddr, services: ServiceFlags, time: u32) -> Add
         IpAddr::V4(ipv4) => AddrV2::Ipv4(ipv4),
         IpAddr::V6(ipv6) => AddrV2::Ipv6(ipv6),
     };
-    AddrV2Message { time, services, addr: addr_v2, port: addr.port() }
+    AddrV2Message {
+        time,
+        services,
+        addr: addr_v2,
+        port: addr.port(),
+    }
 }
 
 /// Handler for AddrV2 peer exchange protocol
