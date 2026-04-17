@@ -161,14 +161,18 @@ pub struct PeerReputation {
     /// Successful connection count
     pub successful_connections: u64,
 
-    /// Last connection time
+    /// Monotonic instant of the last connection attempt within the current process session.
+    /// Resets to `None` on restart. Used for runtime decisions such as immediate
+    /// reconnect throttling. For persistent cooldown/backoff logic use `last_tried`.
     #[serde(skip)]
     pub last_connection: Option<Instant>,
 
     /// Wall-clock time of the last successful handshake with this peer.
     pub last_success: Option<SystemTime>,
 
-    /// Wall-clock time of the last attempted connection to this peer.
+    /// Wall-clock time of the last attempted connection to this peer (persisted across
+    /// restarts). The canonical source for cooldown and backoff decisions that must
+    /// survive process restarts. Distinct from `last_connection`, which is session-only.
     pub last_tried: Option<SystemTime>,
 
     /// Failures since the last success. Resets to 0 on a successful handshake.
