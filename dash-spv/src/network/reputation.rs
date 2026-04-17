@@ -460,7 +460,8 @@ impl PeerReputationManager {
     /// Record a connection failure and apply a reputation penalty in a single write-lock
     /// acquisition. Returns `true` if the peer was banned by this call.
     ///
-    /// `score_change` must be non-negative. Failure paths apply penalties (positive delta), not rewards.
+    /// Any negative `score_change` is clamped to 0 (panics in debug). Failure paths must not
+    /// reward peers.
     pub async fn record_failure_with_penalty(
         &self,
         peer: SocketAddr,
@@ -471,6 +472,7 @@ impl PeerReputationManager {
             score_change >= 0,
             "record_failure_with_penalty expects non-negative score change"
         );
+        let score_change = score_change.max(0);
         let should_ban = {
             let mut reputations = self.reputations.write().await;
             let reputation = reputations.entry(peer).or_default();
