@@ -127,6 +127,7 @@ pub mod string;
 pub mod taproot;
 pub mod util;
 
+#[cfg(feature = "serde")]
 use std::error::Error as StdError;
 
 pub use std::io;
