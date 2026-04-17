@@ -407,4 +407,36 @@ mod tests {
             "normalize_after_load must reset streak when last_tried is absent"
         );
     }
+
+    #[tokio::test]
+    async fn test_normalize_after_load_preserves_failures_when_last_tried_valid() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        let peers_dir = temp_dir.path().join("peers");
+        std::fs::create_dir_all(&peers_dir).unwrap();
+        let reputation_file = peers_dir.join("reputations.json");
+
+        let recent_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 300;
+        let json = format!(
+            r#"{{"127.0.0.1:9203":{{"score":0,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":5,"successful_connections":2,"last_success":null,"last_tried":{{"secs_since_epoch":{recent_secs},"nanos_since_epoch":0}},"consecutive_failures":3}}}}"#
+        );
+        std::fs::write(&reputation_file, json).unwrap();
+
+        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
+            .await
+            .expect("Failed to open PersistentPeerStorage");
+
+        let manager = PeerReputationManager::new();
+        manager.load_from_storage(&peer_storage).await.unwrap();
+
+        let peer: SocketAddr = "127.0.0.1:9203".parse().unwrap();
+        let reputations = manager.get_all_reputations().await;
+        let rep = reputations.get(&peer).expect("peer must be present after load");
+
+        assert!(rep.last_tried.is_some(), "valid last_tried must be preserved");
+        assert_eq!(
+            rep.consecutive_failures, 3,
+            "non-zero streak must be preserved when last_tried is valid"
+        );
+    }
 }
