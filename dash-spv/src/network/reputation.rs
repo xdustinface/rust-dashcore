@@ -159,7 +159,7 @@ where
 {
     let opt = Option::<SystemTime>::deserialize(d)?;
     let now = SystemTime::now();
-    let deadline = now + FUTURE_TIMESTAMP_TOLERANCE;
+    let deadline = now.checked_add(FUTURE_TIMESTAMP_TOLERANCE).unwrap_or(now);
     let floor = now.checked_sub(TIMESTAMP_MAX_AGE).unwrap_or(SystemTime::UNIX_EPOCH);
     Ok(opt.filter(|t| *t >= floor && *t <= deadline))
 }
