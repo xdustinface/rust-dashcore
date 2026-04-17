@@ -310,4 +310,27 @@ mod tests {
 
         assert!(after_failure > attempt_time, "failure should update last_tried");
     }
+
+    #[tokio::test]
+    async fn test_connection_attempt_then_success_preserves_last_tried() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+
+        manager.record_connection_attempt(peer).await;
+        let tried_after_attempt =
+            manager.get_all_reputations().await[&peer].last_tried.expect("attempt sets last_tried");
+        assert!(manager.get_all_reputations().await[&peer].last_success.is_none());
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        manager.record_successful_connection(peer).await;
+
+        let rep = &manager.get_all_reputations().await[&peer];
+        assert_eq!(
+            rep.last_tried,
+            Some(tried_after_attempt),
+            "success must preserve last_tried from the preceding attempt"
+        );
+        assert!(rep.last_success.is_some(), "success sets last_success");
+        assert_eq!(rep.consecutive_failures, 0);
+    }
 }
