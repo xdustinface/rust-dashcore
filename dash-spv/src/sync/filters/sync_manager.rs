@@ -193,6 +193,27 @@ impl<
     }
 
     async fn tick(&mut self, requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
+        // Detect a wallet that was added behind our scan progress and rescan
+        // from its `synced_height`.
+        if matches!(self.state(), SyncState::Syncing | SyncState::Synced | SyncState::WaitForEvents)
+        {
+            let committed = self.progress.committed_height();
+            let wallet_read = self.wallet.read().await;
+            let behind = wallet_read.wallets_behind(committed);
+            let wallet_min_synced = wallet_read.synced_height();
+            drop(wallet_read);
+            if !behind.is_empty() {
+                tracing::info!(
+                    "Wallet synced_height {} fell below filter committed_height {}, restarting scan",
+                    wallet_min_synced,
+                    committed
+                );
+                self.clear_in_flight_state();
+                self.progress.update_committed_height(wallet_min_synced);
+                return self.start_download(requests).await;
+            }
+        }
+
         // TODO: Get rid of the send pending in here? Or decouple it from the header storage?
         // Run tick when Syncing OR when Synced with pending work (new blocks arriving)
         let has_pending_work = !self.active_batches.is_empty();

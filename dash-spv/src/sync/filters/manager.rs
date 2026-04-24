@@ -1312,4 +1312,115 @@ mod tests {
         assert_eq!(manager.state(), SyncState::Synced);
         assert!(events.is_empty());
     }
+
+    /// A wallet whose `synced_height` sits below the manager's `committed_height`
+    /// must trigger a rescan from the wallet's height. This simulates a wallet
+    /// being added at runtime behind current scan progress.
+    #[tokio::test]
+    async fn test_tick_rescans_when_wallet_falls_behind_committed() {
+        let mut manager = create_test_manager().await;
+
+        // Block headers required by start_download to resolve heights.
+        let headers = dashcore::block::Header::dummy_batch(0..201);
+        manager.header_storage.write().await.store_headers(&headers).await.unwrap();
+
+        // Manager believes filters are committed up to 100, with filter headers at 200.
+        manager.set_state(SyncState::Synced);
+        manager.progress.update_committed_height(100);
+        manager.progress.update_stored_height(100);
+        manager.progress.update_filter_header_tip_height(200);
+        manager.progress.update_target_height(200);
+
+        // Pre-populate in-flight state so we can verify clear_in_flight_state runs.
+        manager.active_batches.insert(101, FiltersBatch::new(101, 200, HashMap::new()));
+        manager.filters_matched.insert(dashcore::block::Header::dummy(0).block_hash());
+        manager.filter_pipeline.init(101, 200);
+
+        // MockWallet defaults to synced_height=0, so wallets_behind(100) = {MOCK_WALLET_ID}.
+        assert_eq!(manager.wallet.read().await.synced_height(), 0);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let _events = manager.tick(&requests).await.unwrap();
+
+        // Old in-flight state was cleared and a fresh batch was created at scan_start=0.
+        assert!(!manager.active_batches.contains_key(&101));
+        assert!(manager.active_batches.contains_key(&0));
+        assert!(manager.filters_matched.is_empty());
+
+        // committed_height was lowered and start_download set it to scan_start - 1 = 0.
+        assert_eq!(manager.progress.committed_height(), 0);
+        assert_eq!(manager.state(), SyncState::Syncing);
+    }
+
+    /// When every managed wallet is at or beyond `committed_height`, the rescan
+    /// trigger must not fire even though the aggregate `synced_height` could
+    /// otherwise look stale.
+    #[tokio::test]
+    async fn test_tick_does_not_rescan_when_no_wallets_behind() {
+        let mut manager = create_test_manager().await;
+
+        // Wallet at synced_height=200, manager committed at 100 → no wallets behind.
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 200);
+
+        manager.set_state(SyncState::Synced);
+        manager.progress.update_committed_height(100);
+        manager.progress.update_stored_height(100);
+        manager.progress.update_filter_header_tip_height(200);
+        manager.progress.update_target_height(200);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let events = manager.tick(&requests).await.unwrap();
+
+        assert!(events.is_empty());
+        assert_eq!(manager.progress.committed_height(), 100);
+        assert_eq!(manager.state(), SyncState::Synced);
+        assert!(manager.active_batches.is_empty());
+    }
+
+    /// `committed_height = 0` on a fresh manager must not falsely trip the
+    /// rescan trigger. `wallets_behind(0)` returns an empty set since heights
+    /// are unsigned, so no wallet can be strictly less than 0.
+    #[tokio::test]
+    async fn test_tick_does_not_rescan_at_genesis_committed() {
+        let mut manager = create_test_manager().await;
+        // Default state: committed_height=0, wallet synced_height=0, state=WaitForEvents.
+        assert_eq!(manager.progress.committed_height(), 0);
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let events = manager.tick(&requests).await.unwrap();
+
+        assert!(events.is_empty());
+        assert!(manager.is_idle());
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+    }
+
+    /// The rescan trigger only fires in `Syncing | Synced | WaitForEvents`.
+    /// `WaitingForConnections` must be skipped since we're not actively syncing.
+    #[tokio::test]
+    async fn test_tick_does_not_rescan_in_waiting_for_connections() {
+        let mut manager = create_test_manager().await;
+        manager.set_state(SyncState::WaitingForConnections);
+        manager.progress.update_committed_height(100);
+
+        // Wallet behind committed — would normally trip the trigger.
+        assert!(!manager.wallet.read().await.wallets_behind(100).is_empty());
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let events = manager.tick(&requests).await.unwrap();
+
+        assert!(events.is_empty());
+        // committed_height not lowered, no batches created.
+        assert_eq!(manager.progress.committed_height(), 100);
+        assert_eq!(manager.state(), SyncState::WaitingForConnections);
+        assert!(manager.active_batches.is_empty());
+    }
 }
