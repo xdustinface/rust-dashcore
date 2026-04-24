@@ -99,9 +99,9 @@ Functions: 64
 | `managed_wallet_get_top_up_account_with_registration_index` | Get a managed IdentityTopUp account with a specific registration index  This... | managed_account |
 | `managed_wallet_get_utxos` | Get all UTXOs from managed wallet info  # Safety  - `managed_info` must be a... | utxo |
 | `managed_wallet_info_free` | Free managed wallet info returned by wallet_manager_get_managed_wallet_info ... | managed_wallet |
+| `managed_wallet_last_processed_height` | Get current last processed height from wallet info  # Safety  -... | managed_wallet |
 | `managed_wallet_mark_address_used` | Mark an address as used in the pool  This updates the pool's tracking of... | address_pool |
 | `managed_wallet_set_gap_limit` | Set the gap limit for an address pool  The gap limit determines how many... | address_pool |
-| `managed_wallet_synced_height` | Get current synced height from wallet info  # Safety  - `managed_wallet`... | managed_wallet |
 | `wallet_add_account` | Add an account to the wallet without xpub  # Safety  This function... | wallet |
 | `wallet_add_account_with_string_xpub` | Add an account to the wallet with xpub as string  # Safety  This function... | wallet |
 | `wallet_add_account_with_xpub_bytes` | Add an account to the wallet with xpub as byte array  # Safety  This... | wallet |
@@ -1140,6 +1140,22 @@ Free managed wallet info returned by wallet_manager_get_managed_wallet_info  # S
 
 ---
 
+#### `managed_wallet_last_processed_height`
+
+```c
+managed_wallet_last_processed_height(managed_wallet: *const FFIManagedWalletInfo, error: *mut FFIError,) -> c_uint
+```
+
+**Description:**
+Get current last processed height from wallet info  # Safety  - `managed_wallet` must be a valid pointer to an FFIManagedWalletInfo - `error` must be a valid pointer to an FFIError structure - The caller must ensure all pointers remain valid for the duration of this call
+
+**Safety:**
+- `managed_wallet` must be a valid pointer to an FFIManagedWalletInfo - `error` must be a valid pointer to an FFIError structure - The caller must ensure all pointers remain valid for the duration of this call
+
+**Module:** `managed_wallet`
+
+---
+
 #### `managed_wallet_mark_address_used`
 
 ```c
@@ -1169,22 +1185,6 @@ Set the gap limit for an address pool  The gap limit determines how many unused 
 - `managed_wallet` must be a valid pointer to an FFIManagedWalletInfo - `error` must be a valid pointer to an FFIError
 
 **Module:** `address_pool`
-
----
-
-#### `managed_wallet_synced_height`
-
-```c
-managed_wallet_synced_height(managed_wallet: *const FFIManagedWalletInfo, error: *mut FFIError,) -> c_uint
-```
-
-**Description:**
-Get current synced height from wallet info  # Safety  - `managed_wallet` must be a valid pointer to an FFIManagedWalletInfo - `error` must be a valid pointer to an FFIError structure - The caller must ensure all pointers remain valid for the duration of this call
-
-**Safety:**
-- `managed_wallet` must be a valid pointer to an FFIManagedWalletInfo - `error` must be a valid pointer to an FFIError structure - The caller must ensure all pointers remain valid for the duration of this call
-
-**Module:** `managed_wallet`
 
 ---
 
