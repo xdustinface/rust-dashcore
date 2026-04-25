@@ -79,15 +79,17 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
         let mut events = Vec::new();
 
         // Process blocks in height order using pipeline's ordering logic
-        while let Some((block, height)) = self.pipeline.take_next_ordered_block() {
+        while let Some((block, height, interested)) = self.pipeline.take_next_ordered_block() {
             let hash = block.block_hash();
 
-            // Process block through wallet
+            // Process the block only for the wallets whose filter matched it.
+            // Already-synced wallets that did not match are not touched.
             let mut wallet = self.wallet.write().await;
-            let result = wallet.process_block(&block, height).await;
+            let result = wallet.process_block_for_wallets(&block, height, &interested).await;
             drop(wallet);
 
             let total_relevant = result.relevant_tx_count();
+            let new_addresses_total: usize = result.new_addresses.values().map(|v| v.len()).sum();
             if total_relevant > 0 {
                 tracing::info!(
                     "Found {} relevant transactions ({} new, {} existing) {} at height {}, new addresses: {}",
@@ -96,7 +98,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
                     result.existing_txids.len(),
                     hash,
                     height,
-                    result.new_addresses.len()
+                    new_addresses_total
                 );
             }
 
@@ -104,11 +106,12 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             let confirmed_txids: Vec<_> = result.relevant_txids().cloned().collect();
 
             // Collect new addresses for gap limit rescanning
-            let new_addresses: Vec<_> = result.new_addresses.into_iter().collect();
-            if !new_addresses.is_empty() {
+            let new_addresses = result.new_addresses;
+            if new_addresses_total > 0 {
                 tracing::debug!(
-                    "Block {} generated {} new addresses for gap limit maintenance",
+                    "Block {} generated {} new addresses for gap limit maintenance across {} wallets",
                     height,
+                    new_addresses_total,
                     new_addresses.len()
                 );
             }
@@ -170,7 +173,7 @@ mod tests {
     use crate::test_utils::MockNetworkManager;
     use key_wallet_manager::test_utils::MockWallet;
     use key_wallet_manager::FilterMatchKey;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     type TestBlocksManager =
         BlocksManager<PersistentBlockHeaderStorage, PersistentBlockStorage, MockWallet>;
@@ -215,8 +218,8 @@ mod tests {
         let requests = network.request_sender();
 
         let block_hash = dashcore::BlockHash::dummy(0);
-        let mut blocks = BTreeSet::new();
-        blocks.insert(FilterMatchKey::new(100, block_hash));
+        let mut blocks = BTreeMap::new();
+        blocks.insert(FilterMatchKey::new(100, block_hash), BTreeSet::new());
         let event = SyncEvent::BlocksNeeded {
             blocks,
         };
