@@ -101,30 +101,40 @@ fn test_all_callbacks_during_sync() {
         drop(connected_peers);
 
         // Wait for wallet callbacks (they travel on a separate channel from sync events)
-        tracker.wait_for_callback(&tracker.transaction_received_count, 0, "transaction_received");
-        tracker.wait_for_callback(&tracker.balance_updated_count, 0, "balance_updated");
+        tracker.wait_for_callback(
+            &tracker.block_process_change_record_count,
+            0,
+            "block_process_change_record",
+        );
 
         // Validate wallet event callbacks (test wallet has transactions)
-        let tx_received = tracker.transaction_received_count.load(Ordering::SeqCst);
-        let balance_updated = tracker.balance_updated_count.load(Ordering::SeqCst);
-        let tx_status_changed = tracker.transaction_status_changed_count.load(Ordering::SeqCst);
+        let block_records = tracker.block_process_change_record_count.load(Ordering::SeqCst);
+        let block_changes = tracker.block_process_change_count.load(Ordering::SeqCst);
+        let mempool_received = tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
+        let instant_send_locked =
+            tracker.transaction_instant_send_locked_count.load(Ordering::SeqCst);
 
         tracing::info!(
-            "Wallet: tx_received={}, tx_status_changed={}, balance_updated={}",
-            tx_received,
-            tx_status_changed,
-            balance_updated
+            "Wallet: mempool_received={}, instant_send_locked={}, block_changes={}, \
+             block_records={}",
+            mempool_received,
+            instant_send_locked,
+            block_changes,
+            block_records
         );
 
         assert!(
-            tx_received > 0,
-            "on_transaction_received should fire for wallet with transactions"
+            block_records > 0,
+            "on_block_process_change should deliver records for a wallet with transactions"
+        );
+        assert!(
+            block_changes > 0,
+            "on_block_process_change should fire for blocks containing wallet records"
         );
         assert_eq!(
-            tx_status_changed, 0,
-            "on_transaction_status_changed should not fire here, all transactions are confirmed."
+            instant_send_locked, 0,
+            "on_transaction_instant_send_locked should not fire during initial sync"
         );
-        assert!(balance_updated > 0, "on_balance_updated should fire for wallet with transactions");
 
         // Validate sync cycle (initial sync is cycle 0)
         let last_sync_cycle = tracker.last_sync_cycle.load(Ordering::SeqCst);
@@ -260,8 +270,9 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         tracing::info!("Initial sync complete");
 
         // Record callback counts before post-sync operations
-        let tx_received_before = tracker.transaction_received_count.load(Ordering::SeqCst);
-        let balance_updated_before = tracker.balance_updated_count.load(Ordering::SeqCst);
+        let mempool_received_before =
+            tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
+        let block_records_before = tracker.block_process_change_record_count.load(Ordering::SeqCst);
 
         // Send DASH to the wallet and mine a block
         let receive_address = ctx.get_receive_address(&wallet_id);
@@ -277,28 +288,29 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
 
         // Wait for wallet callbacks (they travel on a separate channel from sync events)
         tracker.wait_for_callback(
-            &tracker.transaction_received_count,
-            tx_received_before,
-            "transaction_received",
+            &tracker.mempool_transaction_received_count,
+            mempool_received_before,
+            "mempool_transaction_received",
         );
         tracker.wait_for_callback(
-            &tracker.balance_updated_count,
-            balance_updated_before,
-            "balance_updated",
+            &tracker.block_process_change_record_count,
+            block_records_before,
+            "block_process_change_record",
         );
 
-        // Verify on_transaction_received fired for the new transaction
-        let tx_received_after = tracker.transaction_received_count.load(Ordering::SeqCst);
+        // Verify on_mempool_transaction_received fired for the new transaction
+        let mempool_received_after =
+            tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
         assert!(
-            tx_received_after > tx_received_before,
-            "on_transaction_received should fire for post-sync transaction: {} -> {}",
-            tx_received_before,
-            tx_received_after
+            mempool_received_after > mempool_received_before,
+            "on_mempool_transaction_received should fire for post-sync transaction: {} -> {}",
+            mempool_received_before,
+            mempool_received_after
         );
         tracing::info!(
-            "Transaction callback verified: {} -> {}",
-            tx_received_before,
-            tx_received_after
+            "Mempool transaction callback verified: {} -> {}",
+            mempool_received_before,
+            mempool_received_after
         );
 
         // Verify the sent txid appears in the callback data with a non-zero
@@ -323,20 +335,18 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         );
         drop(received_txs);
 
-        let balance_updated_after = tracker.balance_updated_count.load(Ordering::SeqCst);
+        let block_records_after = tracker.block_process_change_record_count.load(Ordering::SeqCst);
         tracing::info!(
-            "Balance updated callback verified: {} -> {}",
-            balance_updated_before,
-            balance_updated_after
+            "Block-process record callback verified: {} -> {}",
+            block_records_before,
+            block_records_after
         );
 
-        // Verify balance data from callback reflects a positive spendable balance
-        let last_spendable = tracker.last_spendable.load(Ordering::SeqCst);
-        assert!(
-            last_spendable > 0,
-            "last_spendable from on_balance_updated should be positive after receiving funds"
-        );
-        tracing::info!("Balance data verified: last_spendable={}", last_spendable);
+        // Verify balance data from the most recent wallet event reflects a positive
+        // confirmed balance.
+        let last_confirmed = tracker.last_confirmed.load(Ordering::SeqCst);
+        assert!(last_confirmed > 0, "last_confirmed should be positive after receiving funds");
+        tracing::info!("Balance data verified: last_confirmed={}", last_confirmed);
 
         // Record connect count before disconnect
         let connect_before = tracker.peer_connected_count.load(Ordering::SeqCst);

@@ -12,10 +12,9 @@ use dash_spv::sync::{SyncEvent, SyncProgress};
 use dash_spv::EventHandler;
 use dashcore::hashes::Hash;
 use key_wallet_ffi::managed_account::FFITransactionRecord;
-use key_wallet_ffi::types::FFITransactionContext;
-use key_wallet_manager::WalletEvent;
+use key_wallet_ffi::types::FFIBalance;
+use key_wallet_manager::{RecordAction, WalletEvent};
 use std::ffi::CString;
-use std::ops::Deref;
 use std::os::raw::{c_char, c_void};
 
 // ============================================================================
@@ -530,63 +529,118 @@ impl FFINetworkEventCallbacks {
 // FFIWalletEventCallbacks - One callback per WalletEvent variant
 // ============================================================================
 
-/// Callback for WalletEvent::TransactionReceived
+/// Whether a record is newly stored or updates a previously stored record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFIRecordAction {
+    /// The record is new (first time stored for this wallet).
+    Inserted = 0,
+    /// The record was already stored and has been updated.
+    Updated = 1,
+}
+
+impl From<RecordAction> for FFIRecordAction {
+    fn from(action: RecordAction) -> Self {
+        match action {
+            RecordAction::Inserted => FFIRecordAction::Inserted,
+            RecordAction::Updated => FFIRecordAction::Updated,
+        }
+    }
+}
+
+/// FFI-friendly form of `BlockRecordUpdate`: a `TransactionRecord` affected by
+/// a block, with its account derivation path and whether it is a fresh
+/// insertion or an update to an existing record.
+#[repr(C)]
+pub struct FFIBlockRecordUpdate {
+    /// Null-terminated UTF-8 BIP-32 path string identifying the account
+    /// (e.g. `"m/44'/1'/0'"`). Borrowed for the duration of the callback.
+    pub account_path: *const c_char,
+    /// Whether the record is new or an update to a previously stored one.
+    pub action: FFIRecordAction,
+    /// The transaction record.
+    pub record: FFITransactionRecord,
+}
+
+/// Callback for `WalletEvent::MempoolTransactionReceived`.
 ///
-/// The `record` pointer is borrowed and only valid for the duration of the
-/// callback. Callers must copy any data they need to retain after the callback
-/// returns. The record contains all transaction details including serialized
-/// transaction bytes, input/output details, and classification metadata.
-pub type OnTransactionReceivedCallback = Option<
+/// Fires when a wallet-relevant transaction is first seen in the mempool
+/// (optionally with an InstantSend lock — in that case the record's context
+/// is `InstantSend(..)`).
+///
+/// All pointer parameters are borrowed and only valid for the duration of the
+/// callback. `balance` is the wallet's balance *after* the transaction was
+/// recorded.
+pub type OnMempoolTransactionReceivedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
-        account_index: u32,
+        account_path: *const c_char,
         record: *const FFITransactionRecord,
+        balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
 >;
 
-/// Callback for WalletEvent::TransactionStatusChanged
+/// Callback for `WalletEvent::TransactionInstantSendLocked`.
 ///
-/// The `wallet_id` string pointer and `txid` hash pointer are borrowed and only
-/// valid for the duration of the callback.
-pub type OnTransactionStatusChangedCallback = Option<
+/// Fires when a previously-seen wallet-relevant transaction is
+/// InstantSend-locked. `islock_data` points to consensus-serialized
+/// `InstantLock` bytes valid only for the duration of the callback.
+pub type OnTransactionInstantSendLockedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
         txid: *const [u8; 32],
-        status: FFITransactionContext,
+        islock_data: *const u8,
+        islock_len: usize,
+        balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
 >;
 
-/// Callback for WalletEvent::BalanceUpdated
+/// Callback for `WalletEvent::BlockProcessChange`.
 ///
-/// The `wallet_id` string pointer is borrowed and only valid for the duration
-/// of the callback. Callers must copy the string if they need to retain it
-/// after the callback returns.
-pub type OnBalanceUpdatedCallback = Option<
+/// Fires once per wallet affected by a processed block. `updates` points to an
+/// array of `update_count` `FFIBlockRecordUpdate` entries covering records
+/// newly recorded or updated by this block. The array may be empty when only
+/// the wallet's balance shifted (e.g. a coinbase maturing). `balance` is the
+/// wallet's balance *after* the block was processed.
+///
+/// The `updates` array and all its contents are borrowed and only valid for
+/// the duration of the callback.
+pub type OnBlockProcessChangeCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
-        confirmed: u64,
-        unconfirmed: u64,
-        immature: u64,
-        locked: u64,
+        height: u32,
+        updates: *const FFIBlockRecordUpdate,
+        update_count: u32,
+        balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
 >;
+
+/// Callback for `WalletEvent::SyncedHeightUpdated`.
+///
+/// Fires once per wallet when the filter pipeline commits a batch — the
+/// wallet has been scanned up to `height`. Consumers can persist this as a
+/// checkpoint atomically with any records/balance already persisted from
+/// prior `BlockProcessChange` events inside the batch.
+pub type OnSyncedHeightUpdatedCallback =
+    Option<extern "C" fn(wallet_id: *const c_char, height: u32, user_data: *mut c_void)>;
 
 /// Wallet event callbacks - one callback per WalletEvent variant.
 ///
 /// Set only the callbacks you're interested in; unset callbacks will be ignored.
 ///
-/// All pointer parameters passed to callbacks (wallet IDs, txids, addresses)
-/// are borrowed and only valid for the duration of the callback invocation.
-/// Callers must copy any data they need to retain.
+/// All pointer parameters passed to callbacks (wallet IDs, txids, records,
+/// balances, updates) are borrowed and only valid for the duration of the
+/// callback invocation. Callers must copy any data they need to retain.
 #[repr(C)]
 #[derive(Clone)]
 pub struct FFIWalletEventCallbacks {
-    pub on_transaction_received: OnTransactionReceivedCallback,
-    pub on_transaction_status_changed: OnTransactionStatusChangedCallback,
-    pub on_balance_updated: OnBalanceUpdatedCallback,
+    pub on_mempool_transaction_received: OnMempoolTransactionReceivedCallback,
+    pub on_transaction_instant_send_locked: OnTransactionInstantSendLockedCallback,
+    pub on_block_process_change: OnBlockProcessChangeCallback,
+    pub on_synced_height_updated: OnSyncedHeightUpdatedCallback,
     pub user_data: *mut c_void,
 }
 
@@ -597,9 +651,10 @@ unsafe impl Sync for FFIWalletEventCallbacks {}
 impl Default for FFIWalletEventCallbacks {
     fn default() -> Self {
         Self {
-            on_transaction_received: None,
-            on_transaction_status_changed: None,
-            on_balance_updated: None,
+            on_mempool_transaction_received: None,
+            on_transaction_instant_send_locked: None,
+            on_block_process_change: None,
+            on_synced_height_updated: None,
             user_data: std::ptr::null_mut(),
         }
     }
@@ -694,62 +749,100 @@ impl FFIWalletEventCallbacks {
     /// Dispatch a WalletEvent to the appropriate callback.
     pub fn dispatch(&self, event: &WalletEvent) {
         match event {
-            WalletEvent::TransactionReceived {
+            WalletEvent::MempoolTransactionReceived {
                 wallet_id,
-                account_index,
+                account_path,
                 record,
+                balance,
             } => {
-                if let Some(cb) = self.on_transaction_received {
+                if let Some(cb) = self.on_mempool_transaction_received {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
-
-                    let ffi_record = FFITransactionRecord::from(record.deref());
+                    let c_account_path = CString::new(account_path.to_string()).unwrap_or_default();
+                    let ffi_record = FFITransactionRecord::from(record.as_ref());
+                    let ffi_balance = FFIBalance::from(*balance);
 
                     cb(
                         c_wallet_id.as_ptr(),
-                        *account_index,
+                        c_account_path.as_ptr(),
                         &ffi_record as *const FFITransactionRecord,
+                        &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
                 }
             }
-            WalletEvent::TransactionStatusChanged {
+            WalletEvent::TransactionInstantSendLocked {
                 wallet_id,
                 txid,
-                status,
+                instant_send_lock,
+                balance,
             } => {
-                if let Some(cb) = self.on_transaction_status_changed {
+                if let Some(cb) = self.on_transaction_instant_send_locked {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
                     let txid_bytes = txid.as_byte_array();
-                    let ffi_ctx = FFITransactionContext::from(status.clone());
+                    let islock_bytes = dashcore::consensus::serialize(instant_send_lock);
+                    let ffi_balance = FFIBalance::from(*balance);
 
                     cb(
                         c_wallet_id.as_ptr(),
                         txid_bytes as *const [u8; 32],
-                        ffi_ctx,
+                        islock_bytes.as_ptr(),
+                        islock_bytes.len(),
+                        &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
                 }
             }
-            WalletEvent::BalanceUpdated {
+            WalletEvent::BlockProcessChange {
                 wallet_id,
-                confirmed,
-                unconfirmed,
-                immature,
-                locked,
+                height,
+                updates,
+                balance,
             } => {
-                if let Some(cb) = self.on_balance_updated {
+                if let Some(cb) = self.on_block_process_change {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
+                    // Materialize one CString per update *before* building the
+                    // FFI views so the `*const c_char` pointers stored inside
+                    // `FFIBlockRecordUpdate` stay valid for the duration of
+                    // the callback invocation.
+                    let path_cstrs: Vec<CString> = updates
+                        .iter()
+                        .map(|u| CString::new(u.account_path.to_string()).unwrap_or_default())
+                        .collect();
+                    let ffi_updates: Vec<FFIBlockRecordUpdate> = updates
+                        .iter()
+                        .zip(path_cstrs.iter())
+                        .map(|(u, path)| FFIBlockRecordUpdate {
+                            account_path: path.as_ptr(),
+                            action: FFIRecordAction::from(u.action),
+                            record: FFITransactionRecord::from(&u.record),
+                        })
+                        .collect();
+                    let ffi_balance = FFIBalance::from(*balance);
+
                     cb(
                         c_wallet_id.as_ptr(),
-                        *confirmed,
-                        *unconfirmed,
-                        *immature,
-                        *locked,
+                        *height,
+                        ffi_updates.as_ptr(),
+                        ffi_updates.len() as u32,
+                        &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
+
+                    drop(ffi_updates);
+                    drop(path_cstrs);
+                }
+            }
+            WalletEvent::SyncedHeightUpdated {
+                wallet_id,
+                height,
+            } => {
+                if let Some(cb) = self.on_synced_height_updated {
+                    let wallet_id_hex = hex::encode(wallet_id);
+                    let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
+                    cb(c_wallet_id.as_ptr(), *height, self.user_data);
                 }
             }
         }
