@@ -347,7 +347,7 @@ impl FFISyncEventCallbacks {
             } => {
                 if let Some(cb) = self.on_blocks_needed {
                     let ffi_blocks: Vec<FFIBlockNeeded> = blocks
-                        .iter()
+                        .keys()
                         .map(|key| FFIBlockNeeded {
                             height: key.height(),
                             hash: *key.hash().as_byte_array(),
@@ -366,10 +366,11 @@ impl FFISyncEventCallbacks {
                     let hash_bytes = block_hash.as_byte_array();
                     let txid_bytes: Vec<[u8; 32]> =
                         confirmed_txids.iter().map(|txid| *txid.as_byte_array()).collect();
+                    let total_new_addresses: usize = new_addresses.values().map(|v| v.len()).sum();
                     cb(
                         *height,
                         hash_bytes as *const [u8; 32],
-                        new_addresses.len() as u32,
+                        total_new_addresses as u32,
                         txid_bytes.as_ptr(),
                         txid_bytes.len() as u32,
                         self.user_data,

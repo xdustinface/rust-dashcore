@@ -161,7 +161,6 @@ impl<
             } => {
                 // Check if this block is part of our tracked blocks
                 if let Some((_, batch_start)) = self.blocks_remaining.remove(block_hash) {
-                    // Decrement this batch's pending_blocks count
                     if let Some(batch) = self.active_batches.get_mut(&batch_start) {
                         batch.decrement_pending_blocks();
                         tracing::debug!(
@@ -173,16 +172,16 @@ impl<
                         );
                     }
 
-                    // Collect new addresses in the batch for deferred rescan at commit time.
-                    // This batches rescans for efficiency and ensures all blocks from
-                    // a BlocksNeeded event are processed before triggering new rescans.
-                    if !new_addresses.is_empty() {
+                    // Collect per-wallet new addresses for deferred rescan at commit time.
+                    for (wallet_id, addrs) in new_addresses {
+                        if addrs.is_empty() {
+                            continue;
+                        }
                         if let Some(batch) = self.active_batches.get_mut(&batch_start) {
-                            batch.add_addresses(new_addresses.iter().cloned());
+                            batch.add_addresses_for_wallet(*wallet_id, addrs.iter().cloned());
                         }
                     }
 
-                    // Try to commit/scan/create batches
                     return self.try_process_batch().await;
                 }
             }
