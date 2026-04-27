@@ -9,7 +9,7 @@ use key_wallet::{Account, Address, Network, Utxo, Wallet};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::broadcast;
 
-impl<T: WalletInfoInterface> WalletManager<T> {
+impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
     /// Get a wallet by ID
     pub fn get_wallet(&self, wallet_id: &WalletId) -> Option<&Wallet> {
         self.wallets.get(wallet_id)
