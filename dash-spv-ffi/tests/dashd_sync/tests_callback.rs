@@ -132,6 +132,10 @@ fn test_all_callbacks_during_sync() {
             "on_block_process_change should fire for blocks containing wallet records"
         );
         assert_eq!(
+            mempool_received, 0,
+            "on_mempool_transaction_received must not fire during historical block sync"
+        );
+        assert_eq!(
             instant_send_locked, 0,
             "on_transaction_instant_send_locked should not fire during initial sync"
         );
