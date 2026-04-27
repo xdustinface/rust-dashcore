@@ -268,4 +268,62 @@ mod tests {
         assert_eq!(processed.len(), 1);
         assert_eq!(processed[0].1, 100);
     }
+
+    /// A wallet that is NOT in the pipeline's interested set must not be
+    /// routed the block. Two wallets are registered, but only `wallet_in`
+    /// appears in the routed set; the other wallet's processed log must
+    /// stay empty for that block.
+    #[tokio::test]
+    async fn test_process_buffered_blocks_excludes_uninterested_wallet() {
+        use dashcore::block::Header;
+        use dashcore::{Block, TxMerkleNode};
+        use dashcore_hashes::Hash;
+        use key_wallet_manager::test_utils::{MockWalletState, MultiMockWallet};
+        use key_wallet_manager::WalletId;
+
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let multi = MultiMockWallet::new();
+        let wallet_in: WalletId = [0xAA; 32];
+        let wallet_out: WalletId = [0xBB; 32];
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(wallet_in, MockWalletState::default());
+            w.insert_wallet(wallet_out, MockWalletState::default());
+        }
+        let mut manager: BlocksManager<
+            PersistentBlockHeaderStorage,
+            PersistentBlockStorage,
+            MultiMockWallet,
+        > = BlocksManager::new(multi.clone(), storage.block_headers(), storage.blocks()).await;
+        manager.progress.set_state(SyncState::Syncing);
+
+        let header = Header {
+            version: dashcore::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: dashcore::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![],
+        };
+        // Only wallet_in is in the routed set.
+        manager.pipeline.add_from_storage(block.clone(), 100, BTreeSet::from([wallet_in]));
+
+        let _ = manager.process_buffered_blocks().await.unwrap();
+
+        let processed = multi.read().await.processed();
+        let processed = processed.lock().await;
+        // Exactly one entry, for wallet_in only.
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].0, wallet_in);
+        assert_eq!(processed[0].2, 100);
+        assert!(
+            !processed.iter().any(|(id, _, _)| *id == wallet_out),
+            "wallet_out was not in the routed set, must not be processed"
+        );
+    }
 }
