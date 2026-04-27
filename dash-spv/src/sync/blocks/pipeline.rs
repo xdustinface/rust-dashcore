@@ -76,18 +76,23 @@ impl BlocksPipeline {
     /// Queue blocks with their heights and per-block interested wallet sets.
     ///
     /// Each entry's wallet set is the union of wallets whose addresses matched
-    /// the filter for that block. If the block is already queued we merge the
-    /// new wallet ids into the existing set so a late-discovered wallet still
-    /// gets the block processed when it arrives.
+    /// the filter for that block. If the block is already tracked (pending or
+    /// in flight) we only merge the new wallet ids into the existing set so a
+    /// late-discovered wallet still gets the block processed when it arrives.
+    /// Re-enqueueing a tracked hash would corrupt the coordinator's pending
+    /// count and cause a duplicate request to the peer.
     pub(super) fn queue(
         &mut self,
         blocks: impl IntoIterator<Item = (FilterMatchKey, BTreeSet<WalletId>)>,
     ) {
         for (key, wallets) in blocks {
             let hash = *key.hash();
-            self.coordinator.enqueue([hash]);
-            self.pending_heights.insert(key.height());
-            self.hash_to_height.insert(hash, key.height());
+            let is_new = !self.hash_to_height.contains_key(&hash);
+            if is_new {
+                self.coordinator.enqueue([hash]);
+                self.pending_heights.insert(key.height());
+                self.hash_to_height.insert(hash, key.height());
+            }
             self.hash_to_wallets.entry(hash).or_default().extend(wallets);
         }
     }
@@ -462,7 +467,8 @@ mod tests {
     #[test]
     fn test_queue_merges_wallet_sets_for_repeat_hashes() {
         // Queueing the same block hash twice with different wallet sets must
-        // produce the union when the block is later taken from the pipeline.
+        // produce the union when the block is later taken from the pipeline,
+        // and must not double-count it in the coordinator's pending state.
         let mut pipeline = BlocksPipeline::new();
         let block = make_test_block(1);
         let hash = block.block_hash();
@@ -470,13 +476,50 @@ mod tests {
         let wallets_b: BTreeSet<WalletId> = BTreeSet::from([[2u8; 32], [3u8; 32]]);
 
         pipeline.queue([(FilterMatchKey::new(100, hash), wallets_a.clone())]);
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
         pipeline.queue([(FilterMatchKey::new(100, hash), wallets_b.clone())]);
+        // Re-queueing must not double the coordinator's pending count.
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
 
         // Land the block in `downloaded` to retrieve it.
         let hashes = pipeline.coordinator.take_pending(1);
+        assert_eq!(hashes.len(), 1);
         pipeline.coordinator.mark_sent(&hashes);
         assert!(pipeline.receive_block(&block));
 
+        let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
+        let mut expected = wallets_a;
+        expected.extend(wallets_b);
+        assert_eq!(taken_wallets, expected);
+    }
+
+    #[test]
+    fn test_queue_does_not_re_enqueue_in_flight_hash() {
+        // A late-arriving wallet match for a block already in flight must
+        // merge the wallet id without re-enqueueing the hash. Re-enqueueing
+        // would cause a duplicate request and corrupt the coordinator's
+        // pending/in-flight state.
+        let mut pipeline = BlocksPipeline::new();
+        let block = make_test_block(1);
+        let hash = block.block_hash();
+        let wallets_a: BTreeSet<WalletId> = BTreeSet::from([[1u8; 32]]);
+        let wallets_b: BTreeSet<WalletId> = BTreeSet::from([[2u8; 32]]);
+
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_a.clone())]);
+        // Move the hash to in-flight.
+        let hashes = pipeline.coordinator.take_pending(1);
+        pipeline.coordinator.mark_sent(&hashes);
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 1);
+
+        // A second queue call for the same hash must not push it back to
+        // pending while it is in flight.
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_b.clone())]);
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 1);
+
+        // Late wallet ids are still merged for when the block arrives.
+        assert!(pipeline.receive_block(&block));
         let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
         let mut expected = wallets_a;
         expected.extend(wallets_b);
