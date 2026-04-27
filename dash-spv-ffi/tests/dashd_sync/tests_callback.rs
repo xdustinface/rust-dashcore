@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dash_spv::test_utils::{DashdTestContext, TestChain};
+use dash_spv_ffi::FFIRecordAction;
 use dashcore::hashes::Hash;
 use dashcore::Amount;
 
@@ -140,7 +141,11 @@ fn test_all_callbacks_during_sync() {
             "on_transaction_instant_send_locked should not fire during initial sync"
         );
 
-        // Validate SyncedHeightUpdated callback (atomicity boundary for persistence flush)
+        // Validate SyncedHeightUpdated callback (atomicity boundary for persistence flush).
+        // Wait explicitly for the callback because it travels on the same wallet
+        // broadcast channel as `BlockProcessChange` but is dispatched separately,
+        // so observing block-process records does not guarantee it has fired yet.
+        tracker.wait_for_callback(&tracker.synced_height_updated_count, 0, "synced_height_updated");
         let synced_height_fired = tracker.synced_height_updated_count.load(Ordering::SeqCst);
         let last_synced_height = tracker.last_synced_height.load(Ordering::SeqCst);
         assert!(
@@ -237,14 +242,39 @@ fn test_all_callbacks_during_sync() {
             "best height from peers should match initial height"
         );
 
-        // Validate transaction data from initial sync
-        let received_txs = tracker.received_transactions.lock().unwrap();
-        assert!(!received_txs.is_empty(), "should have received transactions during sync");
+        // Validate transaction data from initial sync. Historical sync only
+        // touches the block-process-change callback (mempool callback must
+        // remain silent during initial sync), so assert against that bucket
+        // explicitly.
+        let block_received = tracker.block_received_transactions.lock().unwrap();
+        assert!(!block_received.is_empty(), "should have received block records during sync");
         assert!(
-            received_txs.iter().any(|&(_, amount)| amount != 0),
-            "at least one received transaction amount should be non-zero"
+            block_received.iter().any(|&(_, amount)| amount != 0),
+            "at least one block-record net_amount should be non-zero"
         );
-        drop(received_txs);
+        drop(block_received);
+
+        // Validate FFIRecordAction is delivered: every record observed during
+        // initial sync is a fresh insertion (no prior mempool sighting).
+        let actions = tracker.block_record_actions.lock().unwrap();
+        assert!(!actions.is_empty(), "FFIRecordAction should be captured for block records");
+        assert!(
+            actions.iter().all(|a| *a == FFIRecordAction::Inserted),
+            "every block record during historical sync should carry FFIRecordAction::Inserted, got: {:?}",
+            *actions
+        );
+        drop(actions);
+
+        // Validate every block-record callback delivered a well-formed BIP-32
+        // account path string (e.g. `m/44'/1'/0'`).
+        let paths = tracker.block_account_paths.lock().unwrap();
+        assert!(!paths.is_empty(), "block account paths should be captured");
+        assert!(
+            paths.iter().all(|p| p.starts_with("m/")),
+            "every account_path should be a BIP-32 path string starting with `m/`, got: {:?}",
+            *paths
+        );
+        drop(paths);
 
         // Masternodes are disabled in test config, so these should not fire
         let masternode_updated = tracker.masternode_state_updated_count.load(Ordering::SeqCst);
@@ -333,17 +363,21 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             mempool_received_after
         );
 
-        // Verify the sent txid appears in the callback data with a non-zero
-        // net_amount.  The SPV wallet and dashd share the same mnemonic so the
-        // transaction is an internal transfer (wallet owns both inputs and
-        // outputs); net_amount therefore equals approximately -fee, not the
-        // nominal send amount.
+        // Verify the sent txid appears in the mempool callback data with a
+        // non-zero net_amount. Asserting against the mempool bucket (rather
+        // than the union of mempool+block records) ensures the mempool
+        // callback specifically delivered the txid — a broken mempool callback
+        // that pushed the wrong txid wouldn't be masked by the block path.
+        // The SPV wallet and dashd share the same mnemonic so the transaction
+        // is an internal transfer (wallet owns both inputs and outputs);
+        // net_amount therefore equals approximately -fee, not the nominal
+        // send amount.
         let sent_txid_bytes = *txid.as_byte_array();
-        let received_txs = tracker.received_transactions.lock().unwrap();
-        let sent_entry = received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
+        let mempool_received_txs = tracker.mempool_received_transactions.lock().unwrap();
+        let sent_entry = mempool_received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
         assert!(
             sent_entry.is_some(),
-            "sent txid should appear in received transaction callback data"
+            "sent txid should appear in mempool callback data"
         );
         let &(_, net_amount) = sent_entry.unwrap();
         // Internal transfer: net_amount = received - sent = (send_amount + change) - input = -fee.
@@ -353,7 +387,29 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             "internal transfer net_amount should equal -fee (small negative), got: {}",
             net_amount
         );
-        drop(received_txs);
+        drop(mempool_received_txs);
+
+        // Verify the mempool callback delivered a well-formed BIP-32 account
+        // path (e.g. `m/44'/1'/0'`).
+        let mempool_paths = tracker.mempool_account_paths.lock().unwrap();
+        assert!(
+            mempool_paths.iter().any(|p| p.starts_with("m/")),
+            "mempool callback should deliver a BIP-32 account path, got: {:?}",
+            *mempool_paths
+        );
+        drop(mempool_paths);
+
+        // The post-sync block confirms a transaction that was already known
+        // from the mempool, so the corresponding `BlockProcessChange` update
+        // must carry `FFIRecordAction::Updated` rather than `Inserted`.
+        let block_actions = tracker.block_record_actions.lock().unwrap();
+        assert!(
+            block_actions.contains(&FFIRecordAction::Updated),
+            "post-sync block confirming a known mempool tx should deliver \
+             FFIRecordAction::Updated, got: {:?}",
+            *block_actions
+        );
+        drop(block_actions);
 
         let block_records_after = tracker.block_process_change_record_count.load(Ordering::SeqCst);
         tracing::info!(

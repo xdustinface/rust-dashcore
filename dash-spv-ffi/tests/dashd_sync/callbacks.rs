@@ -54,8 +54,22 @@ pub(super) struct CallbackTracker {
     pub(super) connected_peers: Mutex<Vec<String>>,
     pub(super) errors: Mutex<Vec<String>>,
 
-    // Per-record (txid, net_amount) seen via any wallet event.
-    pub(super) received_transactions: Mutex<Vec<([u8; 32], i64)>>,
+    // Per-record (txid, net_amount) seen via the mempool wallet callback.
+    pub(super) mempool_received_transactions: Mutex<Vec<([u8; 32], i64)>>,
+    // Per-record (txid, net_amount) seen via the block-process-change callback.
+    pub(super) block_received_transactions: Mutex<Vec<([u8; 32], i64)>>,
+
+    // Account derivation paths captured from wallet callbacks (BIP-32 strings
+    // like `"m/44'/1'/0'"`). Lets tests assert that path delivery is
+    // well-formed and matches the expected account.
+    pub(super) mempool_account_paths: Mutex<Vec<String>>,
+    pub(super) block_account_paths: Mutex<Vec<String>>,
+
+    // `FFIRecordAction` values observed on `BlockProcessChange` updates, in
+    // delivery order. Lets tests assert the action discriminant is correct
+    // (`Inserted` for first-seen records, `Updated` for confirmation of
+    // previously-known mempool transactions).
+    pub(super) block_record_actions: Mutex<Vec<FFIRecordAction>>,
 
     // Balance data from the most recent wallet event.
     pub(super) last_confirmed: AtomicU64,
@@ -368,15 +382,20 @@ extern "C" fn on_mempool_transaction_received(
     if !record.is_null() {
         let r = unsafe { &*record };
         tracker
-            .received_transactions
+            .mempool_received_transactions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((r.txid, r.net_amount));
     }
+    let path_str = unsafe { cstr_or_unknown(account_path) };
+    tracker
+        .mempool_account_paths
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path_str.clone());
     tracker.mempool_transaction_received_count.fetch_add(1, Ordering::SeqCst);
     record_balance(tracker, balance);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
-    let path_str = unsafe { cstr_or_unknown(account_path) };
     tracing::info!("on_mempool_transaction_received: wallet={}, account={}", wallet_str, path_str);
 }
 
@@ -407,15 +426,25 @@ extern "C" fn on_block_process_change(
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
     };
+    // `block_process_change_count` is incremented inside the same lock as
+    // `block_process_change_record_count` so a test that observes either
+    // counter via `wait_for_callback` is guaranteed to see the matching one.
+    let mut sink = tracker.block_received_transactions.lock().unwrap_or_else(|e| e.into_inner());
+    let mut paths = tracker.block_account_paths.lock().unwrap_or_else(|e| e.into_inner());
+    let mut actions = tracker.block_record_actions.lock().unwrap_or_else(|e| e.into_inner());
     if !updates.is_null() && update_count > 0 {
         let updates_slice = unsafe { slice::from_raw_parts(updates, update_count as usize) };
-        let mut sink = tracker.received_transactions.lock().unwrap_or_else(|e| e.into_inner());
         for u in updates_slice {
             sink.push((u.record.txid, u.record.net_amount));
+            paths.push(unsafe { cstr_or_unknown(u.account_path) });
+            actions.push(u.action);
             tracker.block_process_change_record_count.fetch_add(1, Ordering::SeqCst);
         }
     }
     tracker.block_process_change_count.fetch_add(1, Ordering::SeqCst);
+    drop(sink);
+    drop(paths);
+    drop(actions);
     record_balance(tracker, balance);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
     tracing::info!(

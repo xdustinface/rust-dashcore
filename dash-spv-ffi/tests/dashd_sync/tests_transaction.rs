@@ -74,12 +74,12 @@ fn test_ffi_sync_then_generate_blocks() {
             "block_process_change_record",
         );
 
-        // Verify the transaction was received via wallet callback
-        let received_txs = ctx.tracker().received_transactions.lock().unwrap();
+        // Verify the transaction was received via the block-process-change callback
+        let received_txs = ctx.tracker().block_received_transactions.lock().unwrap();
         let txid_bytes = *txid.as_byte_array();
         assert!(
             received_txs.iter().any(|&(txid, _)| txid == txid_bytes),
-            "Wallet callback should have received txid {}",
+            "Block-process-change callback should have received txid {}",
             txid
         );
         drop(received_txs);
