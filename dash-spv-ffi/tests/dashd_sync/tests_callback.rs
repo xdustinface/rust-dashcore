@@ -375,10 +375,7 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         let sent_txid_bytes = *txid.as_byte_array();
         let mempool_received_txs = tracker.mempool_received_transactions.lock().unwrap();
         let sent_entry = mempool_received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
-        assert!(
-            sent_entry.is_some(),
-            "sent txid should appear in mempool callback data"
-        );
+        assert!(sent_entry.is_some(), "sent txid should appear in mempool callback data");
         let &(_, net_amount) = sent_entry.unwrap();
         // Internal transfer: net_amount = received - sent = (send_amount + change) - input = -fee.
         // The fee must be negative, non-zero, and small (< 0.001 DASH).

@@ -388,11 +388,7 @@ extern "C" fn on_mempool_transaction_received(
             .push((r.txid, r.net_amount));
     }
     let path_str = unsafe { cstr_or_unknown(account_path) };
-    tracker
-        .mempool_account_paths
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(path_str.clone());
+    tracker.mempool_account_paths.lock().unwrap_or_else(|e| e.into_inner()).push(path_str.clone());
     tracker.mempool_transaction_received_count.fetch_add(1, Ordering::SeqCst);
     record_balance(tracker, balance);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
