@@ -184,6 +184,56 @@ async fn test_instant_send_lock_for_unknown_txid_is_silent() {
     assert_no_events(&mut rx);
 }
 
+#[tokio::test]
+async fn test_late_instant_send_lock_after_block_confirmation_emits_event() {
+    // A late IS-lock for a transaction that was already confirmed in a block
+    // currently downgrades the record context from `InBlock(_)` back to
+    // `InstantSend(_)` and re-emits `TransactionInstantSendLocked`. This test
+    // pins down that observable behavior so any future change (silently
+    // ignoring the late lock, rejecting it at the record layer) shows up as a
+    // test failure rather than a silent semantic drift.
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xe3);
+
+    // Confirm the transaction in a block first.
+    let block = make_block(vec![tx.clone()], 0xe3, 4000);
+    manager.process_block(&block, 300).await;
+
+    let mut rx = manager.subscribe_events();
+    let lock = InstantLock {
+        txid: tx.txid(),
+        cyclehash: CycleHash::from_byte_array([0xab; 32]),
+        signature: BLSSignature::from([0xcd; 96]),
+        ..InstantLock::default()
+    };
+    manager.process_instant_send_lock(lock.clone());
+
+    let events = drain_events(&mut rx);
+    let is_locked = events
+        .iter()
+        .find(|e| matches!(e, WalletEvent::TransactionInstantSendLocked { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "late IS-lock for an already-confirmed tx currently emits \
+                 TransactionInstantSendLocked, got: {:?}",
+                events
+            )
+        });
+    match is_locked {
+        WalletEvent::TransactionInstantSendLocked {
+            wallet_id: wid,
+            txid,
+            instant_send_lock,
+            ..
+        } => {
+            assert_eq!(*wid, wallet_id);
+            assert_eq!(*txid, tx.txid());
+            assert_eq!(*instant_send_lock, lock);
+        }
+        _ => unreachable!(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Block path
 // ---------------------------------------------------------------------------
