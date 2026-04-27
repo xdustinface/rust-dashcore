@@ -42,7 +42,7 @@ impl<
     fn clear_in_flight_state(&mut self) {
         self.active_batches.clear();
         self.blocks_remaining.clear();
-        self.filters_matched.clear();
+        self.matched_block_hashes.clear();
         self.pending_batches.clear();
         self.filter_pipeline = FiltersPipeline::new();
     }
@@ -194,22 +194,25 @@ impl<
 
     async fn tick(&mut self, requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
         // Detect a wallet that was added behind our scan progress and rescan
-        // from its `synced_height`.
+        // from its `synced_height`. Reset committed_height to the lowest
+        // synced_height across the stale wallets only, so already-synced
+        // wallets are not re-scanned from scratch.
         if matches!(self.state(), SyncState::Syncing | SyncState::Synced | SyncState::WaitForEvents)
         {
             let committed = self.progress.committed_height();
             let wallet_read = self.wallet.read().await;
             let behind = wallet_read.wallets_behind(committed);
-            let wallet_min_synced = wallet_read.synced_height();
+            let stale_min_synced =
+                behind.iter().map(|id| wallet_read.wallet_synced_height(id)).min();
             drop(wallet_read);
-            if !behind.is_empty() {
+            if let Some(stale_min_synced) = stale_min_synced {
                 tracing::info!(
                     "Wallet synced_height {} fell below filter committed_height {}, restarting scan",
-                    wallet_min_synced,
+                    stale_min_synced,
                     committed
                 );
                 self.clear_in_flight_state();
-                self.progress.update_committed_height(wallet_min_synced);
+                self.progress.update_committed_height(stale_min_synced);
                 return self.start_download(requests).await;
             }
         }

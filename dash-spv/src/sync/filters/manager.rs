@@ -69,8 +69,29 @@ pub struct FiltersManager<
     /// Blocks remaining that need to be processed.
     /// Maps block_hash -> (height, batch_start) for batch association.
     pub(super) blocks_remaining: BTreeMap<BlockHash, (u32, u32)>,
-    /// Block hashes that have been matched and queued for download.
-    pub(super) filters_matched: HashSet<BlockHash>,
+    /// Hashes of blocks whose filters matched at least once during this run.
+    /// Used as a record (not a gate) so we can detect the difference between
+    /// "still in flight" (also in `blocks_remaining`) and "already processed in
+    /// a prior round" (only in this set).
+    pub(super) matched_block_hashes: HashSet<BlockHash>,
+}
+
+/// Result of recording a filter match for a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTrackResult {
+    /// Block was newly tracked. Caller should emit a `BlocksNeeded` event and
+    /// account for the block in the batch's `pending_blocks` count.
+    NewlyTracked,
+    /// Block is already in flight from a previous match. Caller should still
+    /// emit a `BlocksNeeded` event so the late-arriving wallet ID gets merged
+    /// into the `BlocksPipeline`'s pending wallet set, but must NOT increment
+    /// the batch's `pending_blocks` count (already counted on first match).
+    InFlight,
+    /// Block was already processed in a prior round. Caller should skip the
+    /// block to avoid re-running `process_block_for_wallets` on it. Late-added
+    /// wallets miss this block but `BlocksManager`'s wallet processing isn't
+    /// idempotent, so rescheduling is unsafe.
+    AlreadyProcessed,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -115,7 +136,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             active_batches: BTreeMap::new(),
             processing_height: 0,
             blocks_remaining: BTreeMap::new(),
-            filters_matched: HashSet::new(),
+            matched_block_hashes: HashSet::new(),
         }
     }
 
@@ -123,27 +144,23 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
     fn is_idle(&self) -> bool {
         self.active_batches.is_empty()
             && self.blocks_remaining.is_empty()
-            && self.filters_matched.is_empty()
+            && self.matched_block_hashes.is_empty()
             && self.pending_batches.is_empty()
             && self.filter_pipeline.is_idle()
     }
 
-    /// Track a filter match for a block.
-    ///
-    /// Returns `true` if the block was newly tracked and the caller should
-    /// emit a `BlocksNeeded` event. Returns `false` if the block is already
-    /// in flight from an earlier match (caller should not re-emit). When the
-    /// block was already processed in a prior round, `blocks_remaining` no
-    /// longer contains it and a fresh entry is inserted, which causes
-    /// `BlocksManager` to reload the block from local storage and process it
-    /// again for whichever wallets the caller passes via `BlocksNeeded`.
-    fn track_block_match(&mut self, key: &FilterMatchKey, batch_start: u32) -> bool {
+    /// Track a filter match for a block. See `BlockTrackResult` for the
+    /// per-case caller responsibilities.
+    fn track_block_match(&mut self, key: &FilterMatchKey, batch_start: u32) -> BlockTrackResult {
         if self.blocks_remaining.contains_key(key.hash()) {
-            return false;
+            return BlockTrackResult::InFlight;
+        }
+        if self.matched_block_hashes.contains(key.hash()) {
+            return BlockTrackResult::AlreadyProcessed;
         }
         self.blocks_remaining.insert(*key.hash(), (key.height(), batch_start));
-        self.filters_matched.insert(*key.hash());
-        true
+        self.matched_block_hashes.insert(*key.hash());
+        BlockTrackResult::NewlyTracked
     }
 
     async fn load_filters(
@@ -480,8 +497,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
 
                 if !addresses_by_wallet.is_empty() {
                     // Rescan current batch
-                    events
-                        .extend(self.rescan_batch(batch_start, addresses_by_wallet.clone()).await?);
+                    events.extend(self.rescan_batch(batch_start, &addresses_by_wallet).await?);
 
                     // Also rescan later batches that are already scanned
                     let later_batches: Vec<u32> = self
@@ -492,9 +508,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                         .collect();
 
                     for later_start in later_batches {
-                        events.extend(
-                            self.rescan_batch(later_start, addresses_by_wallet.clone()).await?,
-                        );
+                        events.extend(self.rescan_batch(later_start, &addresses_by_wallet).await?);
                     }
 
                     // Check if rescan found more blocks
@@ -616,13 +630,13 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
     pub(super) async fn rescan_batch(
         &mut self,
         batch_start: u32,
-        new_addresses: HashMap<WalletId, HashSet<Address>>,
+        new_addresses: &HashMap<WalletId, HashSet<Address>>,
     ) -> SyncResult<Vec<SyncEvent>> {
         if new_addresses.is_empty() {
             return Ok(vec![]);
         }
 
-        let Some(batch) = self.active_batches.get_mut(&batch_start) else {
+        let Some(batch) = self.active_batches.get(&batch_start) else {
             return Ok(vec![]);
         };
 
@@ -636,17 +650,17 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         if batch.filters().is_empty() {
             return Ok(vec![]);
         }
-        let batch_filters = self.active_batches.get(&batch_start).unwrap().filters();
+        let batch_filters = batch.filters();
 
         let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
         for (wallet_id, addresses) in new_addresses {
             if addresses.is_empty() {
                 continue;
             }
-            let addresses_vec: Vec<_> = addresses.into_iter().collect();
+            let addresses_vec: Vec<_> = addresses.iter().cloned().collect();
             let matches = check_compact_filters_for_addresses(batch_filters, addresses_vec);
             for key in matches {
-                block_to_wallets.entry(key).or_default().insert(wallet_id);
+                block_to_wallets.entry(key).or_default().insert(*wallet_id);
             }
         }
 
@@ -658,18 +672,28 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             self.progress.add_matched(block_to_wallets.len() as u32);
         }
         for (key, wallets) in block_to_wallets {
-            if self.track_block_match(&key, batch_start) {
-                blocks_needed.insert(key, wallets);
-                new_blocks_count += 1;
+            match self.track_block_match(&key, batch_start) {
+                BlockTrackResult::NewlyTracked => {
+                    blocks_needed.insert(key, wallets);
+                    new_blocks_count += 1;
+                }
+                BlockTrackResult::InFlight => {
+                    // Block already on its way; merge new wallet ids into the
+                    // pipeline's pending wallet set via a fresh BlocksNeeded.
+                    blocks_needed.insert(key, wallets);
+                }
+                BlockTrackResult::AlreadyProcessed => {}
             }
         }
 
-        // Update batch pending_blocks count
+        // Update batch pending_blocks count for the genuinely new entries only.
         if new_blocks_count > 0 {
             if let Some(batch) = self.active_batches.get_mut(&batch_start) {
                 batch.set_pending_blocks(batch.pending_blocks() + new_blocks_count);
             }
             tracing::info!("Rescan found {} additional blocks", new_blocks_count);
+        }
+        if !blocks_needed.is_empty() {
             events.push(SyncEvent::BlocksNeeded {
                 blocks: blocks_needed,
             });
@@ -697,20 +721,20 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         );
 
         batch.mark_scanned();
+        let batch_end = batch.end_height();
 
         // Get all filters in the batch
         if batch.filters().is_empty() {
             tracing::debug!("scan_batch: batch filters are empty, returning early");
             return Ok(events);
         }
-        let batch_end = batch.end_height();
 
         // Snapshot per-wallet state for the wallets behind this batch's range.
         // A wallet whose `synced_height >= batch_end` is fully covered and is
         // skipped entirely, its addresses never even get tested against these
         // filters.
         let wallet = self.wallet.read().await;
-        let behind = wallet.wallets_behind(batch_end.saturating_add(1));
+        let behind = wallet.wallets_not_yet_at(batch_end);
         let mut wallet_states: Vec<(WalletId, u32, Vec<Address>)> = Vec::new();
         for wallet_id in &behind {
             let synced = wallet.wallet_synced_height(wallet_id);
@@ -721,34 +745,75 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         }
         drop(wallet);
 
-        // Record which wallets we're scanning for so the commit phase advances
-        // only their per-wallet `synced_height`.
-        if let Some(batch) = self.active_batches.get_mut(&batch_start) {
-            batch.set_scanned_wallets(behind);
-        }
+        // Only wallets that actually contributed addresses to the scan have
+        // had their coverage advanced by this batch. Wallets without any
+        // monitored addresses must not have their `synced_height` bumped at
+        // commit time even though `wallets_not_yet_at` listed them.
+        let scanned_wallets: BTreeSet<WalletId> =
+            wallet_states.iter().map(|(id, _, _)| *id).collect();
 
         if wallet_states.is_empty() {
+            // Nothing to record on the batch, no scanned wallets to advance.
             tracing::debug!("scan_batch: no behind wallets with monitored addresses");
             return Ok(events);
         }
 
-        // Match per-wallet, projecting each wallet's filter set to those at
-        // heights it hasn't yet covered. Aggregate per-block wallet sets.
-        let batch_filters = self.active_batches.get(&batch_start).unwrap().filters();
-        let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
-        for (wallet_id, wallet_synced, addresses) in &wallet_states {
+        // Single-pass union-then-attribute: build the union of all addresses
+        // across behind wallets, run the filters once, then for each matched
+        // block re-test per-wallet scripts to attribute the match correctly.
+        // This avoids cloning the filter map per wallet and re-scanning
+        // overlapping address sets multiple times. Cost reduces from
+        // O(N_wallets * batch_size) to O(batch_size + N_wallets * matches).
+        let union_addresses: Vec<Address> =
+            wallet_states.iter().flat_map(|(_, _, addrs)| addrs.iter().cloned()).collect();
+
+        let block_to_wallets = {
+            let Some(batch) = self.active_batches.get(&batch_start) else {
+                return Ok(events);
+            };
+            let batch_filters = batch.filters();
+
+            // Project the filter set to heights any behind wallet still needs.
+            let min_synced = wallet_states.iter().map(|(_, synced, _)| *synced).min().unwrap_or(0);
             let relevant: HashMap<FilterMatchKey, BlockFilter> = batch_filters
                 .iter()
-                .filter(|(key, _)| key.height() > *wallet_synced)
+                .filter(|(key, _)| key.height() > min_synced)
                 .map(|(key, filter)| (key.clone(), filter.clone()))
                 .collect();
+
             if relevant.is_empty() {
-                continue;
+                BTreeMap::new()
+            } else {
+                let matches = check_compact_filters_for_addresses(&relevant, union_addresses);
+                let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> =
+                    BTreeMap::new();
+                for key in matches {
+                    // Attribute the union match to the wallets whose own
+                    // scripts hit this block's filter. Probabilistic false
+                    // positives in the union pass are filtered out here too.
+                    let filter = relevant.get(&key).expect("matched key was in relevant set");
+                    for (wallet_id, wallet_synced, addresses) in &wallet_states {
+                        if key.height() <= *wallet_synced {
+                            continue;
+                        }
+                        let scripts: Vec<Vec<u8>> =
+                            addresses.iter().map(|a| a.script_pubkey().to_bytes()).collect();
+                        if filter
+                            .match_any(key.hash(), scripts.iter().map(|v| v.as_slice()))
+                            .unwrap_or(false)
+                        {
+                            block_to_wallets.entry(key.clone()).or_default().insert(*wallet_id);
+                        }
+                    }
+                }
+                block_to_wallets
             }
-            let matches = check_compact_filters_for_addresses(&relevant, addresses.clone());
-            for key in matches {
-                block_to_wallets.entry(key).or_default().insert(*wallet_id);
-            }
+        };
+
+        // Record which wallets we're scanning for so the commit phase advances
+        // only their per-wallet `synced_height`.
+        if let Some(batch) = self.active_batches.get_mut(&batch_start) {
+            batch.set_scanned_wallets(scanned_wallets);
         }
 
         tracing::info!(
@@ -765,25 +830,29 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
 
         self.progress.add_matched(block_to_wallets.len() as u32);
 
-        // Either (re)queue the block via `BlocksNeeded` or skip it if it's
-        // already in flight. A block that was already processed in a prior
-        // round and matches again for a late-added wallet is re-queued:
-        // `BlocksManager` reloads it from local storage and processes it for
-        // just the wallets in this `BlocksNeeded` payload (the per-wallet
-        // processing path is idempotent for already-processed wallets through
-        // the monotonic `last_processed_height`).
+        // Either (re)queue the block via `BlocksNeeded` or skip if already
+        // processed in a prior round. In-flight blocks still re-emit so the
+        // BlocksPipeline merges any late-arriving wallet ids.
         let mut blocks_needed: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
         let mut new_blocks_count = 0;
         for (key, wallets) in block_to_wallets {
-            if self.track_block_match(&key, batch_start) {
-                blocks_needed.insert(key, wallets);
-                new_blocks_count += 1;
+            match self.track_block_match(&key, batch_start) {
+                BlockTrackResult::NewlyTracked => {
+                    blocks_needed.insert(key, wallets);
+                    new_blocks_count += 1;
+                }
+                BlockTrackResult::InFlight => {
+                    blocks_needed.insert(key, wallets);
+                }
+                BlockTrackResult::AlreadyProcessed => {}
             }
         }
 
-        // Update batch pending_blocks count
-        if let Some(batch) = self.active_batches.get_mut(&batch_start) {
-            batch.set_pending_blocks(batch.pending_blocks() + new_blocks_count);
+        // Update batch pending_blocks count for the genuinely new entries only.
+        if new_blocks_count > 0 {
+            if let Some(batch) = self.active_batches.get_mut(&batch_start) {
+                batch.set_pending_blocks(batch.pending_blocks() + new_blocks_count);
+            }
         }
 
         if !blocks_needed.is_empty() {
@@ -851,9 +920,13 @@ mod tests {
         PersistentFilterHeaderStorage, PersistentFilterStorage, StorageManager,
     };
     use crate::sync::{ManagerIdentifier, SyncManagerProgress};
+    use dashcore::bip158::BlockFilter;
     use dashcore::Header;
+    use dashcore::{Block, Network, Transaction};
     use dashcore_hashes::Hash;
-    use key_wallet_manager::test_utils::{MockWallet, MOCK_WALLET_ID};
+    use key_wallet_manager::test_utils::{
+        MockWallet, MockWalletState, MultiMockWallet, MOCK_WALLET_ID,
+    };
     use tokio::sync::mpsc::unbounded_channel;
 
     type TestFiltersManager = FiltersManager<
@@ -861,6 +934,12 @@ mod tests {
         PersistentFilterHeaderStorage,
         PersistentFilterStorage,
         MockWallet,
+    >;
+    type MultiTestFiltersManager = FiltersManager<
+        PersistentBlockHeaderStorage,
+        PersistentFilterHeaderStorage,
+        PersistentFilterStorage,
+        MultiMockWallet,
     >;
     type TestSyncManager = dyn SyncManager;
 
@@ -874,6 +953,30 @@ mod tests {
             storage.filters(),
         )
         .await
+    }
+
+    async fn create_multi_test_manager(
+        wallet: Arc<RwLock<MultiMockWallet>>,
+    ) -> MultiTestFiltersManager {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        FiltersManager::new(
+            wallet,
+            storage.block_headers(),
+            storage.filter_headers(),
+            storage.filters(),
+        )
+        .await
+    }
+
+    /// Build a real `BlockFilter` for a single-output block paying `address`.
+    fn filter_for_address(
+        height: u32,
+        address: &dashcore::Address,
+    ) -> (FilterMatchKey, BlockFilter) {
+        let tx = Transaction::dummy(address, 0..0, &[height as u64]);
+        let block = Block::dummy(height, vec![tx]);
+        let filter = BlockFilter::dummy(&block);
+        (FilterMatchKey::new(height, block.block_hash()), filter)
     }
 
     #[tokio::test]
@@ -1043,6 +1146,173 @@ mod tests {
         assert_eq!(manager.wallet.read().await.wallet_synced_height(&MOCK_WALLET_ID), 4999);
     }
 
+    /// Two wallets in the same batch: only the wallet recorded in
+    /// `scanned_wallets` advances, the other stays put even after commit.
+    #[tokio::test]
+    async fn test_batch_commit_advances_only_recorded_wallet_with_two_wallets() {
+        let wallet_a: WalletId = [0xAA; 32];
+        let wallet_b: WalletId = [0xBB; 32];
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(wallet_a, MockWalletState::default());
+            w.insert_wallet(wallet_b, MockWalletState::default());
+        }
+        let mut manager = create_multi_test_manager(multi.clone()).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Batch records only wallet_a as scanned. wallet_b is excluded.
+        let mut batch = FiltersBatch::new(0, 4999, HashMap::new());
+        batch.set_pending_blocks(0);
+        batch.mark_scanned();
+        batch.mark_rescan_complete();
+        batch.set_scanned_wallets(BTreeSet::from([wallet_a]));
+        manager.active_batches.insert(0, batch);
+
+        manager.try_commit_batches().await.unwrap();
+        assert_eq!(manager.progress.committed_height(), 4999);
+        assert_eq!(multi.read().await.wallet_synced_height(&wallet_a), 4999);
+        assert_eq!(multi.read().await.wallet_synced_height(&wallet_b), 0);
+    }
+
+    /// `scan_batch` with two wallets at different `synced_height` values:
+    /// only the wallet whose synced_height is below the matching block's
+    /// height should be attributed.
+    #[tokio::test]
+    async fn test_scan_batch_attributes_per_wallet_height() {
+        let wallet_low: WalletId = [0x01; 32];
+        let wallet_high: WalletId = [0x02; 32];
+        let address_low = dashcore::Address::dummy(Network::Regtest, 1);
+        let address_high = dashcore::Address::dummy(Network::Regtest, 2);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            // wallet_low is behind: synced_height=10, will see filters above 10.
+            w.insert_wallet(
+                wallet_low,
+                MockWalletState {
+                    addresses: vec![address_low.clone()],
+                    synced_height: 10,
+                    last_processed_height: 10,
+                },
+            );
+            // wallet_high is mostly synced: synced_height=50, only sees > 50.
+            w.insert_wallet(
+                wallet_high,
+                MockWalletState {
+                    addresses: vec![address_high.clone()],
+                    synced_height: 50,
+                    last_processed_height: 50,
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Build a batch with three filters: at 30 paying wallet_low's address,
+        // at 60 paying wallet_high's address, at 70 paying wallet_low's address.
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        let (key_30, f_30) = filter_for_address(30, &address_low);
+        let (key_60, f_60) = filter_for_address(60, &address_high);
+        let (key_70, f_70) = filter_for_address(70, &address_low);
+        filters.insert(key_30.clone(), f_30);
+        filters.insert(key_60.clone(), f_60);
+        filters.insert(key_70.clone(), f_70);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+        manager.progress.update_stored_height(99);
+
+        let events = manager.scan_batch(0).await.unwrap();
+
+        // Find the BlocksNeeded event.
+        let blocks = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("BlocksNeeded event");
+
+        // Block at 30 only attributable to wallet_low (height <= wallet_high.synced)
+        let attr_30 = blocks.get(&key_30).expect("entry for height 30");
+        assert!(attr_30.contains(&wallet_low));
+        assert!(!attr_30.contains(&wallet_high));
+
+        // Block at 60 only attributable to wallet_high (matches its address);
+        // wallet_low's address does not match so it shouldn't be there either.
+        let attr_60 = blocks.get(&key_60).expect("entry for height 60");
+        assert!(attr_60.contains(&wallet_high));
+        assert!(!attr_60.contains(&wallet_low));
+
+        // Block at 70 only attributable to wallet_low: matches wallet_low's
+        // address, and wallet_high's address does not match this filter.
+        let attr_70 = blocks.get(&key_70).expect("entry for height 70");
+        assert!(attr_70.contains(&wallet_low));
+        assert!(!attr_70.contains(&wallet_high));
+    }
+
+    /// `rescan_batch` with multiple wallets in `addresses_by_wallet`:
+    /// each wallet's new addresses are matched independently and the
+    /// attribution is correct in the emitted `BlocksNeeded`.
+    #[tokio::test]
+    async fn test_rescan_batch_attributes_per_wallet_addresses() {
+        let wallet_a: WalletId = [0x0A; 32];
+        let wallet_b: WalletId = [0x0B; 32];
+        let address_a = dashcore::Address::dummy(Network::Regtest, 11);
+        let address_b = dashcore::Address::dummy(Network::Regtest, 22);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(wallet_a, MockWalletState::default());
+            w.insert_wallet(wallet_b, MockWalletState::default());
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        let (key_a, f_a) = filter_for_address(15, &address_a);
+        let (key_b, f_b) = filter_for_address(25, &address_b);
+        filters.insert(key_a.clone(), f_a);
+        filters.insert(key_b.clone(), f_b);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+
+        let mut new_addresses: HashMap<WalletId, HashSet<Address>> = HashMap::new();
+        new_addresses.insert(wallet_a, HashSet::from([address_a]));
+        new_addresses.insert(wallet_b, HashSet::from([address_b]));
+
+        let events = manager.rescan_batch(0, &new_addresses).await.unwrap();
+
+        let blocks = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("BlocksNeeded event");
+
+        let attr_a = blocks.get(&key_a).expect("entry for wallet_a's match");
+        assert!(attr_a.contains(&wallet_a));
+        assert!(!attr_a.contains(&wallet_b));
+
+        let attr_b = blocks.get(&key_b).expect("entry for wallet_b's match");
+        assert!(attr_b.contains(&wallet_b));
+        assert!(!attr_b.contains(&wallet_a));
+    }
+
     #[tokio::test]
     async fn test_batch_commit_order_preserved() {
         let mut manager = create_test_manager().await;
@@ -1086,33 +1356,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_track_block_match_dedupes_in_flight_and_requeues_processed() {
+    async fn test_track_block_match_distinguishes_in_flight_and_processed() {
         let mut manager = create_test_manager().await;
         let hash = dashcore::block::Header::dummy(0).block_hash();
         let key = FilterMatchKey::new(100, hash);
 
-        // First match: nothing tracked yet, should request a download.
-        assert!(manager.track_block_match(&key, 0));
+        // First match: nothing tracked yet, helper records both maps.
+        assert_eq!(manager.track_block_match(&key, 0), BlockTrackResult::NewlyTracked);
         assert_eq!(manager.blocks_remaining.get(&hash), Some(&(100, 0)));
-        assert!(manager.filters_matched.contains(&hash));
+        assert!(manager.matched_block_hashes.contains(&hash));
 
-        // Second match while the block is still in flight: do not re-emit
-        // a `BlocksNeeded`. The block is already on its way and the in-flight
-        // entry is left as-is.
-        assert!(!manager.track_block_match(&key, 0));
+        // Second match while the block is still in flight: caller still
+        // emits a fresh `BlocksNeeded` so the BlocksPipeline merges any
+        // late-arriving wallet ids. The in-flight entry is left as-is.
+        assert_eq!(manager.track_block_match(&key, 0), BlockTrackResult::InFlight);
         assert_eq!(manager.blocks_remaining.get(&hash), Some(&(100, 0)));
 
         // Simulate the block being delivered and processed: `blocks_remaining`
-        // is cleared but `filters_matched` keeps the hash.
+        // is cleared but `matched_block_hashes` keeps the hash.
         manager.blocks_remaining.remove(&hash);
-        assert!(manager.filters_matched.contains(&hash));
+        assert!(manager.matched_block_hashes.contains(&hash));
 
-        // A late-added wallet's filter now matches the same block. The helper
-        // must re-queue the block (re-insert into `blocks_remaining`) so the
-        // caller's `BlocksNeeded` reaches `BlocksManager` with the new wallet
-        // set instead of being dropped on the floor.
-        assert!(manager.track_block_match(&key, 5000));
-        assert_eq!(manager.blocks_remaining.get(&hash), Some(&(100, 5000)));
+        // A late-added wallet's filter matches the same already-processed
+        // block. The helper reports `AlreadyProcessed` so the caller skips
+        // re-running `process_block_for_wallets` (which is not idempotent).
+        assert_eq!(manager.track_block_match(&key, 5000), BlockTrackResult::AlreadyProcessed);
+        // No re-insertion into `blocks_remaining`.
+        assert!(!manager.blocks_remaining.contains_key(&hash));
     }
 
     #[tokio::test]
@@ -1132,9 +1402,9 @@ mod tests {
         assert!(!manager.is_idle());
         manager.blocks_remaining.clear();
 
-        manager.filters_matched.insert(hash);
+        manager.matched_block_hashes.insert(hash);
         assert!(!manager.is_idle());
-        manager.filters_matched.clear();
+        manager.matched_block_hashes.clear();
 
         manager.pending_batches.insert(FiltersBatch::new(0, 999, HashMap::new()));
         assert!(!manager.is_idle());
@@ -1147,7 +1417,7 @@ mod tests {
         // Populate all fields, then clear_in_flight_state restores idleness
         manager.active_batches.insert(0, FiltersBatch::new(0, 999, HashMap::new()));
         manager.blocks_remaining.insert(hash, (0, 0));
-        manager.filters_matched.insert(hash);
+        manager.matched_block_hashes.insert(hash);
         manager.pending_batches.insert(FiltersBatch::new(1000, 1999, HashMap::new()));
         manager.filter_pipeline.init(2000, 2999);
         assert!(!manager.is_idle());
@@ -1320,20 +1590,49 @@ mod tests {
     async fn test_tick_rescans_when_wallet_falls_behind_committed() {
         let mut manager = create_test_manager().await;
 
-        // Block headers required by start_download to resolve heights.
-        let headers = dashcore::block::Header::dummy_batch(0..201);
+        // Set up a single address on the wallet and a real matching filter at
+        // height 50 so scan_batch can emit a `BlocksNeeded` for it on rescan.
+        let address = dashcore::Address::dummy(Network::Regtest, 7);
+        manager.wallet.write().await.set_addresses(vec![address.clone()]);
+
+        // Build matching block + filter at height 50.
+        let tx = Transaction::dummy(&address, 0..0, &[50u64]);
+        let block_at_50 = Block::dummy(50, vec![tx]);
+        let filter_at_50 = BlockFilter::dummy(&block_at_50);
+
+        // Headers must form a contiguous range so the storage segment is
+        // fully populated. Only the height-50 entry needs to be the real
+        // header; the rest are dummies and never get matched against.
+        let mut headers: Vec<dashcore::Header> = dashcore::block::Header::dummy_batch(0..201);
+        headers[50] = block_at_50.header;
         manager.header_storage.write().await.store_headers(&headers).await.unwrap();
 
-        // Manager believes filters are committed up to 100, with filter headers at 200.
+        // Persist a filter at every height in 0..=100 so `load_filters` over
+        // the initial batch range succeeds. Non-matching heights get a
+        // throwaway filter, only height 50 gets the address-matching one.
+        let mut filter_store = manager.filter_storage.write().await;
+        let dummy_filter = BlockFilter::new(&[0u8; 32]);
+        for h in 0..=100u32 {
+            if h == 50 {
+                filter_store.store_filter(h, &filter_at_50.content).await.unwrap();
+            } else {
+                filter_store.store_filter(h, &dummy_filter.content).await.unwrap();
+            }
+        }
+        drop(filter_store);
+
+        // Manager believes filters are committed up to 100. Filter headers
+        // and target are pinned at 100 too so start_download immediately
+        // scans the freshly created batch instead of waiting for downloads.
         manager.set_state(SyncState::Synced);
         manager.progress.update_committed_height(100);
         manager.progress.update_stored_height(100);
-        manager.progress.update_filter_header_tip_height(200);
-        manager.progress.update_target_height(200);
+        manager.progress.update_filter_header_tip_height(100);
+        manager.progress.update_target_height(100);
 
         // Pre-populate in-flight state so we can verify clear_in_flight_state runs.
         manager.active_batches.insert(101, FiltersBatch::new(101, 200, HashMap::new()));
-        manager.filters_matched.insert(dashcore::block::Header::dummy(0).block_hash());
+        manager.matched_block_hashes.insert(dashcore::block::Header::dummy(0).block_hash());
         manager.filter_pipeline.init(101, 200);
 
         // MockWallet defaults to synced_height=0, so wallets_behind(100) = {MOCK_WALLET_ID}.
@@ -1342,16 +1641,36 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let requests = RequestSender::new(tx);
 
-        let _events = manager.tick(&requests).await.unwrap();
+        // Sanity: the pre-populated stale match is in the matched set.
+        let stale_hash = dashcore::block::Header::dummy(0).block_hash();
+        assert!(manager.matched_block_hashes.contains(&stale_hash));
+
+        let events = manager.tick(&requests).await.unwrap();
 
         // Old in-flight state was cleared and a fresh batch was created at scan_start=0.
         assert!(!manager.active_batches.contains_key(&101));
         assert!(manager.active_batches.contains_key(&0));
-        assert!(manager.filters_matched.is_empty());
+        // The stale pre-populated hash was wiped by `clear_in_flight_state`.
+        assert!(!manager.matched_block_hashes.contains(&stale_hash));
 
-        // committed_height was lowered and start_download set it to scan_start - 1 = 0.
+        // start_download set committed_height to scan_start - 1 = 0.
         assert_eq!(manager.progress.committed_height(), 0);
         assert_eq!(manager.state(), SyncState::Syncing);
+
+        // Verify a `BlocksNeeded` event was emitted that includes MOCK_WALLET_ID
+        // for the matching block at height 50.
+        let blocks_needed = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("BlocksNeeded event from rescan");
+        let key_50 = FilterMatchKey::new(50, block_at_50.block_hash());
+        let attribution = blocks_needed.get(&key_50).expect("entry for matching block 50");
+        assert!(attribution.contains(&MOCK_WALLET_ID));
     }
 
     /// When every managed wallet is at or beyond `committed_height`, the rescan
