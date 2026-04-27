@@ -216,10 +216,6 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             info.update_synced_height(height);
         }
 
-        if height > self.last_processed_height() {
-            self.update_last_processed_height(height);
-        }
-
         for wallet_id in advanced_wallets {
             let event = WalletEvent::SyncedHeightUpdated {
                 wallet_id,
