@@ -89,6 +89,12 @@ fn test_ffi_sync_then_generate_blocks() {
 
         // Verify FFIRecordAction was captured for the post-sync block records.
         let actions = ctx.tracker().block_record_actions.lock().unwrap();
+        assert!(
+            actions.len() >= block_records_before as usize,
+            "block_record_actions length ({}) < block_records_before ({}): counter/vector mismatch",
+            actions.len(),
+            block_records_before
+        );
         let new_actions = &actions[block_records_before as usize..];
         assert!(
             !new_actions.is_empty(),
@@ -98,6 +104,12 @@ fn test_ffi_sync_then_generate_blocks() {
 
         // Verify the BIP-32 account path was delivered for the post-sync block records.
         let paths = ctx.tracker().block_account_paths.lock().unwrap();
+        assert!(
+            paths.len() >= block_records_before as usize,
+            "block_account_paths length ({}) < block_records_before ({}): counter/vector mismatch",
+            paths.len(),
+            block_records_before
+        );
         let new_paths = &paths[block_records_before as usize..];
         assert!(
             new_paths.iter().any(|p| p.starts_with("m/")),

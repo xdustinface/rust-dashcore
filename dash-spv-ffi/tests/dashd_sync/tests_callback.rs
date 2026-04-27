@@ -407,7 +407,7 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         // path (e.g. `m/44'/1'/0'`).
         let mempool_paths = tracker.mempool_account_paths.lock().unwrap();
         assert!(
-            mempool_paths.iter().any(|p| p.starts_with("m/")),
+            mempool_paths.iter().all(|p| p.starts_with("m/")),
             "mempool callback should deliver a BIP-32 account path, got: {:?}",
             *mempool_paths
         );
