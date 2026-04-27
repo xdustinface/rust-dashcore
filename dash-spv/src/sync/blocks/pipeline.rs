@@ -438,6 +438,70 @@ mod tests {
     }
 
     #[test]
+    fn test_queue_propagates_wallet_set_through_take_next() {
+        // A block queued with a non-empty wallet set must yield that exact
+        // wallet set when taken in height order via `take_next_ordered_block`.
+        let mut pipeline = BlocksPipeline::new();
+        let block = make_test_block(1);
+        let hash = block.block_hash();
+        let wallets: BTreeSet<WalletId> = BTreeSet::from([[1u8; 32], [2u8; 32]]);
+
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets.clone())]);
+
+        // Drive the block through receive_block to land it in `downloaded`.
+        let hashes = pipeline.coordinator.take_pending(1);
+        pipeline.coordinator.mark_sent(&hashes);
+        assert!(pipeline.receive_block(&block));
+
+        let (taken_block, height, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
+        assert_eq!(taken_block.block_hash(), hash);
+        assert_eq!(height, 100);
+        assert_eq!(taken_wallets, wallets);
+    }
+
+    #[test]
+    fn test_queue_merges_wallet_sets_for_repeat_hashes() {
+        // Queueing the same block hash twice with different wallet sets must
+        // produce the union when the block is later taken from the pipeline.
+        let mut pipeline = BlocksPipeline::new();
+        let block = make_test_block(1);
+        let hash = block.block_hash();
+        let wallets_a: BTreeSet<WalletId> = BTreeSet::from([[1u8; 32]]);
+        let wallets_b: BTreeSet<WalletId> = BTreeSet::from([[2u8; 32], [3u8; 32]]);
+
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_a.clone())]);
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_b.clone())]);
+
+        // Land the block in `downloaded` to retrieve it.
+        let hashes = pipeline.coordinator.take_pending(1);
+        pipeline.coordinator.mark_sent(&hashes);
+        assert!(pipeline.receive_block(&block));
+
+        let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
+        let mut expected = wallets_a;
+        expected.extend(wallets_b);
+        assert_eq!(taken_wallets, expected);
+    }
+
+    #[test]
+    fn test_add_from_storage_merges_wallet_sets() {
+        // The `add_from_storage` path must merge wallet sets for repeat
+        // additions of the same block hash, matching `queue`'s semantics.
+        let mut pipeline = BlocksPipeline::new();
+        let block = make_test_block(1);
+        let wallets_a: BTreeSet<WalletId> = BTreeSet::from([[1u8; 32]]);
+        let wallets_b: BTreeSet<WalletId> = BTreeSet::from([[2u8; 32]]);
+
+        pipeline.add_from_storage(block.clone(), 100, wallets_a.clone());
+        pipeline.add_from_storage(block.clone(), 100, wallets_b.clone());
+
+        let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
+        let mut expected = wallets_a;
+        expected.extend(wallets_b);
+        assert_eq!(taken_wallets, expected);
+    }
+
+    #[test]
     fn test_receive_block_duplicate() {
         let mut pipeline = BlocksPipeline::new();
         let block = make_test_block(1);
