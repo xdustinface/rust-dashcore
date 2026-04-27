@@ -66,8 +66,8 @@ pub(super) struct CallbackTracker {
 
     // `account_index` values captured alongside `FFIAccountType`, paired
     // positionally with the corresponding `*_account_types` entries.
-    pub(super) received_account_indices: Mutex<Vec<i32>>,
-    pub(super) block_account_indices: Mutex<Vec<i32>>,
+    pub(super) received_account_indices: Mutex<Vec<u32>>,
+    pub(super) block_account_indices: Mutex<Vec<u32>>,
 
     // `FFIRecordAction` values observed on `BlockProcessed` changes, in
     // delivery order. Lets tests assert the action discriminant is correct
@@ -380,7 +380,7 @@ fn record_balance(tracker: &CallbackTracker, balance: *const FFIBalance) {
 
 extern "C" fn on_transaction_received(
     wallet_id: *const c_char,
-    change: *const FFIRecordChange,
+    update: *const FFITransactionRecordUpdate,
     balance: *const FFIBalance,
     user_data: *mut c_void,
 ) {
@@ -388,24 +388,24 @@ extern "C" fn on_transaction_received(
         return;
     };
     let mut account_type_log = None;
-    if !change.is_null() {
-        let c = unsafe { &*change };
+    if !update.is_null() {
+        let u = unsafe { &*update };
         tracker
             .received_transactions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((c.record.txid, c.record.net_amount));
+            .push((u.record.txid, u.record.net_amount));
         tracker
             .received_account_types
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(c.account_type);
+            .push(u.record.account_type);
         tracker
             .received_account_indices
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(c.account_index);
-        account_type_log = Some((c.account_type, c.account_index));
+            .push(u.record.account_index);
+        account_type_log = Some((u.record.account_type, u.record.account_index));
     }
     // Store the balance before bumping the counter so a test that waits on the
     // counter and then reads `last_unconfirmed` is guaranteed to observe the
@@ -443,8 +443,8 @@ extern "C" fn on_transaction_instant_send_locked(
 extern "C" fn on_wallet_block_processed(
     wallet_id: *const c_char,
     height: u32,
-    changes: *const FFIRecordChange,
-    change_count: u32,
+    updates: *const FFITransactionRecordUpdate,
+    update_count: u32,
     balance: *const FFIBalance,
     user_data: *mut c_void,
 ) {
@@ -461,13 +461,13 @@ extern "C" fn on_wallet_block_processed(
     let mut indices = tracker.block_account_indices.lock().unwrap_or_else(|e| e.into_inner());
     let mut actions = tracker.block_record_actions.lock().unwrap_or_else(|e| e.into_inner());
     let mut records_added = 0u32;
-    if !changes.is_null() && change_count > 0 {
-        let changes_slice = unsafe { slice::from_raw_parts(changes, change_count as usize) };
-        for c in changes_slice {
-            sink.push((c.record.txid, c.record.net_amount));
-            types.push(c.account_type);
-            indices.push(c.account_index);
-            actions.push(c.action);
+    if !updates.is_null() && update_count > 0 {
+        let updates_slice = unsafe { slice::from_raw_parts(updates, update_count as usize) };
+        for u in updates_slice {
+            sink.push((u.record.txid, u.record.net_amount));
+            types.push(u.record.account_type);
+            indices.push(u.record.account_index);
+            actions.push(u.action);
             records_added += 1;
         }
     }
@@ -482,10 +482,10 @@ extern "C" fn on_wallet_block_processed(
     record_balance(tracker, balance);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
     tracing::info!(
-        "on_wallet_block_processed: wallet={}, height={}, changes={}",
+        "on_wallet_block_processed: wallet={}, height={}, updates={}",
         wallet_str,
         height,
-        change_count
+        update_count
     );
 }
 

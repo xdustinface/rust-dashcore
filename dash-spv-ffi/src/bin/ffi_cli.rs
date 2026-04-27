@@ -174,25 +174,25 @@ fn read_balance(balance: *const FFIBalance) -> FFIBalance {
 
 extern "C" fn on_transaction_received(
     wallet_id: *const c_char,
-    change: *const FFIRecordChange,
+    update: *const FFITransactionRecordUpdate,
     balance: *const FFIBalance,
     _user_data: *mut c_void,
 ) {
     let wallet_short = short_wallet(wallet_id);
-    if change.is_null() {
-        println!("[Wallet] TX received: wallet={}..., change=null", wallet_short);
+    if update.is_null() {
+        println!("[Wallet] TX received: wallet={}..., update=null", wallet_short);
         return;
     }
-    let c = unsafe { &*change };
+    let u = unsafe { &*update };
     let b = read_balance(balance);
-    let txid_hex = hex::encode(c.record.txid);
+    let txid_hex = hex::encode(u.record.txid);
     println!(
         "[Wallet] TX received: wallet={}..., txid={}, account_type={:?}, account_index={}, amount={} duffs, balance[confirmed={}, unconfirmed={}]",
         wallet_short,
         txid_hex,
-        c.account_type,
-        c.account_index,
-        c.record.net_amount,
+        u.record.account_type,
+        u.record.account_index,
+        u.record.net_amount,
         b.confirmed,
         b.unconfirmed
     );
@@ -218,16 +218,16 @@ extern "C" fn on_transaction_instant_send_locked(
 extern "C" fn on_wallet_block_processed(
     wallet_id: *const c_char,
     height: u32,
-    _changes: *const FFIRecordChange,
-    change_count: u32,
+    _updates: *const FFITransactionRecordUpdate,
+    update_count: u32,
     balance: *const FFIBalance,
     _user_data: *mut c_void,
 ) {
     let wallet_short = short_wallet(wallet_id);
     let b = read_balance(balance);
     println!(
-        "[Wallet] Block processed: wallet={}..., height={}, changes={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}]",
-        wallet_short, height, change_count, b.confirmed, b.unconfirmed, b.immature, b.locked
+        "[Wallet] Block processed: wallet={}..., height={}, updates={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}]",
+        wallet_short, height, update_count, b.confirmed, b.unconfirmed, b.immature, b.locked
     );
 }
 

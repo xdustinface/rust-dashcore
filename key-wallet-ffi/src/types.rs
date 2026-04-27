@@ -7,8 +7,11 @@ use key_wallet::managed_account::transaction_record::{OutputRole, TransactionDir
 use key_wallet::transaction_checking::transaction_router::TransactionType;
 use key_wallet::transaction_checking::{BlockInfo, TransactionContext};
 use key_wallet::Wallet;
+use key_wallet_manager::{RecordAction, TransactionRecordUpdate};
 use std::os::raw::c_char;
 use std::sync::Arc;
+
+use crate::managed_account::FFITransactionRecord;
 
 /// FFI-compatible block metadata (height, hash, timestamp).
 #[repr(C)]
@@ -113,6 +116,51 @@ impl From<key_wallet::WalletCoreBalance> for FFIBalance {
             immature: balance.immature(),
             locked: balance.locked(),
             total: balance.total(),
+        }
+    }
+}
+
+/// Whether a record is newly stored or updates a previously stored record.
+///
+/// FFI mirror of [`key_wallet_manager::RecordAction`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFIRecordAction {
+    /// The record is new (first time stored for this wallet).
+    Inserted = 0,
+    /// The record was already stored and has been updated (e.g. a previously
+    /// known mempool transaction was confirmed or InstantSend-locked).
+    Updated = 1,
+}
+
+impl From<RecordAction> for FFIRecordAction {
+    fn from(action: RecordAction) -> Self {
+        match action {
+            RecordAction::Inserted => FFIRecordAction::Inserted,
+            RecordAction::Updated => FFIRecordAction::Updated,
+        }
+    }
+}
+
+/// FFI mirror of [`key_wallet_manager::TransactionRecordUpdate`]: a transaction
+/// record paired with the action that just happened to it. Used as a single
+/// value by the off-chain wallet callback and as an array element by the
+/// per-block wallet callback. The owning account is encoded on `record`
+/// directly (`record.account_type` plus the auxiliary `account_*` fields on
+/// [`FFITransactionRecord`]).
+#[repr(C)]
+pub struct FFITransactionRecordUpdate {
+    /// Whether the record is new or an update to a previously stored one.
+    pub action: FFIRecordAction,
+    /// The transaction record.
+    pub record: FFITransactionRecord,
+}
+
+impl From<&TransactionRecordUpdate> for FFITransactionRecordUpdate {
+    fn from(update: &TransactionRecordUpdate) -> Self {
+        Self {
+            action: FFIRecordAction::from(update.action),
+            record: FFITransactionRecord::from(&update.record),
         }
     }
 }

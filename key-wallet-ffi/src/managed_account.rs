@@ -668,6 +668,20 @@ pub unsafe extern "C" fn managed_core_account_get_utxo_count(
 ///
 /// Heap-allocated fields are freed automatically when the record is dropped
 /// (see `Drop` impl below).
+///
+/// The `account_*` fields together identify the wallet account that owns this
+/// record. They mirror the Rust-side `TransactionRecord::account_type`:
+/// `account_type` is the discriminant, `account_index` is the primary index
+/// (`0` for variants that have no meaningful primary index — see
+/// [`FFIAccountType::from_account_type`]), `account_index_secondary` carries
+/// the secondary index (`registration_index` for `IdentityTopUp`, `key_class`
+/// for `PlatformPayment`) or `-1` when not applicable. The
+/// `account_identity_user` and `account_identity_friend` pointers are non-null
+/// only for the Dashpay variants and point to 32-byte identity hashes owned
+/// by this record (freed in `Drop`). `account_key_class` is `-1` unless this
+/// is a `PlatformPayment` record, in which case it carries the `key_class`
+/// hardened index (also exposed in `account_index_secondary` for symmetry
+/// with the existing FFI tuple contract).
 #[repr(C)]
 pub struct FFITransactionRecord {
     /// Transaction ID (32 bytes)
@@ -682,6 +696,29 @@ pub struct FFITransactionRecord {
     pub direction: FFITransactionDirection,
     /// Fee if known, 0 if unknown
     pub fee: u64,
+    /// Discriminant identifying the owning account variant.
+    pub account_type: FFIAccountType,
+    /// Primary account index for variants that carry one (`Standard`,
+    /// `CoinJoin`, `IdentityTopUp` registration index, `Dashpay*` index,
+    /// `PlatformPayment` account). `0` for variants without a meaningful
+    /// primary index (identity-singleton, provider-key, asset-lock).
+    pub account_index: u32,
+    /// Secondary account index when applicable, `-1` otherwise. Currently
+    /// used only by `PlatformPayment` (`key_class`); see
+    /// [`FFIAccountType::from_account_type`] for the contract.
+    pub account_index_secondary: i32,
+    /// Pointer to the 32-byte `user_identity_id` of the Dashpay account that
+    /// owns this record, null when the account is not a Dashpay variant. The
+    /// pointee is owned by this record and freed when the record is dropped.
+    pub account_identity_user: *const [u8; 32],
+    /// Pointer to the 32-byte `friend_identity_id` of the Dashpay account
+    /// that owns this record, null when the account is not a Dashpay variant.
+    /// The pointee is owned by this record and freed when the record is
+    /// dropped.
+    pub account_identity_friend: *const [u8; 32],
+    /// `PlatformPayment` `key_class` hardened index, `-1` for any other
+    /// account variant. Mirrors `account_index_secondary` for `PlatformPayment`.
+    pub account_key_class: i32,
     /// Input details array
     pub input_details: *mut FFIInputDetail,
     /// Number of input details
@@ -706,6 +743,18 @@ impl From<&TransactionRecord> for FFITransactionRecord {
         let transaction_type = FFITransactionType::from(value.transaction_type);
         let direction = FFITransactionDirection::from(value.direction);
         let fee = value.fee.unwrap_or(0);
+
+        let (account_type, account_index, account_index_secondary) =
+            decompose_account_type(&value.account_type);
+        let (account_identity_user, account_identity_friend) =
+            extract_dashpay_identity_ids(&value.account_type);
+        let account_key_class = match value.account_type {
+            AccountType::PlatformPayment {
+                key_class,
+                ..
+            } => key_class as i32,
+            _ => -1,
+        };
 
         // Serialize transaction bytes
         let tx_slice = dashcore::consensus::serialize(&value.transaction).into_boxed_slice();
@@ -750,6 +799,12 @@ impl From<&TransactionRecord> for FFITransactionRecord {
             transaction_type,
             direction,
             fee,
+            account_type,
+            account_index,
+            account_index_secondary,
+            account_identity_user,
+            account_identity_friend,
+            account_key_class,
             input_details,
             input_details_count,
             output_details,
@@ -759,6 +814,87 @@ impl From<&TransactionRecord> for FFITransactionRecord {
             label,
         }
     }
+}
+
+/// Decompose an `AccountType` into the FFI-tuple shape `(discriminant,
+/// primary_index, secondary_index_or_minus_one)`.
+///
+/// This is the non-panicking counterpart of [`FFIAccountType::from_account_type`]:
+/// Dashpay variants do not abort here because the identity-id payload is
+/// preserved separately on `FFITransactionRecord` via
+/// [`extract_dashpay_identity_ids`].
+fn decompose_account_type(account_type: &AccountType) -> (FFIAccountType, u32, i32) {
+    use key_wallet::account::StandardAccountType;
+    match *account_type {
+        AccountType::Standard {
+            index,
+            standard_account_type: StandardAccountType::BIP44Account,
+        } => (FFIAccountType::StandardBIP44, index, -1),
+        AccountType::Standard {
+            index,
+            standard_account_type: StandardAccountType::BIP32Account,
+        } => (FFIAccountType::StandardBIP32, index, -1),
+        AccountType::CoinJoin {
+            index,
+        } => (FFIAccountType::CoinJoin, index, -1),
+        AccountType::IdentityRegistration => (FFIAccountType::IdentityRegistration, 0, -1),
+        AccountType::IdentityTopUp {
+            registration_index,
+        } => (FFIAccountType::IdentityTopUp, registration_index, -1),
+        AccountType::IdentityTopUpNotBoundToIdentity => {
+            (FFIAccountType::IdentityTopUpNotBoundToIdentity, 0, -1)
+        }
+        AccountType::IdentityInvitation => (FFIAccountType::IdentityInvitation, 0, -1),
+        AccountType::AssetLockAddressTopUp => (FFIAccountType::AssetLockAddressTopUp, 0, -1),
+        AccountType::AssetLockShieldedAddressTopUp => {
+            (FFIAccountType::AssetLockShieldedAddressTopUp, 0, -1)
+        }
+        AccountType::ProviderVotingKeys => (FFIAccountType::ProviderVotingKeys, 0, -1),
+        AccountType::ProviderOwnerKeys => (FFIAccountType::ProviderOwnerKeys, 0, -1),
+        AccountType::ProviderOperatorKeys => (FFIAccountType::ProviderOperatorKeys, 0, -1),
+        AccountType::ProviderPlatformKeys => (FFIAccountType::ProviderPlatformKeys, 0, -1),
+        AccountType::DashpayReceivingFunds {
+            index,
+            ..
+        } => (FFIAccountType::DashpayReceivingFunds, index, -1),
+        AccountType::DashpayExternalAccount {
+            index,
+            ..
+        } => (FFIAccountType::DashpayExternalAccount, index, -1),
+        AccountType::PlatformPayment {
+            account,
+            key_class,
+        } => (FFIAccountType::PlatformPayment, account, key_class as i32),
+    }
+}
+
+/// Heap-allocate copies of the Dashpay identity ids carried by `account_type`,
+/// returning raw pointers owned by the caller. Returns `(null, null)` for any
+/// non-Dashpay variant. The caller is responsible for freeing the boxes
+/// (see `FFITransactionRecord::Drop`).
+fn extract_dashpay_identity_ids(account_type: &AccountType) -> (*const [u8; 32], *const [u8; 32]) {
+    let (user, friend) = match *account_type {
+        AccountType::DashpayReceivingFunds {
+            user_identity_id,
+            friend_identity_id,
+            ..
+        } => (Some(user_identity_id), Some(friend_identity_id)),
+        AccountType::DashpayExternalAccount {
+            user_identity_id,
+            friend_identity_id,
+            ..
+        } => (Some(user_identity_id), Some(friend_identity_id)),
+        _ => (None, None),
+    };
+    let user_ptr = match user {
+        Some(bytes) => Box::into_raw(Box::new(bytes)) as *const [u8; 32],
+        None => std::ptr::null(),
+    };
+    let friend_ptr = match friend {
+        Some(bytes) => Box::into_raw(Box::new(bytes)) as *const [u8; 32],
+        None => std::ptr::null(),
+    };
+    (user_ptr, friend_ptr)
 }
 
 impl Drop for FFITransactionRecord {
@@ -793,6 +929,18 @@ impl Drop for FFITransactionRecord {
             let _ = unsafe { std::ffi::CString::from_raw(self.label) };
 
             self.label = std::ptr::null_mut();
+        }
+
+        if !self.account_identity_user.is_null() {
+            let _ = unsafe { Box::from_raw(self.account_identity_user as *mut [u8; 32]) };
+
+            self.account_identity_user = std::ptr::null();
+        }
+
+        if !self.account_identity_friend.is_null() {
+            let _ = unsafe { Box::from_raw(self.account_identity_friend as *mut [u8; 32]) };
+
+            self.account_identity_friend = std::ptr::null();
         }
     }
 }
@@ -2014,6 +2162,12 @@ mod tests {
             transaction_type: FFITransactionType::Standard,
             direction: FFITransactionDirection::Incoming,
             fee: 226,
+            account_type: FFIAccountType::StandardBIP44,
+            account_index: 0,
+            account_index_secondary: -1,
+            account_identity_user: std::ptr::null(),
+            account_identity_friend: std::ptr::null(),
+            account_key_class: -1,
             input_details_count: input_slice.len(),
             input_details: Box::into_raw(input_slice) as *mut FFIInputDetail,
             output_details_count: output_slice.len(),
@@ -2038,6 +2192,12 @@ mod tests {
             transaction_type: FFITransactionType::Standard,
             direction: FFITransactionDirection::Outgoing,
             fee: 0,
+            account_type: FFIAccountType::StandardBIP44,
+            account_index: 0,
+            account_index_secondary: -1,
+            account_identity_user: std::ptr::null(),
+            account_identity_friend: std::ptr::null(),
+            account_key_class: -1,
             input_details: std::ptr::null_mut(),
             input_details_count: 0,
             output_details: std::ptr::null_mut(),
