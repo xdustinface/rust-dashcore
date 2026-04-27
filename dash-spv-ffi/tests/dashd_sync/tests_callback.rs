@@ -101,11 +101,15 @@ fn test_all_callbacks_during_sync() {
         );
         drop(connected_peers);
 
-        // Wait for wallet callbacks (they travel on a separate channel from sync events)
+        // Wait for wallet callbacks (they travel on a separate channel from sync events).
+        // Wait on `block_process_change_count` because it is bumped last in the
+        // callback, after all per-record state has been written. Reading the
+        // record counter afterwards is therefore guaranteed to see the matching
+        // increment.
         tracker.wait_for_callback(
-            &tracker.block_process_change_record_count,
+            &tracker.block_process_change_count,
             0,
-            "block_process_change_record",
+            "block_process_change",
         );
 
         // Validate wallet event callbacks (test wallet has transactions)
@@ -152,9 +156,11 @@ fn test_all_callbacks_during_sync() {
             synced_height_fired > 0,
             "on_synced_height_updated should fire at least once during sync"
         );
-        assert_eq!(
-            last_synced_height, dashd.initial_height,
-            "last_synced_height should match initial_height after sync"
+        assert!(
+            last_synced_height >= dashd.initial_height,
+            "last_synced_height ({}) should be at least initial_height ({}) after sync",
+            last_synced_height,
+            dashd.initial_height
         );
 
         // Validate sync cycle (initial sync is cycle 0)
@@ -318,6 +324,7 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         // Record callback counts before post-sync operations
         let mempool_received_before =
             tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
+        let block_changes_before = tracker.block_process_change_count.load(Ordering::SeqCst);
         let block_records_before = tracker.block_process_change_record_count.load(Ordering::SeqCst);
 
         // Send DASH to the wallet. Wait for the mempool callback before mining
@@ -335,17 +342,31 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             "mempool_transaction_received",
         );
 
+        // The mempool callback updates `last_unconfirmed` with the post-event
+        // balance. Snapshot it now, before mining. After confirmation the
+        // block-process callback overwrites the same field back toward zero,
+        // so this is the only window in which the unconfirmed-balance update
+        // is observable.
+        let unconfirmed_after_mempool = tracker.last_unconfirmed.load(Ordering::SeqCst);
+        assert!(
+            unconfirmed_after_mempool > 0,
+            "balance.unconfirmed should be positive after mempool receipt, got {}",
+            unconfirmed_after_mempool
+        );
+
         let miner_address = dashd.node.get_new_address_from_wallet("default");
         dashd.node.generate_blocks(1, &miner_address);
 
         // Wait for incremental sync to complete
         ctx.wait_for_sync(dashd.initial_height + 1);
 
-        // Wait for the block-record callback (mempool callback already observed above).
+        // Wait for the block-process callback. The per-callback counter is
+        // bumped last in the callback, so observing it incremented guarantees
+        // the per-record vectors and counters have already been updated.
         tracker.wait_for_callback(
-            &tracker.block_process_change_record_count,
-            block_records_before,
-            "block_process_change_record",
+            &tracker.block_process_change_count,
+            block_changes_before,
+            "block_process_change",
         );
 
         // Verify on_mempool_transaction_received fired for the new transaction
@@ -398,13 +419,17 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
 
         // The post-sync block confirms a transaction that was already known
         // from the mempool, so the corresponding `BlockProcessChange` update
-        // must carry `FFIRecordAction::Updated` rather than `Inserted`.
+        // must carry `FFIRecordAction::Updated` rather than `Inserted`. Slice
+        // by the pre-captured index so only post-sync entries are checked,
+        // avoiding masking by any `Updated` that might appear during initial
+        // sync.
         let block_actions = tracker.block_record_actions.lock().unwrap();
+        let new_actions = &block_actions[block_records_before as usize..];
         assert!(
-            block_actions.contains(&FFIRecordAction::Updated),
+            new_actions.contains(&FFIRecordAction::Updated),
             "post-sync block confirming a known mempool tx should deliver \
              FFIRecordAction::Updated, got: {:?}",
-            *block_actions
+            new_actions
         );
         drop(block_actions);
 

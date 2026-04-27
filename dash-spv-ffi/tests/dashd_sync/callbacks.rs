@@ -75,6 +75,11 @@ pub(super) struct CallbackTracker {
     pub(super) last_confirmed: AtomicU64,
     pub(super) last_unconfirmed: AtomicU64,
 
+    // Raw IS lock bytes captured from the most recent
+    // `on_transaction_instant_send_locked` callback. Lets tests verify the
+    // payload is non-empty and round-trips through `InstantLock` deserialisation.
+    pub(super) last_islock_bytes: Mutex<Option<Vec<u8>>>,
+
     // Lifecycle ordering via global sequence counter
     pub(super) sequence_counter: AtomicU32,
     pub(super) sync_start_seq: AtomicU32,
@@ -398,14 +403,18 @@ extern "C" fn on_mempool_transaction_received(
 extern "C" fn on_transaction_instant_send_locked(
     _wallet_id: *const c_char,
     _txid: *const [u8; 32],
-    _islock_data: *const u8,
-    _islock_len: usize,
+    islock_data: *const u8,
+    islock_len: usize,
     balance: *const FFIBalance,
     user_data: *mut c_void,
 ) {
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
     };
+    if !islock_data.is_null() && islock_len > 0 {
+        let bytes = unsafe { slice::from_raw_parts(islock_data, islock_len) }.to_vec();
+        *tracker.last_islock_bytes.lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+    }
     tracker.transaction_instant_send_locked_count.fetch_add(1, Ordering::SeqCst);
     record_balance(tracker, balance);
     tracing::debug!("on_transaction_instant_send_locked");
@@ -422,25 +431,31 @@ extern "C" fn on_block_process_change(
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
     };
-    // Bump the per-callback counter before the per-record counter so a test
-    // that waits on `block_process_change_record_count` and then reads
-    // `block_process_change_count` is guaranteed to observe a matching pair.
-    tracker.block_process_change_count.fetch_add(1, Ordering::SeqCst);
+    // Append all per-record state before bumping either counter so that a
+    // test waiting on `block_process_change_count` (the per-callback counter)
+    // is guaranteed to also observe the matching `block_process_change_record_count`
+    // and the underlying vectors. Tests should always wait on
+    // `block_process_change_count` and read the record counter afterwards.
     let mut sink = tracker.block_received_transactions.lock().unwrap_or_else(|e| e.into_inner());
     let mut paths = tracker.block_account_paths.lock().unwrap_or_else(|e| e.into_inner());
     let mut actions = tracker.block_record_actions.lock().unwrap_or_else(|e| e.into_inner());
+    let mut records_added = 0u32;
     if !updates.is_null() && update_count > 0 {
         let updates_slice = unsafe { slice::from_raw_parts(updates, update_count as usize) };
         for u in updates_slice {
             sink.push((u.record.txid, u.record.net_amount));
             paths.push(unsafe { cstr_or_unknown(u.account_path) });
             actions.push(u.action);
-            tracker.block_process_change_record_count.fetch_add(1, Ordering::SeqCst);
+            records_added += 1;
         }
     }
     drop(sink);
     drop(paths);
     drop(actions);
+    if records_added > 0 {
+        tracker.block_process_change_record_count.fetch_add(records_added, Ordering::SeqCst);
+    }
+    tracker.block_process_change_count.fetch_add(1, Ordering::SeqCst);
     record_balance(tracker, balance);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
     tracing::info!(
@@ -459,8 +474,11 @@ extern "C" fn on_synced_height_updated(
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
     };
-    tracker.synced_height_updated_count.fetch_add(1, Ordering::SeqCst);
+    // Store the height before bumping the counter so a test that waits on the
+    // counter and then reads `last_synced_height` is guaranteed to observe the
+    // height for the same callback invocation.
     tracker.last_synced_height.store(height, Ordering::SeqCst);
+    tracker.synced_height_updated_count.fetch_add(1, Ordering::SeqCst);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
     tracing::info!("on_synced_height_updated: wallet={}, height={}", wallet_str, height);
 }

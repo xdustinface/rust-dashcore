@@ -47,6 +47,8 @@ fn test_ffi_sync_then_generate_blocks() {
 
         // Generate a block containing a wallet transaction and wait for sync.
         let cycle_before = ctx.tracker().last_sync_cycle.load(Ordering::SeqCst);
+        let block_changes_before =
+            ctx.tracker().block_process_change_count.load(Ordering::SeqCst);
         let block_records_before =
             ctx.tracker().block_process_change_record_count.load(Ordering::SeqCst);
         let receive_address = ctx.get_receive_address(&wallet_id);
@@ -67,11 +69,13 @@ fn test_ffi_sync_then_generate_blocks() {
             cycle_after_first
         );
 
-        // Wait for wallet callback (travels on a separate channel from sync events)
+        // Wait for wallet callback (travels on a separate channel from sync events).
+        // The per-callback counter is bumped last in the callback, so observing
+        // it incremented guarantees the per-record vectors are also updated.
         ctx.tracker().wait_for_callback(
-            &ctx.tracker().block_process_change_record_count,
-            block_records_before,
-            "block_process_change_record",
+            &ctx.tracker().block_process_change_count,
+            block_changes_before,
+            "block_process_change",
         );
 
         // Verify the transaction was received via the block-process-change callback
@@ -83,6 +87,25 @@ fn test_ffi_sync_then_generate_blocks() {
             txid
         );
         drop(received_txs);
+
+        // Verify FFIRecordAction was captured for the post-sync block records.
+        let actions = ctx.tracker().block_record_actions.lock().unwrap();
+        let new_actions = &actions[block_records_before as usize..];
+        assert!(
+            !new_actions.is_empty(),
+            "block_record_actions should be populated for the post-sync block"
+        );
+        drop(actions);
+
+        // Verify the BIP-32 account path was delivered for the post-sync block records.
+        let paths = ctx.tracker().block_account_paths.lock().unwrap();
+        let new_paths = &paths[block_records_before as usize..];
+        assert!(
+            new_paths.iter().any(|p| p.starts_with("m/")),
+            "block account path should be a valid BIP-32 path, got: {:?}",
+            new_paths
+        );
+        drop(paths);
 
         // Verify via wallet query as well
         assert!(
