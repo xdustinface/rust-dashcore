@@ -426,9 +426,10 @@ extern "C" fn on_block_process_change(
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
         return;
     };
-    // `block_process_change_count` is incremented inside the same lock as
-    // `block_process_change_record_count` so a test that observes either
-    // counter via `wait_for_callback` is guaranteed to see the matching one.
+    // Bump the per-callback counter before the per-record counter so a test
+    // that waits on `block_process_change_record_count` and then reads
+    // `block_process_change_count` is guaranteed to observe a matching pair.
+    tracker.block_process_change_count.fetch_add(1, Ordering::SeqCst);
     let mut sink = tracker.block_received_transactions.lock().unwrap_or_else(|e| e.into_inner());
     let mut paths = tracker.block_account_paths.lock().unwrap_or_else(|e| e.into_inner());
     let mut actions = tracker.block_record_actions.lock().unwrap_or_else(|e| e.into_inner());
@@ -441,7 +442,6 @@ extern "C" fn on_block_process_change(
             tracker.block_process_change_record_count.fetch_add(1, Ordering::SeqCst);
         }
     }
-    tracker.block_process_change_count.fetch_add(1, Ordering::SeqCst);
     drop(sink);
     drop(paths);
     drop(actions);
