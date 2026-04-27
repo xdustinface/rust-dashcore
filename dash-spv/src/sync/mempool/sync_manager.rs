@@ -194,7 +194,7 @@ mod tests {
     use crate::test_utils::test_socket_address;
     use dashcore::hashes::Hash;
     use key_wallet_manager::test_utils::MockWallet;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use tokio::sync::{mpsc, RwLock};
 
@@ -389,6 +389,7 @@ mod tests {
         let event = SyncEvent::BlockProcessed {
             block_hash: dashcore::BlockHash::all_zeros(),
             height: 1001,
+            wallets: BTreeSet::new(),
             new_addresses: BTreeMap::new(),
             confirmed_txids: txids.clone(),
         };
@@ -574,6 +575,7 @@ mod tests {
         let event = SyncEvent::BlockProcessed {
             block_hash: dashcore::BlockHash::all_zeros(),
             height: 1001,
+            wallets: BTreeSet::new(),
             new_addresses: BTreeMap::new(),
             confirmed_txids: vec![dashcore::Txid::all_zeros()],
         };
@@ -600,6 +602,7 @@ mod tests {
         let event = SyncEvent::BlockProcessed {
             block_hash: dashcore::BlockHash::all_zeros(),
             height: 1001,
+            wallets: BTreeSet::new(),
             new_addresses: BTreeMap::new(),
             confirmed_txids: vec![],
         };

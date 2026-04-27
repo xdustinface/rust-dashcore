@@ -127,6 +127,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             events.push(SyncEvent::BlockProcessed {
                 block_hash: hash,
                 height,
+                wallets: interested,
                 new_addresses,
                 confirmed_txids,
             });

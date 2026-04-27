@@ -42,7 +42,7 @@ impl<
     fn clear_in_flight_state(&mut self) {
         self.active_batches.clear();
         self.blocks_remaining.clear();
-        self.matched_block_hashes.clear();
+        self.processed_blocks_per_wallet.clear();
         self.pending_batches.clear();
         self.filter_pipeline = FiltersPipeline::new();
     }
@@ -156,9 +156,15 @@ impl<
             SyncEvent::BlockProcessed {
                 block_hash,
                 height,
+                wallets,
                 new_addresses,
                 ..
             } => {
+                // Record per-wallet processing so a future scan can give a
+                // late-added wallet its own pass at this block via the
+                // `track_block_match` residual.
+                self.record_processed_for_wallets(*height, *block_hash, wallets);
+
                 // Check if this block is part of our tracked blocks
                 if let Some((_, batch_start)) = self.blocks_remaining.remove(block_hash) {
                     if let Some(batch) = self.active_batches.get_mut(&batch_start) {

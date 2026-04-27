@@ -101,6 +101,11 @@ pub enum SyncEvent {
         block_hash: BlockHash,
         /// Height of the processed block
         height: u32,
+        /// Wallets the block was actually processed for. `FiltersManager` uses
+        /// this to gate per-wallet `AlreadyProcessed` so a runtime-added wallet
+        /// can still receive a block that was earlier processed for another
+        /// wallet only.
+        wallets: BTreeSet<WalletId>,
         /// New addresses discovered from wallet gap limit maintenance, attributed
         /// to the wallet that produced them.
         new_addresses: BTreeMap<WalletId, Vec<Address>>,

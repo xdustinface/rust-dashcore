@@ -361,6 +361,7 @@ impl FFISyncEventCallbacks {
                 height,
                 new_addresses,
                 confirmed_txids,
+                ..
             } => {
                 if let Some(cb) = self.on_block_processed {
                     let hash_bytes = block_hash.as_byte_array();
@@ -831,6 +832,7 @@ mod tests {
         callbacks.dispatch(&SyncEvent::BlockProcessed {
             block_hash: BlockHash::from_byte_array([7u8; 32]),
             height: 100,
+            wallets: BTreeSet::new(),
             new_addresses,
             confirmed_txids: vec![Txid::from_byte_array([9u8; 32])],
         });
