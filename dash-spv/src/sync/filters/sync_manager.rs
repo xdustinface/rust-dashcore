@@ -42,7 +42,7 @@ impl<
     fn clear_in_flight_state(&mut self) {
         self.active_batches.clear();
         self.blocks_remaining.clear();
-        self.filters_matched.clear();
+        self.matched_block_hashes.clear();
         self.pending_batches.clear();
         self.filter_pipeline = FiltersPipeline::new();
     }
@@ -161,7 +161,6 @@ impl<
             } => {
                 // Check if this block is part of our tracked blocks
                 if let Some((_, batch_start)) = self.blocks_remaining.remove(block_hash) {
-                    // Decrement this batch's pending_blocks count
                     if let Some(batch) = self.active_batches.get_mut(&batch_start) {
                         batch.decrement_pending_blocks();
                         tracing::debug!(
@@ -173,16 +172,16 @@ impl<
                         );
                     }
 
-                    // Collect new addresses in the batch for deferred rescan at commit time.
-                    // This batches rescans for efficiency and ensures all blocks from
-                    // a BlocksNeeded event are processed before triggering new rescans.
-                    if !new_addresses.is_empty() {
+                    // Collect per-wallet new addresses for deferred rescan at commit time.
+                    for (wallet_id, addrs) in new_addresses {
+                        if addrs.is_empty() {
+                            continue;
+                        }
                         if let Some(batch) = self.active_batches.get_mut(&batch_start) {
-                            batch.add_addresses(new_addresses.iter().cloned());
+                            batch.add_addresses_for_wallet(*wallet_id, addrs.iter().cloned());
                         }
                     }
 
-                    // Try to commit/scan/create batches
                     return self.try_process_batch().await;
                 }
             }
@@ -194,6 +193,30 @@ impl<
     }
 
     async fn tick(&mut self, requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
+        // Detect a wallet that was added behind our scan progress and rescan
+        // from its `synced_height`. Reset committed_height to the lowest
+        // synced_height across the stale wallets only, so already-synced
+        // wallets are not re-scanned from scratch.
+        if matches!(self.state(), SyncState::Syncing | SyncState::Synced | SyncState::WaitForEvents)
+        {
+            let committed = self.progress.committed_height();
+            let wallet_read = self.wallet.read().await;
+            let behind = wallet_read.wallets_behind(committed);
+            let stale_min_synced =
+                behind.iter().map(|id| wallet_read.wallet_synced_height(id)).min();
+            drop(wallet_read);
+            if let Some(stale_min_synced) = stale_min_synced {
+                tracing::info!(
+                    "Wallet synced_height {} fell below filter committed_height {}, restarting scan",
+                    stale_min_synced,
+                    committed
+                );
+                self.clear_in_flight_state();
+                self.progress.update_committed_height(stale_min_synced);
+                return self.start_download(requests).await;
+            }
+        }
+
         // TODO: Get rid of the send pending in here? Or decouple it from the header storage?
         // Run tick when Syncing OR when Synced with pending work (new blocks arriving)
         let has_pending_work = !self.active_batches.is_empty();
