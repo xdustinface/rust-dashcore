@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use dashcore::bip158::BlockFilter;
-use dashcore::{Address, BlockHash};
+use dashcore::Address;
 
 use super::batch::FiltersBatch;
+use super::block_match_tracker::{BlockMatchTracker, BlockTrackResult};
 use super::pipeline::FiltersPipeline;
 use crate::error::SyncResult;
 use crate::network::RequestSender;
@@ -66,40 +67,11 @@ pub struct FiltersManager<
     pub(super) active_batches: BTreeMap<u32, FiltersBatch>,
     /// Current block height being processed (for progress tracking).
     processing_height: u32,
-    /// Blocks remaining that need to be processed.
-    /// Maps block_hash -> (height, batch_start) for batch association.
-    pub(super) blocks_remaining: BTreeMap<BlockHash, (u32, u32)>,
-    /// Per-(height, hash) record of which wallets have already had this block
-    /// applied to their state, populated from `BlockProcessed`. Lets a
-    /// runtime-added wallet still receive a block that was previously
-    /// processed for another wallet only: the gate is per-wallet, not global.
-    /// Keyed by height so commit-time pruning is one `split_off` call. Bounded
-    /// by matches inside the active batch window since `try_commit_batches`
-    /// drops everything at or below the new committed height.
-    pub(super) processed_blocks_per_wallet: BTreeMap<u32, HashMap<BlockHash, BTreeSet<WalletId>>>,
-}
-
-/// Result of recording a filter match for a block against a candidate wallet
-/// set. The wallet set carried by `NewlyTracked` and `InFlight` is the
-/// residual after subtracting wallets that have already had this block
-/// processed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlockTrackResult {
-    /// Block was newly tracked for the residual wallets. Caller should emit a
-    /// `BlocksNeeded` event with this set and account for the block in the
-    /// batch's `pending_blocks` count.
-    NewlyTracked {
-        wallets: BTreeSet<WalletId>,
-    },
-    /// Block is already in flight. Caller should still emit a `BlocksNeeded`
-    /// event with the residual wallets so the `BlocksPipeline` merges them
-    /// into the pending wallet set, but must NOT increment the batch's
-    /// `pending_blocks` count (already counted on first match).
-    InFlight {
-        wallets: BTreeSet<WalletId>,
-    },
-    /// All candidate wallets already have this block applied. Caller skips it.
-    AlreadyProcessed,
+    /// Per-block tracking state for matched blocks: in-flight blocks awaiting
+    /// `BlockProcessed` and the per-wallet record of which wallets already
+    /// have a given processed block applied. See `BlockMatchTracker` for the
+    /// full lifecycle.
+    pub(super) tracker: BlockMatchTracker,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -143,72 +115,16 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             // Multi-batch processing
             active_batches: BTreeMap::new(),
             processing_height: 0,
-            blocks_remaining: BTreeMap::new(),
-            processed_blocks_per_wallet: BTreeMap::new(),
+            tracker: BlockMatchTracker::new(),
         }
     }
 
     /// Returns true if there is no in-flight processing state.
     fn is_idle(&self) -> bool {
         self.active_batches.is_empty()
-            && self.blocks_remaining.is_empty()
-            && self.processed_blocks_per_wallet.is_empty()
+            && self.tracker.is_empty()
             && self.pending_batches.is_empty()
             && self.filter_pipeline.is_idle()
-    }
-
-    /// Wallets that have already had this block applied to their state.
-    fn already_processed_wallets(&self, key: &FilterMatchKey) -> BTreeSet<WalletId> {
-        self.processed_blocks_per_wallet
-            .get(&key.height())
-            .and_then(|m| m.get(key.hash()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Track a filter match for a block against a candidate wallet set,
-    /// returning only the wallets that still need the block applied. See
-    /// `BlockTrackResult` for per-case caller responsibilities.
-    fn track_block_match(
-        &mut self,
-        key: &FilterMatchKey,
-        batch_start: u32,
-        candidate_wallets: BTreeSet<WalletId>,
-    ) -> BlockTrackResult {
-        let processed = self.already_processed_wallets(key);
-        let residual: BTreeSet<WalletId> =
-            candidate_wallets.difference(&processed).copied().collect();
-        if residual.is_empty() {
-            return BlockTrackResult::AlreadyProcessed;
-        }
-        if self.blocks_remaining.contains_key(key.hash()) {
-            return BlockTrackResult::InFlight {
-                wallets: residual,
-            };
-        }
-        self.blocks_remaining.insert(*key.hash(), (key.height(), batch_start));
-        BlockTrackResult::NewlyTracked {
-            wallets: residual,
-        }
-    }
-
-    /// Record that `wallets` have had the block at `(height, hash)` applied to
-    /// their state. Idempotent: existing entries merge, never shrink.
-    pub(super) fn record_processed_for_wallets(
-        &mut self,
-        height: u32,
-        hash: BlockHash,
-        wallets: &BTreeSet<WalletId>,
-    ) {
-        if wallets.is_empty() {
-            return;
-        }
-        self.processed_blocks_per_wallet
-            .entry(height)
-            .or_default()
-            .entry(hash)
-            .or_default()
-            .extend(wallets.iter().copied());
     }
 
     async fn load_filters(
@@ -592,8 +508,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             // new committed_height a new wallet can only get here via the
             // `tick` rescan trigger, which already wipes the map via
             // `clear_in_flight_state`, so older entries can never be consulted.
-            self.processed_blocks_per_wallet =
-                self.processed_blocks_per_wallet.split_off(&(end + 1));
+            self.tracker.prune_at_or_below(end);
             self.processing_height = end + 1;
 
             tracing::info!(
@@ -738,7 +653,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             self.progress.add_matched(block_to_wallets.len() as u32);
         }
         for (key, wallets) in block_to_wallets {
-            match self.track_block_match(&key, batch_start, wallets) {
+            match self.tracker.track(&key, batch_start, wallets) {
                 BlockTrackResult::NewlyTracked {
                     wallets,
                 } => {
@@ -916,7 +831,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         let mut blocks_needed: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
         let mut new_blocks_count = 0;
         for (key, wallets) in block_to_wallets {
-            match self.track_block_match(&key, batch_start, wallets) {
+            match self.tracker.track(&key, batch_start, wallets) {
                 BlockTrackResult::NewlyTracked {
                     wallets,
                 } => {
@@ -1553,8 +1468,8 @@ mod tests {
         manager.active_batches.insert(0, batch);
         manager.progress.update_stored_height(99);
 
-        // Pre-seed `blocks_remaining` so `track_block_match` returns InFlight.
-        manager.blocks_remaining.insert(*key_40.hash(), (40, 0));
+        // Pre-seed the tracker so `tracker.track` returns InFlight.
+        manager.tracker.track(&key_40, 0, BTreeSet::from([wallet_id]));
 
         let events = manager.scan_batch(0).await.unwrap();
 
@@ -1605,8 +1520,8 @@ mod tests {
         manager.progress.update_stored_height(99);
 
         // Pre-record processing for the only candidate wallet so the residual
-        // is empty and `track_block_match` returns `AlreadyProcessed`.
-        manager.record_processed_for_wallets(40, *key_40.hash(), &BTreeSet::from([wallet_id]));
+        // is empty and `tracker.track` returns `AlreadyProcessed`.
+        manager.tracker.record_processed(40, *key_40.hash(), &BTreeSet::from([wallet_id]));
 
         let events = manager.scan_batch(0).await.unwrap();
         let has_blocks_needed = events.iter().any(|e| matches!(e, SyncEvent::BlocksNeeded { .. }));
@@ -1659,7 +1574,7 @@ mod tests {
 
         // The early wallet has already had this block applied. The late
         // wallet has not. Both wallets' addresses match the filter at 40.
-        manager.record_processed_for_wallets(40, *key_40.hash(), &BTreeSet::from([early]));
+        manager.tracker.record_processed(40, *key_40.hash(), &BTreeSet::from([early]));
 
         let events = manager.scan_batch(0).await.unwrap();
         let blocks = events
@@ -1690,8 +1605,10 @@ mod tests {
         let wallet_id: WalletId = [0xFA; 32];
         let hash_in = dashcore::block::Header::dummy(0).block_hash();
         let hash_out = dashcore::block::Header::dummy(1).block_hash();
-        manager.record_processed_for_wallets(2500, hash_in, &BTreeSet::from([wallet_id]));
-        manager.record_processed_for_wallets(7500, hash_out, &BTreeSet::from([wallet_id]));
+        let key_in = FilterMatchKey::new(2500, hash_in);
+        let key_out = FilterMatchKey::new(7500, hash_out);
+        manager.tracker.record_processed(2500, hash_in, &BTreeSet::from([wallet_id]));
+        manager.tracker.record_processed(7500, hash_out, &BTreeSet::from([wallet_id]));
 
         // Batch 0..=4999 is ready to commit; pruning drops the 2500 entry but
         // keeps the 7500 entry which sits above the new committed_height.
@@ -1704,8 +1621,17 @@ mod tests {
         manager.try_commit_batches().await.unwrap();
 
         assert_eq!(manager.progress.committed_height(), 4999);
-        assert!(!manager.processed_blocks_per_wallet.contains_key(&2500));
-        assert!(manager.processed_blocks_per_wallet.contains_key(&7500));
+        // The 2500 record is gone: a fresh `track` for the same wallet
+        // re-tracks the block instead of returning `AlreadyProcessed`.
+        assert!(matches!(
+            manager.tracker.track(&key_in, 0, BTreeSet::from([wallet_id])),
+            BlockTrackResult::NewlyTracked { .. }
+        ));
+        // The 7500 record survives above the committed height.
+        assert_eq!(
+            manager.tracker.track(&key_out, 0, BTreeSet::from([wallet_id])),
+            BlockTrackResult::AlreadyProcessed
+        );
     }
 
     /// `tick` rescan with a wallet that has a non-zero `synced_height`: the
@@ -1826,16 +1752,17 @@ mod tests {
         let mut manager = create_test_manager().await;
         manager.set_state(SyncState::Syncing);
 
-        // Add blocks from different batches
+        let wallet: WalletId = [1; 32];
         let hash1 = dashcore::block::Header::dummy(0).block_hash();
         let hash2 = dashcore::block::Header::dummy(1).block_hash();
 
-        manager.blocks_remaining.insert(hash1, (100, 0)); // batch 0
-        manager.blocks_remaining.insert(hash2, (5100, 5000)); // batch 5000
+        // Track blocks from two different batches.
+        manager.tracker.track(&FilterMatchKey::new(100, hash1), 0, BTreeSet::from([wallet]));
+        manager.tracker.track(&FilterMatchKey::new(5100, hash2), 5000, BTreeSet::from([wallet]));
 
-        // Verify batch association
-        assert_eq!(manager.blocks_remaining.get(&hash1), Some(&(100, 0)));
-        assert_eq!(manager.blocks_remaining.get(&hash2), Some(&(5100, 5000)));
+        // Each block round-trips its (height, batch_start) on `finish_in_flight`.
+        assert_eq!(manager.tracker.finish_in_flight(&hash1), Some((100, 0)));
+        assert_eq!(manager.tracker.finish_in_flight(&hash2), Some((5100, 5000)));
     }
 
     #[tokio::test]
@@ -1846,56 +1773,58 @@ mod tests {
         let wallet_a: WalletId = [0xA1; 32];
         let wallet_b: WalletId = [0xB2; 32];
 
-        // First match for {A}: nothing tracked yet, helper inserts blocks_remaining.
+        // First match for {A}: nothing tracked yet, helper records the block.
         assert_eq!(
-            manager.track_block_match(&key, 0, BTreeSet::from([wallet_a])),
+            manager.tracker.track(&key, 0, BTreeSet::from([wallet_a])),
             BlockTrackResult::NewlyTracked {
                 wallets: BTreeSet::from([wallet_a])
             }
         );
-        assert_eq!(manager.blocks_remaining.get(&hash), Some(&(100, 0)));
 
         // Second match for {A} while still in flight: residual is {A} (no
         // processing has been recorded yet), so InFlight re-emits to merge
         // late-arriving wallet ids into the pipeline's pending set.
         assert_eq!(
-            manager.track_block_match(&key, 0, BTreeSet::from([wallet_a])),
+            manager.tracker.track(&key, 0, BTreeSet::from([wallet_a])),
             BlockTrackResult::InFlight {
                 wallets: BTreeSet::from([wallet_a])
             }
         );
 
-        // Block is delivered and processed for {A}. Record it.
-        manager.blocks_remaining.remove(&hash);
-        manager.record_processed_for_wallets(100, hash, &BTreeSet::from([wallet_a]));
+        // Block is delivered and processed for {A}. Round-trip the (height,
+        // batch_start) tuple while removing the in-flight entry, then record
+        // the processing.
+        assert_eq!(manager.tracker.finish_in_flight(&hash), Some((100, 0)));
+        manager.tracker.record_processed(100, hash, &BTreeSet::from([wallet_a]));
 
         // Late-added wallet B's filter matches the same block. A is already
         // processed, B is not — residual is {B} and it gets re-queued via
         // NewlyTracked so the block reloads from storage and applies for B
         // only.
         assert_eq!(
-            manager.track_block_match(&key, 5000, BTreeSet::from([wallet_a, wallet_b])),
+            manager.tracker.track(&key, 5000, BTreeSet::from([wallet_a, wallet_b])),
             BlockTrackResult::NewlyTracked {
                 wallets: BTreeSet::from([wallet_b])
             }
         );
-        assert_eq!(manager.blocks_remaining.get(&hash), Some(&(100, 5000)));
+        assert_eq!(manager.tracker.finish_in_flight(&hash), Some((100, 5000)));
 
         // After B is also processed, a third match including only A and B
         // returns AlreadyProcessed since both are covered.
-        manager.blocks_remaining.remove(&hash);
-        manager.record_processed_for_wallets(100, hash, &BTreeSet::from([wallet_b]));
+        manager.tracker.record_processed(100, hash, &BTreeSet::from([wallet_b]));
         assert_eq!(
-            manager.track_block_match(&key, 5000, BTreeSet::from([wallet_a, wallet_b])),
+            manager.tracker.track(&key, 5000, BTreeSet::from([wallet_a, wallet_b])),
             BlockTrackResult::AlreadyProcessed
         );
-        assert!(!manager.blocks_remaining.contains_key(&hash));
+        assert!(manager.tracker.finish_in_flight(&hash).is_none());
     }
 
     #[tokio::test]
     async fn test_is_idle() {
         let mut manager = create_test_manager().await;
         let hash = dashcore::block::Header::dummy(0).block_hash();
+        let key = FilterMatchKey::new(100, hash);
+        let wallet_id: WalletId = [0xCC; 32];
 
         // Fresh manager is idle
         assert!(manager.is_idle());
@@ -1905,14 +1834,13 @@ mod tests {
         assert!(!manager.is_idle());
         manager.active_batches.clear();
 
-        manager.blocks_remaining.insert(hash, (0, 0));
+        manager.tracker.track(&key, 0, BTreeSet::from([wallet_id]));
         assert!(!manager.is_idle());
-        manager.blocks_remaining.clear();
+        manager.tracker.clear();
 
-        let wallet_id: WalletId = [0xCC; 32];
-        manager.record_processed_for_wallets(100, hash, &BTreeSet::from([wallet_id]));
+        manager.tracker.record_processed(100, hash, &BTreeSet::from([wallet_id]));
         assert!(!manager.is_idle());
-        manager.processed_blocks_per_wallet.clear();
+        manager.tracker.clear();
 
         manager.pending_batches.insert(FiltersBatch::new(0, 999, HashMap::new()));
         assert!(!manager.is_idle());
@@ -1924,8 +1852,8 @@ mod tests {
 
         // Populate all fields, then clear_in_flight_state restores idleness
         manager.active_batches.insert(0, FiltersBatch::new(0, 999, HashMap::new()));
-        manager.blocks_remaining.insert(hash, (0, 0));
-        manager.record_processed_for_wallets(100, hash, &BTreeSet::from([wallet_id]));
+        manager.tracker.track(&key, 0, BTreeSet::from([wallet_id]));
+        manager.tracker.record_processed(100, hash, &BTreeSet::from([wallet_id]));
         manager.pending_batches.insert(FiltersBatch::new(1000, 1999, HashMap::new()));
         manager.filter_pipeline.init(2000, 2999);
         assert!(!manager.is_idle());
@@ -2141,7 +2069,8 @@ mod tests {
         // Pre-populate in-flight state so we can verify clear_in_flight_state runs.
         manager.active_batches.insert(101, FiltersBatch::new(101, 200, HashMap::new()));
         let stale_hash = dashcore::block::Header::dummy(0).block_hash();
-        manager.record_processed_for_wallets(150, stale_hash, &BTreeSet::from([MOCK_WALLET_ID]));
+        let stale_key = FilterMatchKey::new(150, stale_hash);
+        manager.tracker.record_processed(150, stale_hash, &BTreeSet::from([MOCK_WALLET_ID]));
         manager.filter_pipeline.init(101, 200);
 
         // MockWallet defaults to synced_height=0, so wallets_behind(100) = {MOCK_WALLET_ID}.
@@ -2150,16 +2079,28 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let requests = RequestSender::new(tx);
 
-        // Sanity: the pre-populated stale processed record is present.
-        assert!(manager.processed_blocks_per_wallet.contains_key(&150));
+        // Sanity: the pre-populated stale processed record is present, so
+        // `track` for the same wallet would short-circuit to AlreadyProcessed.
+        assert_eq!(
+            manager.tracker.track(&stale_key, 0, BTreeSet::from([MOCK_WALLET_ID])),
+            BlockTrackResult::AlreadyProcessed
+        );
+        // Undo the side effect of the probing `track` so the original
+        // processed record is the only state present going into `tick`.
+        manager.tracker.clear();
+        manager.tracker.record_processed(150, stale_hash, &BTreeSet::from([MOCK_WALLET_ID]));
 
         let events = manager.tick(&requests).await.unwrap();
 
         // Old in-flight state was cleared and a fresh batch was created at scan_start=0.
         assert!(!manager.active_batches.contains_key(&101));
         assert!(manager.active_batches.contains_key(&0));
-        // The stale pre-populated record was wiped by `clear_in_flight_state`.
-        assert!(!manager.processed_blocks_per_wallet.contains_key(&150));
+        // The stale pre-populated record was wiped by `clear_in_flight_state`:
+        // a fresh `track` for the same wallet now returns `NewlyTracked`.
+        assert!(matches!(
+            manager.tracker.track(&stale_key, 0, BTreeSet::from([MOCK_WALLET_ID])),
+            BlockTrackResult::NewlyTracked { .. }
+        ));
 
         // start_download set committed_height to scan_start - 1 = 0.
         assert_eq!(manager.progress.committed_height(), 0);
