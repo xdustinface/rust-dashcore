@@ -76,19 +76,26 @@ impl BlocksPipeline {
     /// Queue blocks with their heights and per-block interested wallet sets.
     ///
     /// Each entry's wallet set is the union of wallets whose addresses matched
-    /// the filter for that block. If the block is already tracked (pending or
-    /// in flight) we only merge the new wallet ids into the existing set so a
-    /// late-discovered wallet still gets the block processed when it arrives.
-    /// Re-enqueueing a tracked hash would corrupt the coordinator's pending
-    /// count and cause a duplicate request to the peer.
+    /// the filter for that block. If the block is already tracked (pending,
+    /// in flight, or downloaded but not yet consumed) we only merge the new
+    /// wallet ids into the existing set so a late-discovered wallet still gets
+    /// the block processed when it arrives. Re-enqueueing a tracked hash would
+    /// corrupt the coordinator's pending count and cause a duplicate request
+    /// to the peer.
     pub(super) fn queue(
         &mut self,
         blocks: impl IntoIterator<Item = (FilterMatchKey, BTreeSet<WalletId>)>,
     ) {
         for (key, wallets) in blocks {
             let hash = *key.hash();
-            let is_new = !self.hash_to_height.contains_key(&hash);
-            if is_new {
+            // `hash_to_height` is removed in `receive_block` once the block
+            // lands in `downloaded`, so it alone does not cover the
+            // downloaded-but-not-yet-taken window. `hash_to_wallets` persists
+            // across that window until `take_next_ordered_block` consumes the
+            // block, which makes it the right sentinel to also check.
+            let already_tracked =
+                self.hash_to_height.contains_key(&hash) || self.hash_to_wallets.contains_key(&hash);
+            if !already_tracked {
                 self.coordinator.enqueue([hash]);
                 self.pending_heights.insert(key.height());
                 self.hash_to_height.insert(hash, key.height());
@@ -520,6 +527,41 @@ mod tests {
 
         // Late wallet ids are still merged for when the block arrives.
         assert!(pipeline.receive_block(&block));
+        let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
+        let mut expected = wallets_a;
+        expected.extend(wallets_b);
+        assert_eq!(taken_wallets, expected);
+    }
+
+    #[test]
+    fn test_queue_does_not_re_enqueue_downloaded_hash() {
+        // A late-arriving wallet match for a block already received and sitting
+        // in `downloaded` (but not yet consumed by `take_next_ordered_block`)
+        // must merge the wallet id without re-enqueueing the hash.
+        // `receive_block` removes `hash_to_height`, so without also checking
+        // `hash_to_wallets` the queue would push the hash back to the
+        // coordinator and cause a duplicate request.
+        let mut pipeline = BlocksPipeline::new();
+        let block = make_test_block(1);
+        let hash = block.block_hash();
+        let wallets_a: BTreeSet<WalletId> = BTreeSet::from([[1u8; 32]]);
+        let wallets_b: BTreeSet<WalletId> = BTreeSet::from([[2u8; 32]]);
+
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_a.clone())]);
+        let hashes = pipeline.coordinator.take_pending(1);
+        pipeline.coordinator.mark_sent(&hashes);
+        assert!(pipeline.receive_block(&block));
+        assert_eq!(pipeline.downloaded.len(), 1);
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+
+        // Late-arriving match for the same hash must not re-enqueue.
+        pipeline.queue([(FilterMatchKey::new(100, hash), wallets_b.clone())]);
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+        assert_eq!(pipeline.downloaded.len(), 1);
+
+        // Late wallet ids are still merged for when the block is taken.
         let (_, _, taken_wallets) = pipeline.take_next_ordered_block().unwrap();
         let mut expected = wallets_a;
         expected.extend(wallets_b);
