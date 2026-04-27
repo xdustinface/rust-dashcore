@@ -780,7 +780,14 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 // Attribute the union match to the wallets whose own
                 // scripts hit this block's filter. Probabilistic false
                 // positives in the union pass are filtered out here too.
-                let filter = batch_filters.get(&key).expect("matched key was in batch filters");
+                let Some(filter) = batch_filters.get(&key) else {
+                    tracing::warn!(
+                        "skipping unmatched filter key at height {}: hash {}",
+                        key.height(),
+                        key.hash()
+                    );
+                    continue;
+                };
                 for (wallet_id, wallet_synced, addresses) in &wallet_states {
                     if key.height() <= *wallet_synced {
                         continue;
