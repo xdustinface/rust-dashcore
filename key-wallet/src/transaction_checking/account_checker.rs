@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use super::transaction_router::AccountTypeToCheck;
-use crate::account::{AccountType, ManagedAccountCollection, ManagedCoreAccount};
+use crate::account::{ManagedAccountCollection, ManagedCoreAccount};
 use crate::managed_account::address_pool::{AddressInfo, PublicKeyType};
 use crate::managed_account::managed_account_type::ManagedAccountType;
 use crate::managed_account::transaction_record::TransactionRecord;
@@ -46,14 +46,15 @@ pub struct TransactionCheckResult {
     pub total_received_for_credit_conversion: u64,
     /// New addresses generated during gap limit maintenance
     pub new_addresses: Vec<Address>,
-    /// Transaction records created for new transactions, paired with the
-    /// `AccountType` they belong to. Conversion to a `DerivationPath` is
-    /// performed by the consumer (e.g. `key-wallet-manager`) where the network
-    /// is known.
-    pub new_records: Vec<(AccountType, TransactionRecord)>,
+    /// Transaction records created for new transactions. Each record carries
+    /// its owning [`AccountType`](crate::account::AccountType) on
+    /// `record.account_type`, so consumers can recover it without an external
+    /// pairing.
+    pub new_records: Vec<TransactionRecord>,
     /// Transaction records updated by this check (confirmation or IS-lock
-    /// applied to a previously stored record), paired with their `AccountType`.
-    pub updated_records: Vec<(AccountType, TransactionRecord)>,
+    /// applied to a previously stored record). Each record carries its owning
+    /// `AccountType` on `record.account_type`.
+    pub updated_records: Vec<TransactionRecord>,
 }
 
 /// Enum representing the type of Core account that matched with embedded data

@@ -526,6 +526,7 @@ impl ManagedCoreAccount {
 
         let tx_record = TransactionRecord::new(
             tx.clone(),
+            self.account_type.to_account_type(),
             context.clone(),
             transaction_type,
             direction,
@@ -1324,7 +1325,7 @@ impl<'de> Deserialize<'de> for ManagedCoreAccount {
             utxos: BTreeMap<OutPoint, Utxo>,
         }
 
-        let helper = Helper::deserialize(deserializer)?;
+        let mut helper = Helper::deserialize(deserializer)?;
 
         let spent_outpoints = helper
             .transactions
@@ -1332,6 +1333,14 @@ impl<'de> Deserialize<'de> for ManagedCoreAccount {
             .flat_map(|record| &record.transaction.input)
             .map(|input| input.previous_output)
             .collect();
+
+        // `TransactionRecord::account_type` is transient (skipped during
+        // serialization, defaulted on load). Repopulate it from the owning
+        // account so consumers see the correct account on every record.
+        let account_type = helper.account_type.to_account_type();
+        for record in helper.transactions.values_mut() {
+            record.account_type = account_type;
+        }
 
         Ok(ManagedCoreAccount {
             account_type: helper.account_type,

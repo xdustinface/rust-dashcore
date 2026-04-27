@@ -3,6 +3,7 @@
 //! This module contains the transaction record structure used to track
 //! transactions associated with accounts.
 
+use crate::account::AccountType;
 use crate::error::Error;
 use crate::transaction_checking::transaction_router::TransactionType;
 use crate::transaction_checking::{BlockInfo, TransactionContext};
@@ -11,6 +12,18 @@ use dashcore::blockdata::transaction::Transaction;
 use dashcore::Txid;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// Sentinel `AccountType` used as the deserialization default for
+/// [`TransactionRecord::account_type`]. Records always live inside a
+/// [`ManagedCoreAccount`](crate::managed_account::ManagedCoreAccount), and the
+/// owning account overwrites this sentinel after deserialization with its
+/// own `account_type`. The on-disk format therefore does not need to encode
+/// this field. The variant chosen here has no associated data so it is cheap
+/// to construct and serializes/encodes deterministically.
+#[cfg(feature = "serde")]
+fn default_account_type() -> AccountType {
+    AccountType::IdentityRegistration
+}
 
 /// Maximum length of a transaction label in bytes.
 pub const MAX_LABEL_LENGTH: usize = 256;
@@ -72,6 +85,12 @@ pub enum TransactionDirection {
 }
 
 /// Transaction record with full details
+///
+/// The `account_type` field identifies the owning account and is *not*
+/// persisted: records are always stored inside a
+/// [`ManagedCoreAccount`](crate::managed_account::ManagedCoreAccount), and the
+/// owning account repopulates the field after deserialization with its own
+/// `account_type`. See [`default_account_type`] for the serde default sentinel.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TransactionRecord {
@@ -79,6 +98,10 @@ pub struct TransactionRecord {
     pub transaction: Transaction,
     /// Transaction ID
     pub txid: Txid,
+    /// Account this record belongs to. Transient: skipped during
+    /// (de)serialization and repopulated by the owning account on load.
+    #[cfg_attr(feature = "serde", serde(skip, default = "default_account_type"))]
+    pub account_type: AccountType,
     /// The context in which this transaction was last seen
     pub context: TransactionContext,
     /// Classification of the transaction type
@@ -98,9 +121,16 @@ pub struct TransactionRecord {
 }
 
 impl TransactionRecord {
-    /// Create a new transaction record with the given context
+    /// Create a new transaction record with the given context.
+    ///
+    /// `account_type` identifies the owning account. The record stores it
+    /// in-memory only — it is not persisted, since records always live inside
+    /// a [`ManagedCoreAccount`](crate::managed_account::ManagedCoreAccount)
+    /// that re-populates the field on load.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transaction: Transaction,
+        account_type: AccountType,
         context: TransactionContext,
         transaction_type: TransactionType,
         direction: TransactionDirection,
@@ -111,6 +141,7 @@ impl TransactionRecord {
         let txid = transaction.txid();
         Self {
             txid,
+            account_type,
             transaction,
             context,
             transaction_type,
@@ -194,8 +225,16 @@ impl TransactionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::StandardAccountType;
     use dashcore::hashes::Hash;
     use dashcore::BlockHash;
+
+    fn test_account_type() -> AccountType {
+        AccountType::Standard {
+            index: 0,
+            standard_account_type: StandardAccountType::BIP44Account,
+        }
+    }
 
     fn test_block_context(height: u32) -> TransactionContext {
         TransactionContext::InBlock(BlockInfo::new(height, BlockHash::all_zeros(), 1234567890))
@@ -208,6 +247,7 @@ mod tests {
     ) -> TransactionRecord {
         TransactionRecord::new(
             tx,
+            test_account_type(),
             context,
             TransactionType::Standard,
             TransactionDirection::Incoming,
@@ -264,6 +304,7 @@ mod tests {
 
         let outgoing = TransactionRecord::new(
             tx.clone(),
+            test_account_type(),
             TransactionContext::Mempool,
             TransactionType::Standard,
             TransactionDirection::Outgoing,
@@ -277,6 +318,7 @@ mod tests {
 
         let internal = TransactionRecord::new(
             tx.clone(),
+            test_account_type(),
             TransactionContext::Mempool,
             TransactionType::Standard,
             TransactionDirection::Internal,
@@ -289,6 +331,7 @@ mod tests {
 
         let coinjoin = TransactionRecord::new(
             tx,
+            test_account_type(),
             TransactionContext::Mempool,
             TransactionType::CoinJoin,
             TransactionDirection::CoinJoin,

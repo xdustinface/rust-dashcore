@@ -41,9 +41,9 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 
             for (wallet_id, records) in check_result.per_wallet_new_records {
                 let entry = per_wallet_changes.entry(wallet_id).or_default();
-                for (account_type, record) in records {
+                for record in records {
                     entry.push(RecordChange {
-                        account_type,
+                        account_type: record.account_type,
                         action: RecordAction::Inserted,
                         record,
                     });
@@ -51,9 +51,9 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             }
             for (wallet_id, records) in check_result.per_wallet_updated_records {
                 let entry = per_wallet_changes.entry(wallet_id).or_default();
-                for (account_type, record) in records {
+                for record in records {
                     entry.push(RecordChange {
-                        account_type,
+                        account_type: record.account_type,
                         action: RecordAction::Updated,
                         record,
                     });
@@ -121,11 +121,11 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 continue;
             };
             let balance = info.balance();
-            for (account_type, record) in records {
+            for record in records {
                 let event = WalletEvent::TransactionReceived {
                     wallet_id,
                     change: Box::new(RecordChange {
-                        account_type,
+                        account_type: record.account_type,
                         action: RecordAction::Inserted,
                         record,
                     }),

@@ -81,12 +81,13 @@ pub struct CheckTransactionsResult {
     pub total_sent: u64,
     /// Addresses involved across all wallets
     pub involved_addresses: Vec<Address>,
-    /// Records newly recorded by this check, grouped by wallet. Each entry
-    /// pairs the source `AccountType` with the full record.
-    pub per_wallet_new_records: BTreeMap<WalletId, Vec<(AccountType, TransactionRecord)>>,
+    /// Records newly recorded by this check, grouped by wallet. Each record
+    /// carries its owning `AccountType` on `record.account_type`.
+    pub per_wallet_new_records: BTreeMap<WalletId, Vec<TransactionRecord>>,
     /// Records whose state was updated by this check (confirmation or
     /// InstantSend lock on a previously stored record), grouped by wallet.
-    pub per_wallet_updated_records: BTreeMap<WalletId, Vec<(AccountType, TransactionRecord)>>,
+    /// Each record carries its owning `AccountType` on `record.account_type`.
+    pub per_wallet_updated_records: BTreeMap<WalletId, Vec<TransactionRecord>>,
 }
 
 /// High-level wallet manager that manages multiple wallets
