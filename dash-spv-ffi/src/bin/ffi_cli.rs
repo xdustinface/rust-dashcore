@@ -167,10 +167,10 @@ fn short_wallet(wallet_id: *const c_char) -> String {
 
 fn read_balance(balance: *const FFIBalance) -> FFIBalance {
     if balance.is_null() {
-        FFIBalance::default()
-    } else {
-        unsafe { *balance }
+        tracing::warn!("read_balance: null pointer, returning zero balance");
+        return FFIBalance::default();
     }
+    unsafe { *balance }
 }
 
 extern "C" fn on_mempool_transaction_received(

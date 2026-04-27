@@ -420,6 +420,12 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         // avoiding masking by any `Updated` that might appear during initial
         // sync.
         let block_actions = tracker.block_record_actions.lock().unwrap();
+        assert!(
+            block_actions.len() >= block_records_before as usize,
+            "block_record_actions length ({}) < block_records_before ({}): counter/vector mismatch",
+            block_actions.len(),
+            block_records_before
+        );
         let new_actions = &block_actions[block_records_before as usize..];
         assert!(
             new_actions.contains(&FFIRecordAction::Updated),

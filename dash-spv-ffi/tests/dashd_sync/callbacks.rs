@@ -394,8 +394,11 @@ extern "C" fn on_mempool_transaction_received(
     }
     let path_str = unsafe { cstr_or_unknown(account_path) };
     tracker.mempool_account_paths.lock().unwrap_or_else(|e| e.into_inner()).push(path_str.clone());
-    tracker.mempool_transaction_received_count.fetch_add(1, Ordering::SeqCst);
+    // Store the balance before bumping the counter so a test that waits on the
+    // counter and then reads `last_unconfirmed` is guaranteed to observe the
+    // balance for the same callback invocation.
     record_balance(tracker, balance);
+    tracker.mempool_transaction_received_count.fetch_add(1, Ordering::SeqCst);
     let wallet_str = unsafe { cstr_or_unknown(wallet_id) };
     tracing::info!("on_mempool_transaction_received: wallet={}, account={}", wallet_str, path_str);
 }
