@@ -106,11 +106,7 @@ fn test_all_callbacks_during_sync() {
         // callback, after all per-record state has been written. Reading the
         // record counter afterwards is therefore guaranteed to see the matching
         // increment.
-        tracker.wait_for_callback(
-            &tracker.block_process_change_count,
-            0,
-            "block_process_change",
-        );
+        tracker.wait_for_callback(&tracker.block_process_change_count, 0, "block_process_change");
 
         // Validate wallet event callbacks (test wallet has transactions)
         let block_records = tracker.block_process_change_record_count.load(Ordering::SeqCst);

@@ -47,8 +47,7 @@ fn test_ffi_sync_then_generate_blocks() {
 
         // Generate a block containing a wallet transaction and wait for sync.
         let cycle_before = ctx.tracker().last_sync_cycle.load(Ordering::SeqCst);
-        let block_changes_before =
-            ctx.tracker().block_process_change_count.load(Ordering::SeqCst);
+        let block_changes_before = ctx.tracker().block_process_change_count.load(Ordering::SeqCst);
         let block_records_before =
             ctx.tracker().block_process_change_record_count.load(Ordering::SeqCst);
         let receive_address = ctx.get_receive_address(&wallet_id);
