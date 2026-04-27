@@ -171,7 +171,7 @@ mod tests {
     };
     use crate::sync::{ManagerIdentifier, SyncEvent, SyncManagerProgress};
     use crate::test_utils::MockNetworkManager;
-    use key_wallet_manager::test_utils::MockWallet;
+    use key_wallet_manager::test_utils::{MockWallet, MOCK_WALLET_ID};
     use key_wallet_manager::FilterMatchKey;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -219,7 +219,7 @@ mod tests {
 
         let block_hash = dashcore::BlockHash::dummy(0);
         let mut blocks = BTreeMap::new();
-        blocks.insert(FilterMatchKey::new(100, block_hash), BTreeSet::new());
+        blocks.insert(FilterMatchKey::new(100, block_hash), BTreeSet::from([MOCK_WALLET_ID]));
         let event = SyncEvent::BlocksNeeded {
             blocks,
         };
@@ -229,5 +229,43 @@ mod tests {
         // Should queue the block
         assert_eq!(manager.state(), SyncState::Syncing);
         assert!(events.is_empty());
+    }
+
+    /// `process_buffered_blocks` must call `process_block_for_wallets` with
+    /// the exact wallet set carried in the pipeline so already-synced
+    /// wallets are not touched by routing logic.
+    #[tokio::test]
+    async fn test_process_buffered_blocks_routes_wallet_set() {
+        use dashcore::block::Header;
+        use dashcore::{Block, TxMerkleNode};
+        use dashcore_hashes::Hash;
+
+        let mut manager = create_test_manager().await;
+        manager.progress.set_state(SyncState::Syncing);
+
+        let header = Header {
+            version: dashcore::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: dashcore::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![],
+        };
+        manager.pipeline.add_from_storage(block.clone(), 100, BTreeSet::from([MOCK_WALLET_ID]));
+
+        let events = manager.process_buffered_blocks().await.unwrap();
+        assert!(matches!(events.first(), Some(SyncEvent::BlockProcessed { .. })));
+
+        // MOCK_WALLET_ID was in the routed set, so MockWallet recorded the
+        // block. (MockWallet::process_block_for_wallets returns early when
+        // its id is absent.)
+        let processed = manager.wallet.read().await.processed_blocks();
+        let processed = processed.lock().await;
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].1, 100);
     }
 }

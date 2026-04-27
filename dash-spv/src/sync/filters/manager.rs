@@ -658,7 +658,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 continue;
             }
             let addresses_vec: Vec<_> = addresses.iter().cloned().collect();
-            let matches = check_compact_filters_for_addresses(batch_filters, addresses_vec);
+            let matches = check_compact_filters_for_addresses(batch_filters, addresses_vec, 0);
             for key in matches {
                 block_to_wallets.entry(key).or_default().insert(*wallet_id);
             }
@@ -734,7 +734,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         // skipped entirely, its addresses never even get tested against these
         // filters.
         let wallet = self.wallet.read().await;
-        let behind = wallet.wallets_not_yet_at(batch_end);
+        let behind = wallet.wallets_behind(batch_end);
         let mut wallet_states: Vec<(WalletId, u32, Vec<Address>)> = Vec::new();
         for wallet_id in &behind {
             let synced = wallet.wallet_synced_height(wallet_id);
@@ -745,15 +745,25 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         }
         drop(wallet);
 
-        // Only wallets that actually contributed addresses to the scan have
-        // had their coverage advanced by this batch. Wallets without any
-        // monitored addresses must not have their `synced_height` bumped at
-        // commit time even though `wallets_not_yet_at` listed them.
-        let scanned_wallets: BTreeSet<WalletId> =
-            wallet_states.iter().map(|(id, _, _)| *id).collect();
+        // Every behind wallet's coverage advances to `batch_end` once this
+        // batch commits. That includes wallets without any monitored
+        // addresses: they have nothing to match against these filters, so the
+        // batch fully accounts for their range and their `synced_height` must
+        // advance to keep `wallets_behind` from listing them on every future
+        // batch.
+        let scanned_wallets: BTreeSet<WalletId> = behind.clone();
+
+        // Record which wallets we're scanning for so the commit phase advances
+        // only their per-wallet `synced_height`. This is recorded even when
+        // there are no addresses to scan, otherwise zero-address wallets would
+        // never make progress.
+        if let Some(batch) = self.active_batches.get_mut(&batch_start) {
+            batch.set_scanned_wallets(scanned_wallets);
+        }
 
         if wallet_states.is_empty() {
-            // Nothing to record on the batch, no scanned wallets to advance.
+            // No addresses to scan, but `scanned_wallets` was still recorded
+            // so any zero-address behind wallets advance at commit.
             tracing::debug!("scan_batch: no behind wallets with monitored addresses");
             return Ok(events);
         }
@@ -761,11 +771,13 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         // Single-pass union-then-attribute: build the union of all addresses
         // across behind wallets, run the filters once, then for each matched
         // block re-test per-wallet scripts to attribute the match correctly.
-        // This avoids cloning the filter map per wallet and re-scanning
-        // overlapping address sets multiple times. Cost reduces from
-        // O(N_wallets * batch_size) to O(batch_size + N_wallets * matches).
+        // The `min_height` parameter on the matching helper skips heights no
+        // behind wallet needs, so we never have to clone the filter map.
+        // Cost reduces from O(N_wallets * batch_size) to
+        // O(batch_size + N_wallets * matches).
         let union_addresses: Vec<Address> =
             wallet_states.iter().flat_map(|(_, _, addrs)| addrs.iter().cloned()).collect();
+        let min_synced = wallet_states.iter().map(|(_, synced, _)| *synced).min().unwrap_or(0);
 
         let block_to_wallets = {
             let Some(batch) = self.active_batches.get(&batch_start) else {
@@ -773,48 +785,41 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             };
             let batch_filters = batch.filters();
 
-            // Project the filter set to heights any behind wallet still needs.
-            let min_synced = wallet_states.iter().map(|(_, synced, _)| *synced).min().unwrap_or(0);
-            let relevant: HashMap<FilterMatchKey, BlockFilter> = batch_filters
-                .iter()
-                .filter(|(key, _)| key.height() > min_synced)
-                .map(|(key, filter)| (key.clone(), filter.clone()))
-                .collect();
-
-            if relevant.is_empty() {
-                BTreeMap::new()
-            } else {
-                let matches = check_compact_filters_for_addresses(&relevant, union_addresses);
-                let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> =
-                    BTreeMap::new();
-                for key in matches {
-                    // Attribute the union match to the wallets whose own
-                    // scripts hit this block's filter. Probabilistic false
-                    // positives in the union pass are filtered out here too.
-                    let filter = relevant.get(&key).expect("matched key was in relevant set");
-                    for (wallet_id, wallet_synced, addresses) in &wallet_states {
-                        if key.height() <= *wallet_synced {
-                            continue;
+            let matches =
+                check_compact_filters_for_addresses(batch_filters, union_addresses, min_synced);
+            let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> =
+                BTreeMap::new();
+            for key in matches {
+                // Attribute the union match to the wallets whose own
+                // scripts hit this block's filter. Probabilistic false
+                // positives in the union pass are filtered out here too.
+                let filter = batch_filters.get(&key).expect("matched key was in batch filters");
+                for (wallet_id, wallet_synced, addresses) in &wallet_states {
+                    if key.height() <= *wallet_synced {
+                        continue;
+                    }
+                    let scripts: Vec<Vec<u8>> =
+                        addresses.iter().map(|a| a.script_pubkey().to_bytes()).collect();
+                    let matched = match filter
+                        .match_any(key.hash(), scripts.iter().map(|v| v.as_slice()))
+                    {
+                        Ok(matched) => matched,
+                        Err(e) => {
+                            tracing::warn!(
+                                "filter match_any error during attribution at height {}: {}; treating as non-match",
+                                key.height(),
+                                e
+                            );
+                            false
                         }
-                        let scripts: Vec<Vec<u8>> =
-                            addresses.iter().map(|a| a.script_pubkey().to_bytes()).collect();
-                        if filter
-                            .match_any(key.hash(), scripts.iter().map(|v| v.as_slice()))
-                            .unwrap_or(false)
-                        {
-                            block_to_wallets.entry(key.clone()).or_default().insert(*wallet_id);
-                        }
+                    };
+                    if matched {
+                        block_to_wallets.entry(key.clone()).or_default().insert(*wallet_id);
                     }
                 }
-                block_to_wallets
             }
+            block_to_wallets
         };
-
-        // Record which wallets we're scanning for so the commit phase advances
-        // only their per-wallet `synced_height`.
-        if let Some(batch) = self.active_batches.get_mut(&batch_start) {
-            batch.set_scanned_wallets(scanned_wallets);
-        }
 
         tracing::info!(
             "Batch {}-{}: found {} matching blocks across {} behind wallets",
@@ -844,7 +849,20 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 BlockTrackResult::InFlight => {
                     blocks_needed.insert(key, wallets);
                 }
-                BlockTrackResult::AlreadyProcessed => {}
+                BlockTrackResult::AlreadyProcessed => {
+                    // Block was processed earlier in this session, before
+                    // these wallets were considered for it (e.g. a wallet
+                    // added at runtime). Re-running `process_block_for_wallets`
+                    // is unsafe because wallet processing is not idempotent,
+                    // so the block stays uncovered until the next restart
+                    // re-fetches it from storage. Surface this so operators
+                    // can see when runtime wallet catch-up is incomplete.
+                    tracing::warn!(
+                        "Skipping already-processed block at height {} for wallets {:?}; restart required to backfill",
+                        key.height(),
+                        wallets
+                    );
+                }
             }
         }
 
@@ -1311,6 +1329,232 @@ mod tests {
         let attr_b = blocks.get(&key_b).expect("entry for wallet_b's match");
         assert!(attr_b.contains(&wallet_b));
         assert!(!attr_b.contains(&wallet_a));
+    }
+
+    /// `scan_batch` for a behind wallet with no monitored addresses still
+    /// records the wallet in `scanned_wallets` so its `synced_height`
+    /// advances at commit. Otherwise zero-address wallets would be listed by
+    /// `wallets_behind` on every batch forever.
+    #[tokio::test]
+    async fn test_scan_batch_advances_zero_address_wallet() {
+        let wallet_id: WalletId = [0xCC; 32];
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(wallet_id, MockWalletState::default());
+        }
+        let mut manager = create_multi_test_manager(multi.clone()).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Batch with one filter at height 50 (irrelevant: wallet has no addresses).
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        let throwaway_address = dashcore::Address::dummy(Network::Regtest, 99);
+        let (key, filter) = filter_for_address(50, &throwaway_address);
+        filters.insert(key, filter);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+        manager.progress.update_stored_height(99);
+
+        let events = manager.scan_batch(0).await.unwrap();
+        assert!(events.is_empty(), "no addresses should mean no BlocksNeeded events");
+
+        // Mark batch ready so commit can run, then commit.
+        if let Some(b) = manager.active_batches.get_mut(&0) {
+            b.set_pending_blocks(0);
+            b.mark_rescan_complete();
+        }
+        manager.try_commit_batches().await.unwrap();
+
+        // Wallet had no addresses, but it was behind, so its synced_height
+        // advances to the batch end after commit.
+        assert_eq!(multi.read().await.wallet_synced_height(&wallet_id), 99);
+    }
+
+    /// `scan_batch` after a runtime-added wallet whose address matches a
+    /// block already in flight must re-emit `BlocksNeeded` so the
+    /// `BlocksPipeline` merges the new wallet id into the pending set.
+    #[tokio::test]
+    async fn test_scan_batch_in_flight_re_emits_for_late_wallet() {
+        let wallet_id: WalletId = [0xDD; 32];
+        let address = dashcore::Address::dummy(Network::Regtest, 7);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![address.clone()],
+                    synced_height: 0,
+                    last_processed_height: 0,
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        // One matching filter at height 40.
+        let (key_40, f_40) = filter_for_address(40, &address);
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        filters.insert(key_40.clone(), f_40);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+        manager.progress.update_stored_height(99);
+
+        // Pre-seed `blocks_remaining` so `track_block_match` returns InFlight.
+        manager.blocks_remaining.insert(*key_40.hash(), (40, 0));
+        manager.matched_block_hashes.insert(*key_40.hash());
+
+        let events = manager.scan_batch(0).await.unwrap();
+
+        let blocks = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("InFlight path must still emit BlocksNeeded for wallet-set merge");
+        let attribution = blocks.get(&key_40).expect("entry for the in-flight block");
+        assert!(attribution.contains(&wallet_id));
+    }
+
+    /// `scan_batch` `AlreadyProcessed` path: a wallet added at runtime whose
+    /// address matches a block that has already been processed in this
+    /// session is silently skipped (no `BlocksNeeded`), since
+    /// `process_block_for_wallets` is not idempotent.
+    #[tokio::test]
+    async fn test_scan_batch_already_processed_is_skipped() {
+        let wallet_id: WalletId = [0xEE; 32];
+        let address = dashcore::Address::dummy(Network::Regtest, 8);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![address.clone()],
+                    synced_height: 0,
+                    last_processed_height: 0,
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        let (key_40, f_40) = filter_for_address(40, &address);
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        filters.insert(key_40.clone(), f_40);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+        manager.progress.update_stored_height(99);
+
+        // Pre-seed `matched_block_hashes` only (not `blocks_remaining`) so
+        // `track_block_match` returns `AlreadyProcessed`.
+        manager.matched_block_hashes.insert(*key_40.hash());
+
+        let events = manager.scan_batch(0).await.unwrap();
+        let has_blocks_needed = events.iter().any(|e| matches!(e, SyncEvent::BlocksNeeded { .. }));
+        assert!(!has_blocks_needed, "AlreadyProcessed must not emit BlocksNeeded");
+    }
+
+    /// `tick` rescan with a wallet that has a non-zero `synced_height`: the
+    /// batch must start at `synced_height + 1`, not at genesis.
+    #[tokio::test]
+    async fn test_tick_rescans_from_wallet_synced_height_not_genesis() {
+        let mut manager = create_test_manager().await;
+
+        // Wallet sits at synced_height=150, manager committed at 300, so
+        // the wallet falls behind and the rescan trigger fires.
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 150);
+        manager.set_state(SyncState::Synced);
+        manager.progress.update_committed_height(300);
+        manager.progress.update_stored_height(300);
+        manager.progress.update_filter_header_tip_height(300);
+        manager.progress.update_target_height(300);
+
+        // Headers must exist in storage so start_download can resolve them.
+        let headers = dashcore::block::Header::dummy_batch(0..301);
+        manager.header_storage.write().await.store_headers(&headers).await.unwrap();
+
+        let (tx, _rx) = unbounded_channel();
+        let _ = manager.tick(&RequestSender::new(tx)).await.unwrap();
+
+        // Batch must start at 151, not at 0.
+        assert!(manager.active_batches.contains_key(&151));
+        assert!(!manager.active_batches.contains_key(&0));
+    }
+
+    /// scan_batch's union-then-attribute pass must not falsely attribute a
+    /// block to a wallet whose own address does not actually match the
+    /// filter, even if the union pass picked up the block.
+    #[tokio::test]
+    async fn test_scan_batch_attribution_excludes_non_matching_wallet() {
+        let wallet_a: WalletId = [0xAA; 32];
+        let wallet_b: WalletId = [0xBB; 32];
+        let address_a = dashcore::Address::dummy(Network::Regtest, 31);
+        let address_b = dashcore::Address::dummy(Network::Regtest, 32);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_a,
+                MockWalletState {
+                    addresses: vec![address_a.clone()],
+                    synced_height: 0,
+                    last_processed_height: 0,
+                },
+            );
+            w.insert_wallet(
+                wallet_b,
+                MockWalletState {
+                    addresses: vec![address_b.clone()],
+                    synced_height: 0,
+                    last_processed_height: 0,
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Filter at height 40 only matches address_a. address_b is in the
+        // union but does not match this specific filter, so the attribution
+        // pass must exclude wallet_b.
+        let (key_40, f_40) = filter_for_address(40, &address_a);
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        filters.insert(key_40.clone(), f_40);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+        manager.progress.update_stored_height(99);
+
+        let events = manager.scan_batch(0).await.unwrap();
+        let blocks = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("BlocksNeeded event");
+        let attribution = blocks.get(&key_40).expect("entry for the matching block");
+        assert!(attribution.contains(&wallet_a));
+        assert!(!attribution.contains(&wallet_b));
     }
 
     #[tokio::test]
