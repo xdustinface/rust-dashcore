@@ -140,6 +140,18 @@ fn test_all_callbacks_during_sync() {
             "on_transaction_instant_send_locked should not fire during initial sync"
         );
 
+        // Validate SyncedHeightUpdated callback (atomicity boundary for persistence flush)
+        let synced_height_fired = tracker.synced_height_updated_count.load(Ordering::SeqCst);
+        let last_synced_height = tracker.last_synced_height.load(Ordering::SeqCst);
+        assert!(
+            synced_height_fired > 0,
+            "on_synced_height_updated should fire at least once during sync"
+        );
+        assert_eq!(
+            last_synced_height, dashd.initial_height,
+            "last_synced_height should match initial_height after sync"
+        );
+
         // Validate sync cycle (initial sync is cycle 0)
         let last_sync_cycle = tracker.last_sync_cycle.load(Ordering::SeqCst);
         assert_eq!(last_sync_cycle, 0, "Initial sync should be cycle 0");
