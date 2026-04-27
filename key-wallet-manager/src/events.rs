@@ -7,7 +7,7 @@
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::Txid;
-use key_wallet::bip32::DerivationPath;
+use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::WalletCoreBalance;
 
@@ -23,12 +23,18 @@ pub enum RecordAction {
     Updated,
 }
 
-/// A transaction record affected by a block, with its account context.
+/// A single transaction record delivered by a wallet event, paired with the
+/// account it belongs to and whether it is a fresh insertion or an update to
+/// a previously stored record.
+///
+/// Used as a single value by `TransactionReceived` and as a `Vec` by
+/// `BlockProcessed`, so consumers can share a single record-handling code
+/// path across both events.
 #[derive(Debug, Clone)]
-pub struct BlockRecordUpdate {
-    /// BIP-32 derivation path identifying the account within the wallet that
-    /// the record belongs to.
-    pub account_path: DerivationPath,
+pub struct RecordChange {
+    /// Account within the wallet that the record belongs to. The full BIP-32
+    /// derivation path is recoverable via `account_type.derivation_path(network)`.
+    pub account_type: AccountType,
     /// Whether the record is new or an update to a previously stored one.
     pub action: RecordAction,
     /// The full transaction record.
@@ -42,20 +48,17 @@ pub struct BlockRecordUpdate {
 /// consumers can persist the record(s) and balance atomically.
 #[derive(Debug, Clone)]
 pub enum WalletEvent {
-    /// A wallet-relevant transaction was first seen in the mempool
-    /// (optionally with an InstantSend lock — in that case the record's
-    /// `context` is `InstantSend(..)`).
-    MempoolTransactionReceived {
+    /// A wallet-relevant transaction was first seen off-chain (mempool, or
+    /// directly via an InstantSend lock — in that case `change.record.context`
+    /// is `InstantSend(..)`).
+    TransactionReceived {
         /// ID of the affected wallet.
         wallet_id: WalletId,
-        /// BIP-32 derivation path identifying the account that matched the
-        /// transaction.
-        account_path: DerivationPath,
-        /// The full transaction record.
+        /// The newly-recorded transaction with its account context.
         ///
-        /// Boxed to keep the enum compact: `TransactionRecord` is large
-        /// and would otherwise inflate every variant to its size.
-        record: Box<TransactionRecord>,
+        /// Boxed to keep the enum compact: `TransactionRecord` is large and
+        /// would otherwise inflate every variant to its size.
+        change: Box<RecordChange>,
         /// Wallet balance after the transaction was recorded.
         balance: WalletCoreBalance,
     },
@@ -72,15 +75,15 @@ pub enum WalletEvent {
     },
     /// A block was processed for a wallet. Carries the newly-recorded and
     /// state-modified transaction records plus the post-block balance.
-    /// `updates` may be empty when only the balance shifted (e.g. a
+    /// `changes` may be empty when only the balance shifted (e.g. a
     /// coinbase maturing as the scanned height advanced past its threshold).
-    BlockProcessChange {
+    BlockProcessed {
         /// ID of the affected wallet.
         wallet_id: WalletId,
         /// Height of the block that was processed.
         height: CoreBlockHeight,
         /// Transaction records recorded or updated by this block.
-        updates: Vec<BlockRecordUpdate>,
+        changes: Vec<RecordChange>,
         /// Wallet balance after the block was processed.
         balance: WalletCoreBalance,
     },
@@ -88,7 +91,7 @@ pub enum WalletEvent {
     /// committed a batch covering blocks up to `height`. No new records or
     /// balance are carried — consumers can persist this as a checkpoint
     /// atomically with any records/balance already persisted from prior
-    /// `BlockProcessChange` events inside the batch.
+    /// `BlockProcessed` events inside the batch.
     SyncedHeightUpdated {
         /// ID of the affected wallet.
         wallet_id: WalletId,
@@ -101,7 +104,7 @@ impl WalletEvent {
     /// ID of the wallet this event pertains to.
     pub fn wallet_id(&self) -> WalletId {
         match self {
-            WalletEvent::MempoolTransactionReceived {
+            WalletEvent::TransactionReceived {
                 wallet_id,
                 ..
             }
@@ -109,7 +112,7 @@ impl WalletEvent {
                 wallet_id,
                 ..
             }
-            | WalletEvent::BlockProcessChange {
+            | WalletEvent::BlockProcessed {
                 wallet_id,
                 ..
             }
@@ -123,14 +126,14 @@ impl WalletEvent {
     /// Short description for logging.
     pub fn description(&self) -> String {
         match self {
-            WalletEvent::MempoolTransactionReceived {
-                record,
+            WalletEvent::TransactionReceived {
+                change,
                 balance,
                 ..
             } => {
                 format!(
-                    "MempoolTransactionReceived(txid={}, context={}, balance={})",
-                    record.txid, record.context, balance
+                    "TransactionReceived(txid={}, context={}, balance={})",
+                    change.record.txid, change.record.context, balance
                 )
             }
             WalletEvent::TransactionInstantSendLocked {
@@ -140,16 +143,16 @@ impl WalletEvent {
             } => {
                 format!("TransactionInstantSendLocked(txid={}, balance={})", txid, balance)
             }
-            WalletEvent::BlockProcessChange {
+            WalletEvent::BlockProcessed {
                 height,
-                updates,
+                changes,
                 balance,
                 ..
             } => {
                 format!(
-                    "BlockProcessChange(height={}, updates={}, balance={})",
+                    "BlockProcessed(height={}, changes={}, balance={})",
                     height,
-                    updates.len(),
+                    changes.len(),
                     balance
                 )
             }

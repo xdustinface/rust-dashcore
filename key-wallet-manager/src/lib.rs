@@ -20,14 +20,13 @@ mod process_block;
 mod wallet_interface;
 
 pub use error::WalletError;
-pub use events::{BlockRecordUpdate, RecordAction, WalletEvent};
+pub use events::{RecordAction, RecordChange, WalletEvent};
 pub use matching::{check_compact_filters_for_addresses, FilterMatchKey};
 pub use wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 
 use dashcore::blockdata::transaction::Transaction;
 use dashcore::prelude::CoreBlockHeight;
 use key_wallet::account::AccountCollection;
-use key_wallet::bip32::DerivationPath;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::wallet::managed_wallet_info::transaction_building::AccountTypePreference;
@@ -83,15 +82,11 @@ pub struct CheckTransactionsResult {
     /// Addresses involved across all wallets
     pub involved_addresses: Vec<Address>,
     /// Records newly recorded by this check, grouped by wallet. Each entry
-    /// pairs the BIP-32 derivation path identifying the source account with
-    /// the full record.
-    pub per_wallet_new_records: BTreeMap<WalletId, Vec<(DerivationPath, TransactionRecord)>>,
+    /// pairs the source `AccountType` with the full record.
+    pub per_wallet_new_records: BTreeMap<WalletId, Vec<(AccountType, TransactionRecord)>>,
     /// Records whose state was updated by this check (confirmation or
     /// InstantSend lock on a previously stored record), grouped by wallet.
-    pub per_wallet_updated_records: BTreeMap<WalletId, Vec<(DerivationPath, TransactionRecord)>>,
-    /// Number of records dropped because `AccountType::derivation_path` failed.
-    /// Tests can assert this remains zero to catch silent record loss.
-    pub dropped_records_missing_path: u32,
+    pub per_wallet_updated_records: BTreeMap<WalletId, Vec<(AccountType, TransactionRecord)>>,
 }
 
 /// High-level wallet manager that manages multiple wallets
@@ -506,46 +501,20 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                         }
                     }
 
-                    let network = self.network;
-                    let mut dropped = 0u32;
-                    let mut to_path_pairs = |records: Vec<(AccountType, TransactionRecord)>| {
-                        records
-                            .into_iter()
-                            .filter_map(|(account_type, record)| {
-                                match account_type.derivation_path(network) {
-                                    Ok(path) => Some((path, record)),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            account_type = ?account_type,
-                                            error = %e,
-                                            "Skipping wallet event: failed to derive account path"
-                                        );
-                                        dropped += 1;
-                                        None
-                                    }
-                                }
-                            })
-                            .collect::<Vec<(DerivationPath, TransactionRecord)>>()
-                    };
-
-                    let new_records_with_path = to_path_pairs(check_result.new_records);
-                    if !new_records_with_path.is_empty() {
+                    if !check_result.new_records.is_empty() {
                         result
                             .per_wallet_new_records
                             .entry(wallet_id)
                             .or_default()
-                            .extend(new_records_with_path);
+                            .extend(check_result.new_records);
                     }
-                    let updated_records_with_path = to_path_pairs(check_result.updated_records);
-                    if !updated_records_with_path.is_empty() {
+                    if !check_result.updated_records.is_empty() {
                         result
                             .per_wallet_updated_records
                             .entry(wallet_id)
                             .or_default()
-                            .extend(updated_records_with_path);
+                            .extend(check_result.updated_records);
                     }
-                    result.dropped_records_missing_path =
-                        result.dropped_records_missing_path.saturating_add(dropped);
                 }
 
                 result.new_addresses.extend(check_result.new_addresses);

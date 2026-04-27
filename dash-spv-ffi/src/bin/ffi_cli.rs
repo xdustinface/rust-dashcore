@@ -5,7 +5,6 @@ use std::ptr;
 use clap::{Arg, ArgAction, Command};
 use dash_network::ffi::FFINetwork;
 use dash_spv_ffi::*;
-use key_wallet_ffi::managed_account::FFITransactionRecord;
 use key_wallet_ffi::types::FFIBalance;
 use key_wallet_ffi::wallet_manager::wallet_manager_add_wallet_from_mnemonic;
 use key_wallet_ffi::FFIError;
@@ -173,28 +172,29 @@ fn read_balance(balance: *const FFIBalance) -> FFIBalance {
     unsafe { *balance }
 }
 
-extern "C" fn on_mempool_transaction_received(
+extern "C" fn on_transaction_received(
     wallet_id: *const c_char,
-    account_path: *const c_char,
-    record: *const FFITransactionRecord,
+    change: *const FFIRecordChange,
     balance: *const FFIBalance,
     _user_data: *mut c_void,
 ) {
     let wallet_short = short_wallet(wallet_id);
-    let path_str = ffi_string_to_rust(account_path);
-    if record.is_null() {
-        println!(
-            "[Wallet] Mempool TX received: wallet={}..., account={}, record=null",
-            wallet_short, path_str
-        );
+    if change.is_null() {
+        println!("[Wallet] TX received: wallet={}..., change=null", wallet_short);
         return;
     }
-    let r = unsafe { &*record };
+    let c = unsafe { &*change };
     let b = read_balance(balance);
-    let txid_hex = hex::encode(r.txid);
+    let txid_hex = hex::encode(c.record.txid);
     println!(
-        "[Wallet] Mempool TX received: wallet={}..., txid={}, account={}, amount={} duffs, balance[confirmed={}, unconfirmed={}]",
-        wallet_short, txid_hex, path_str, r.net_amount, b.confirmed, b.unconfirmed
+        "[Wallet] TX received: wallet={}..., txid={}, account_type={:?}, account_index={}, amount={} duffs, balance[confirmed={}, unconfirmed={}]",
+        wallet_short,
+        txid_hex,
+        c.account_type,
+        c.account_index,
+        c.record.net_amount,
+        b.confirmed,
+        b.unconfirmed
     );
 }
 
@@ -215,19 +215,19 @@ extern "C" fn on_transaction_instant_send_locked(
     );
 }
 
-extern "C" fn on_block_process_change(
+extern "C" fn on_wallet_block_processed(
     wallet_id: *const c_char,
     height: u32,
-    _updates: *const FFIBlockRecordUpdate,
-    update_count: u32,
+    _changes: *const FFIRecordChange,
+    change_count: u32,
     balance: *const FFIBalance,
     _user_data: *mut c_void,
 ) {
     let wallet_short = short_wallet(wallet_id);
     let b = read_balance(balance);
     println!(
-        "[Wallet] Block processed: wallet={}..., height={}, updates={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}]",
-        wallet_short, height, update_count, b.confirmed, b.unconfirmed, b.immature, b.locked
+        "[Wallet] Block processed: wallet={}..., height={}, changes={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}]",
+        wallet_short, height, change_count, b.confirmed, b.unconfirmed, b.immature, b.locked
     );
 }
 
@@ -461,9 +461,9 @@ fn main() {
                 user_data: ptr::null_mut(),
             },
             wallet: FFIWalletEventCallbacks {
-                on_mempool_transaction_received: Some(on_mempool_transaction_received),
+                on_transaction_received: Some(on_transaction_received),
                 on_transaction_instant_send_locked: Some(on_transaction_instant_send_locked),
-                on_block_process_change: Some(on_block_process_change),
+                on_block_processed: Some(on_wallet_block_processed),
                 on_synced_height_updated: Some(on_synced_height_updated),
                 user_data: ptr::null_mut(),
             },

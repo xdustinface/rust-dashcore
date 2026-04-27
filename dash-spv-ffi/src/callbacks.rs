@@ -11,9 +11,11 @@ use dash_spv::network::NetworkEvent;
 use dash_spv::sync::{SyncEvent, SyncProgress};
 use dash_spv::EventHandler;
 use dashcore::hashes::Hash;
+use key_wallet::account::StandardAccountType;
+use key_wallet::AccountType;
 use key_wallet_ffi::managed_account::FFITransactionRecord;
 use key_wallet_ffi::types::FFIBalance;
-use key_wallet_manager::{RecordAction, WalletEvent};
+use key_wallet_manager::{RecordAction, RecordChange, WalletEvent};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
@@ -549,34 +551,150 @@ impl From<RecordAction> for FFIRecordAction {
     }
 }
 
-/// FFI-friendly form of `BlockRecordUpdate`: a `TransactionRecord` affected by
-/// a block, with its account derivation path and whether it is a fresh
-/// insertion or an update to an existing record.
+/// Discriminant identifying a wallet account. Mirrors `key_wallet::AccountType`
+/// for FFI consumption. Combined with `account_index` it identifies the
+/// account that owns a record without forcing consumers to parse derivation
+/// path strings. The full BIP-32 path is recoverable from
+/// `(account_type, account_index, network)` via `AccountType::derivation_path`.
+///
+/// Variants that carry extra payload in the Rust enum (`DashpayReceivingFunds`
+/// / `DashpayExternalAccount` carry identity IDs, `PlatformPayment` carries a
+/// `key_class`) are reported here as discriminant + primary index only; the
+/// extra fields are not exposed at the FFI boundary.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FFIAccountType {
+    /// `AccountType::Standard { standard_account_type: BIP44Account, .. }`.
+    /// `account_index` carries the BIP-44 account index.
+    StandardBIP44 = 0,
+    /// `AccountType::Standard { standard_account_type: BIP32Account, .. }`.
+    /// `account_index` carries the BIP-32 account index.
+    StandardBIP32 = 1,
+    /// `AccountType::CoinJoin { index }`. `account_index` carries `index`.
+    CoinJoin = 2,
+    /// `AccountType::IdentityRegistration`. No index.
+    IdentityRegistration = 3,
+    /// `AccountType::IdentityTopUp { registration_index }`.
+    /// `account_index` carries `registration_index`.
+    IdentityTopUp = 4,
+    /// `AccountType::IdentityTopUpNotBoundToIdentity`. No index.
+    IdentityTopUpNotBoundToIdentity = 5,
+    /// `AccountType::IdentityInvitation`. No index.
+    IdentityInvitation = 6,
+    /// `AccountType::AssetLockAddressTopUp`. No index.
+    AssetLockAddressTopUp = 7,
+    /// `AccountType::AssetLockShieldedAddressTopUp`. No index.
+    AssetLockShieldedAddressTopUp = 8,
+    /// `AccountType::ProviderVotingKeys`. No index.
+    ProviderVotingKeys = 9,
+    /// `AccountType::ProviderOwnerKeys`. No index.
+    ProviderOwnerKeys = 10,
+    /// `AccountType::ProviderOperatorKeys`. No index.
+    ProviderOperatorKeys = 11,
+    /// `AccountType::ProviderPlatformKeys`. No index.
+    ProviderPlatformKeys = 12,
+    /// `AccountType::DashpayReceivingFunds { index, .. }`. `account_index`
+    /// carries `index`. Identity IDs are not exposed here.
+    DashpayReceivingFunds = 13,
+    /// `AccountType::DashpayExternalAccount { index, .. }`. `account_index`
+    /// carries `index`. Identity IDs are not exposed here.
+    DashpayExternalAccount = 14,
+    /// `AccountType::PlatformPayment { account, .. }`. `account_index`
+    /// carries `account`; `key_class` is not exposed here.
+    PlatformPayment = 15,
+}
+
+impl FFIAccountType {
+    /// Decompose an `AccountType` into `(discriminant, account_index)`.
+    /// `account_index` is `-1` for variants without a meaningful primary index.
+    fn from_account_type(account_type: &AccountType) -> (Self, i32) {
+        match *account_type {
+            AccountType::Standard {
+                index,
+                standard_account_type: StandardAccountType::BIP44Account,
+            } => (FFIAccountType::StandardBIP44, index as i32),
+            AccountType::Standard {
+                index,
+                standard_account_type: StandardAccountType::BIP32Account,
+            } => (FFIAccountType::StandardBIP32, index as i32),
+            AccountType::CoinJoin {
+                index,
+            } => (FFIAccountType::CoinJoin, index as i32),
+            AccountType::IdentityRegistration => (FFIAccountType::IdentityRegistration, -1),
+            AccountType::IdentityTopUp {
+                registration_index,
+            } => (FFIAccountType::IdentityTopUp, registration_index as i32),
+            AccountType::IdentityTopUpNotBoundToIdentity => {
+                (FFIAccountType::IdentityTopUpNotBoundToIdentity, -1)
+            }
+            AccountType::IdentityInvitation => (FFIAccountType::IdentityInvitation, -1),
+            AccountType::AssetLockAddressTopUp => (FFIAccountType::AssetLockAddressTopUp, -1),
+            AccountType::AssetLockShieldedAddressTopUp => {
+                (FFIAccountType::AssetLockShieldedAddressTopUp, -1)
+            }
+            AccountType::ProviderVotingKeys => (FFIAccountType::ProviderVotingKeys, -1),
+            AccountType::ProviderOwnerKeys => (FFIAccountType::ProviderOwnerKeys, -1),
+            AccountType::ProviderOperatorKeys => (FFIAccountType::ProviderOperatorKeys, -1),
+            AccountType::ProviderPlatformKeys => (FFIAccountType::ProviderPlatformKeys, -1),
+            AccountType::DashpayReceivingFunds {
+                index,
+                ..
+            } => (FFIAccountType::DashpayReceivingFunds, index as i32),
+            AccountType::DashpayExternalAccount {
+                index,
+                ..
+            } => (FFIAccountType::DashpayExternalAccount, index as i32),
+            AccountType::PlatformPayment {
+                account,
+                ..
+            } => (FFIAccountType::PlatformPayment, account as i32),
+        }
+    }
+}
+
+/// FFI-friendly form of `RecordChange`: a `TransactionRecord` paired with the
+/// account it belongs to and whether it is a fresh insertion or an update to
+/// an existing record. Used as a single value by `on_transaction_received`
+/// and as an array element by `on_block_processed`.
 #[repr(C)]
-pub struct FFIBlockRecordUpdate {
-    /// Null-terminated UTF-8 BIP-32 path string identifying the account
-    /// (e.g. `"m/44'/1'/0'"`). Borrowed for the duration of the callback.
-    pub account_path: *const c_char,
+pub struct FFIRecordChange {
+    /// Discriminant identifying the account variant (see `FFIAccountType`).
+    pub account_type: FFIAccountType,
+    /// Primary account index for this variant, or `-1` for variants without
+    /// one (Identity*, Provider*, AssetLock*).
+    pub account_index: i32,
     /// Whether the record is new or an update to a previously stored one.
     pub action: FFIRecordAction,
     /// The transaction record.
     pub record: FFITransactionRecord,
 }
 
-/// Callback for `WalletEvent::MempoolTransactionReceived`.
+impl FFIRecordChange {
+    fn from_record_change(change: &RecordChange) -> Self {
+        let (account_type, account_index) = FFIAccountType::from_account_type(&change.account_type);
+        Self {
+            account_type,
+            account_index,
+            action: FFIRecordAction::from(change.action),
+            record: FFITransactionRecord::from(&change.record),
+        }
+    }
+}
+
+/// Callback for `WalletEvent::TransactionReceived`.
 ///
-/// Fires when a wallet-relevant transaction is first seen in the mempool
-/// (optionally with an InstantSend lock — in that case the record's context
-/// is `InstantSend(..)`).
+/// Fires when a wallet-relevant transaction is first seen off-chain — either
+/// in the mempool, or directly via an InstantSend lock (in that case the
+/// record's `context` is `InstantSend(..)`). `change.action` is always
+/// `Inserted` for this callback.
 ///
 /// All pointer parameters are borrowed and only valid for the duration of the
 /// callback. `balance` is the wallet's balance *after* the transaction was
 /// recorded.
-pub type OnMempoolTransactionReceivedCallback = Option<
+pub type OnTransactionReceivedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
-        account_path: *const c_char,
-        record: *const FFITransactionRecord,
+        change: *const FFIRecordChange,
         balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
@@ -598,22 +716,23 @@ pub type OnTransactionInstantSendLockedCallback = Option<
     ),
 >;
 
-/// Callback for `WalletEvent::BlockProcessChange`.
+/// Callback for `WalletEvent::BlockProcessed`.
 ///
-/// Fires once per wallet affected by a processed block. `updates` points to an
-/// array of `update_count` `FFIBlockRecordUpdate` entries covering records
-/// newly recorded or updated by this block. The array may be empty when only
-/// the wallet's balance shifted (e.g. a coinbase maturing). `balance` is the
-/// wallet's balance *after* the block was processed.
+/// Fires once per wallet affected by a processed block. `changes` points to
+/// an array of `change_count` `FFIRecordChange` entries covering records
+/// newly recorded or updated by this block. The array may be empty (and
+/// `changes` will be null) when only the wallet's balance shifted (e.g. a
+/// coinbase maturing). `balance` is the wallet's balance *after* the block
+/// was processed.
 ///
-/// The `updates` array and all its contents are borrowed and only valid for
+/// The `changes` array and all its contents are borrowed and only valid for
 /// the duration of the callback.
-pub type OnBlockProcessChangeCallback = Option<
+pub type OnWalletBlockProcessedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
         height: u32,
-        updates: *const FFIBlockRecordUpdate,
-        update_count: u32,
+        changes: *const FFIRecordChange,
+        change_count: u32,
         balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
@@ -624,7 +743,7 @@ pub type OnBlockProcessChangeCallback = Option<
 /// Fires once per wallet when the filter pipeline commits a batch — the
 /// wallet has been scanned up to `height`. Consumers can persist this as a
 /// checkpoint atomically with any records/balance already persisted from
-/// prior `BlockProcessChange` events inside the batch.
+/// prior `BlockProcessed` events inside the batch.
 pub type OnSyncedHeightUpdatedCallback =
     Option<extern "C" fn(wallet_id: *const c_char, height: u32, user_data: *mut c_void)>;
 
@@ -633,14 +752,14 @@ pub type OnSyncedHeightUpdatedCallback =
 /// Set only the callbacks you're interested in; unset callbacks will be ignored.
 ///
 /// All pointer parameters passed to callbacks (wallet IDs, txids, records,
-/// balances, updates) are borrowed and only valid for the duration of the
+/// balances, changes) are borrowed and only valid for the duration of the
 /// callback invocation. Callers must copy any data they need to retain.
 #[repr(C)]
 #[derive(Clone)]
 pub struct FFIWalletEventCallbacks {
-    pub on_mempool_transaction_received: OnMempoolTransactionReceivedCallback,
+    pub on_transaction_received: OnTransactionReceivedCallback,
     pub on_transaction_instant_send_locked: OnTransactionInstantSendLockedCallback,
-    pub on_block_process_change: OnBlockProcessChangeCallback,
+    pub on_block_processed: OnWalletBlockProcessedCallback,
     pub on_synced_height_updated: OnSyncedHeightUpdatedCallback,
     pub user_data: *mut c_void,
 }
@@ -652,9 +771,9 @@ unsafe impl Sync for FFIWalletEventCallbacks {}
 impl Default for FFIWalletEventCallbacks {
     fn default() -> Self {
         Self {
-            on_mempool_transaction_received: None,
+            on_transaction_received: None,
             on_transaction_instant_send_locked: None,
-            on_block_process_change: None,
+            on_block_processed: None,
             on_synced_height_updated: None,
             user_data: std::ptr::null_mut(),
         }
@@ -750,23 +869,20 @@ impl FFIWalletEventCallbacks {
     /// Dispatch a WalletEvent to the appropriate callback.
     pub fn dispatch(&self, event: &WalletEvent) {
         match event {
-            WalletEvent::MempoolTransactionReceived {
+            WalletEvent::TransactionReceived {
                 wallet_id,
-                account_path,
-                record,
+                change,
                 balance,
             } => {
-                if let Some(cb) = self.on_mempool_transaction_received {
+                if let Some(cb) = self.on_transaction_received {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
-                    let c_account_path = CString::new(account_path.to_string()).unwrap_or_default();
-                    let ffi_record = FFITransactionRecord::from(record.as_ref());
+                    let ffi_change = FFIRecordChange::from_record_change(change.as_ref());
                     let ffi_balance = FFIBalance::from(*balance);
 
                     cb(
                         c_wallet_id.as_ptr(),
-                        c_account_path.as_ptr(),
-                        &ffi_record as *const FFITransactionRecord,
+                        &ffi_change as *const FFIRecordChange,
                         &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
@@ -795,54 +911,38 @@ impl FFIWalletEventCallbacks {
                     );
                 }
             }
-            WalletEvent::BlockProcessChange {
+            WalletEvent::BlockProcessed {
                 wallet_id,
                 height,
-                updates,
+                changes,
                 balance,
             } => {
-                if let Some(cb) = self.on_block_process_change {
+                if let Some(cb) = self.on_block_processed {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
-                    // Materialize one CString per update *before* building the
-                    // FFI views so the `*const c_char` pointers stored inside
-                    // `FFIBlockRecordUpdate` stay valid for the duration of
-                    // the callback invocation.
-                    let path_cstrs: Vec<CString> = updates
-                        .iter()
-                        .map(|u| CString::new(u.account_path.to_string()).unwrap_or_default())
-                        .collect();
-                    let ffi_updates: Vec<FFIBlockRecordUpdate> = updates
-                        .iter()
-                        .zip(path_cstrs.iter())
-                        .map(|(u, path)| FFIBlockRecordUpdate {
-                            account_path: path.as_ptr(),
-                            action: FFIRecordAction::from(u.action),
-                            record: FFITransactionRecord::from(&u.record),
-                        })
-                        .collect();
+                    let ffi_changes: Vec<FFIRecordChange> =
+                        changes.iter().map(FFIRecordChange::from_record_change).collect();
                     let ffi_balance = FFIBalance::from(*balance);
 
-                    // Pass a null `updates` pointer when the array is empty so
+                    // Pass a null `changes` pointer when the array is empty so
                     // C/Swift consumers that null-check before reading don't
                     // see a non-null dangling pointer paired with a zero count.
-                    let updates_ptr = if ffi_updates.is_empty() {
+                    let changes_ptr = if ffi_changes.is_empty() {
                         ptr::null()
                     } else {
-                        ffi_updates.as_ptr()
+                        ffi_changes.as_ptr()
                     };
 
                     cb(
                         c_wallet_id.as_ptr(),
                         *height,
-                        updates_ptr,
-                        ffi_updates.len() as u32,
+                        changes_ptr,
+                        ffi_changes.len() as u32,
                         &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
 
-                    drop(ffi_updates);
-                    drop(path_cstrs);
+                    drop(ffi_changes);
                 }
             }
             WalletEvent::SyncedHeightUpdated {

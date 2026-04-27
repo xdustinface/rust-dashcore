@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use dash_spv::test_utils::{DashdTestContext, TestChain};
-use dash_spv_ffi::FFIRecordAction;
+use dash_spv_ffi::{FFIAccountType, FFIRecordAction};
 use dashcore::hashes::Hash;
 use dashcore::Amount;
 
@@ -102,23 +102,22 @@ fn test_all_callbacks_during_sync() {
         drop(connected_peers);
 
         // Wait for wallet callbacks (they travel on a separate channel from sync events).
-        // Wait on `block_process_change_count` because it is bumped last in the
+        // Wait on `block_processed_wallet_count` because it is bumped last in the
         // callback, after all per-record state has been written. Reading the
         // record counter afterwards is therefore guaranteed to see the matching
         // increment.
-        tracker.wait_for_callback(&tracker.block_process_change_count, 0, "block_process_change");
+        tracker.wait_for_callback(&tracker.block_processed_wallet_count, 0, "block_processed");
 
         // Validate wallet event callbacks (test wallet has transactions)
-        let block_records = tracker.block_process_change_record_count.load(Ordering::SeqCst);
-        let block_changes = tracker.block_process_change_count.load(Ordering::SeqCst);
-        let mempool_received = tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
+        let block_records = tracker.block_processed_wallet_record_count.load(Ordering::SeqCst);
+        let block_changes = tracker.block_processed_wallet_count.load(Ordering::SeqCst);
+        let received = tracker.transaction_received_count.load(Ordering::SeqCst);
         let instant_send_locked =
             tracker.transaction_instant_send_locked_count.load(Ordering::SeqCst);
 
         tracing::info!(
-            "Wallet: mempool_received={}, instant_send_locked={}, block_changes={}, \
-             block_records={}",
-            mempool_received,
+            "Wallet: received={}, instant_send_locked={}, block_changes={}, block_records={}",
+            received,
             instant_send_locked,
             block_changes,
             block_records
@@ -126,15 +125,15 @@ fn test_all_callbacks_during_sync() {
 
         assert!(
             block_records > 0,
-            "on_block_process_change should deliver records for a wallet with transactions"
+            "on_block_processed should deliver records for a wallet with transactions"
         );
         assert!(
             block_changes > 0,
-            "on_block_process_change should fire for blocks containing wallet records"
+            "on_block_processed should fire for blocks containing wallet records"
         );
         assert_eq!(
-            mempool_received, 0,
-            "on_mempool_transaction_received must not fire during historical block sync"
+            received, 0,
+            "on_transaction_received must not fire during historical block sync"
         );
         assert_eq!(
             instant_send_locked, 0,
@@ -143,8 +142,8 @@ fn test_all_callbacks_during_sync() {
 
         // Validate SyncedHeightUpdated callback (atomicity boundary for persistence flush).
         // Wait explicitly for the callback because it travels on the same wallet
-        // broadcast channel as `BlockProcessChange` but is dispatched separately,
-        // so observing block-process records does not guarantee it has fired yet.
+        // broadcast channel as `BlockProcessed` but is dispatched separately,
+        // so observing block-processed records does not guarantee it has fired yet.
         tracker.wait_for_callback(&tracker.synced_height_updated_count, 0, "synced_height_updated");
         let synced_height_fired = tracker.synced_height_updated_count.load(Ordering::SeqCst);
         let last_synced_height = tracker.last_synced_height.load(Ordering::SeqCst);
@@ -245,7 +244,7 @@ fn test_all_callbacks_during_sync() {
         );
 
         // Validate transaction data from initial sync. Historical sync only
-        // touches the block-process-change callback (mempool callback must
+        // touches the block-processed callback (off-chain callback must
         // remain silent during initial sync), so assert against that bucket
         // explicitly.
         let block_received = tracker.block_received_transactions.lock().unwrap();
@@ -267,16 +266,29 @@ fn test_all_callbacks_during_sync() {
         );
         drop(actions);
 
-        // Validate every block-record callback delivered a well-formed BIP-32
-        // account path string (e.g. `m/44'/1'/0'`).
-        let paths = tracker.block_account_paths.lock().unwrap();
-        assert!(!paths.is_empty(), "block account paths should be captured");
-        assert!(
-            paths.iter().all(|p| p.starts_with("m/")),
-            "every account_path should be a BIP-32 path string starting with `m/`, got: {:?}",
-            *paths
+        // Validate the BIP-44 account discriminant + index reach the FFI
+        // boundary intact: every change observed during historical sync
+        // belongs to the default BIP-44 account (index 0) of the test wallet.
+        let account_types = tracker.block_account_types.lock().unwrap();
+        let account_indices = tracker.block_account_indices.lock().unwrap();
+        assert!(!account_types.is_empty(), "block account types should be captured");
+        assert_eq!(
+            account_types.len(),
+            account_indices.len(),
+            "block account types and indices must be paired 1:1"
         );
-        drop(paths);
+        assert!(
+            account_types.iter().all(|t| *t == FFIAccountType::StandardBIP44),
+            "every block change should carry FFIAccountType::StandardBIP44, got: {:?}",
+            *account_types
+        );
+        assert!(
+            account_indices.iter().all(|i| *i == 0),
+            "every BIP-44 change should carry account_index = 0, got: {:?}",
+            *account_indices
+        );
+        drop(account_indices);
+        drop(account_types);
 
         // Masternodes are disabled in test config, so these should not fire
         let masternode_updated = tracker.masternode_state_updated_count.load(Ordering::SeqCst);
@@ -318,31 +330,31 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         tracing::info!("Initial sync complete");
 
         // Record callback counts before post-sync operations
-        let mempool_received_before =
-            tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
-        let block_changes_before = tracker.block_process_change_count.load(Ordering::SeqCst);
-        let block_records_before = tracker.block_process_change_record_count.load(Ordering::SeqCst);
+        let received_before = tracker.transaction_received_count.load(Ordering::SeqCst);
+        let block_changes_before = tracker.block_processed_wallet_count.load(Ordering::SeqCst);
+        let block_records_before =
+            tracker.block_processed_wallet_record_count.load(Ordering::SeqCst);
 
-        // Send DASH to the wallet. Wait for the mempool callback before mining
-        // so the SPV node observes the transaction in the mempool. If we mine
-        // immediately, the block path can deliver the transaction first and
-        // the mempool callback would never fire.
+        // Send DASH to the wallet. Wait for the off-chain callback before
+        // mining so the SPV node observes the transaction in the mempool.
+        // If we mine immediately, the block path can deliver the transaction
+        // first and the off-chain callback would never fire.
         let receive_address = ctx.get_receive_address(&wallet_id);
         let send_amount = Amount::from_sat(100_000_000);
         let txid = dashd.node.send_to_address(&receive_address, send_amount);
         tracing::info!("Sent {} to wallet, txid: {}", send_amount, txid);
 
         tracker.wait_for_callback(
-            &tracker.mempool_transaction_received_count,
-            mempool_received_before,
-            "mempool_transaction_received",
+            &tracker.transaction_received_count,
+            received_before,
+            "transaction_received",
         );
 
-        // The mempool callback updates `last_unconfirmed` with the post-event
-        // balance. Snapshot it now, before mining. After confirmation the
-        // block-process callback overwrites the same field back toward zero,
-        // so this is the only window in which the unconfirmed-balance update
-        // is observable.
+        // The off-chain callback updates `last_unconfirmed` with the
+        // post-event balance. Snapshot it now, before mining. After
+        // confirmation the block-processed callback overwrites the same
+        // field back toward zero, so this is the only window in which the
+        // unconfirmed-balance update is observable.
         let unconfirmed_after_mempool = tracker.last_unconfirmed.load(Ordering::SeqCst);
         assert!(
             unconfirmed_after_mempool > 0,
@@ -356,43 +368,42 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         // Wait for incremental sync to complete
         ctx.wait_for_sync(dashd.initial_height + 1);
 
-        // Wait for the block-process callback. The per-callback counter is
+        // Wait for the block-processed callback. The per-callback counter is
         // bumped last in the callback, so observing it incremented guarantees
         // the per-record vectors and counters have already been updated.
         tracker.wait_for_callback(
-            &tracker.block_process_change_count,
+            &tracker.block_processed_wallet_count,
             block_changes_before,
-            "block_process_change",
+            "block_processed",
         );
 
-        // Verify on_mempool_transaction_received fired for the new transaction
-        let mempool_received_after =
-            tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
+        // Verify on_transaction_received fired for the new transaction
+        let received_after = tracker.transaction_received_count.load(Ordering::SeqCst);
         assert!(
-            mempool_received_after > mempool_received_before,
-            "on_mempool_transaction_received should fire for post-sync transaction: {} -> {}",
-            mempool_received_before,
-            mempool_received_after
+            received_after > received_before,
+            "on_transaction_received should fire for post-sync transaction: {} -> {}",
+            received_before,
+            received_after
         );
         tracing::info!(
-            "Mempool transaction callback verified: {} -> {}",
-            mempool_received_before,
-            mempool_received_after
+            "Off-chain transaction callback verified: {} -> {}",
+            received_before,
+            received_after
         );
 
-        // Verify the sent txid appears in the mempool callback data with a
-        // non-zero net_amount. Asserting against the mempool bucket (rather
-        // than the union of mempool+block records) ensures the mempool
-        // callback specifically delivered the txid — a broken mempool callback
-        // that pushed the wrong txid wouldn't be masked by the block path.
-        // The SPV wallet and dashd share the same mnemonic so the transaction
-        // is an internal transfer (wallet owns both inputs and outputs);
-        // net_amount therefore equals approximately -fee, not the nominal
-        // send amount.
+        // Verify the sent txid appears in the off-chain callback data with a
+        // non-zero net_amount. Asserting against the off-chain bucket (rather
+        // than the union of off-chain + block records) ensures the off-chain
+        // callback specifically delivered the txid — a broken off-chain
+        // callback that pushed the wrong txid wouldn't be masked by the
+        // block path. The SPV wallet and dashd share the same mnemonic so
+        // the transaction is an internal transfer (wallet owns both inputs
+        // and outputs); net_amount therefore equals approximately -fee, not
+        // the nominal send amount.
         let sent_txid_bytes = *txid.as_byte_array();
-        let mempool_received_txs = tracker.mempool_received_transactions.lock().unwrap();
-        let sent_entry = mempool_received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
-        assert!(sent_entry.is_some(), "sent txid should appear in mempool callback data");
+        let received_txs = tracker.received_transactions.lock().unwrap();
+        let sent_entry = received_txs.iter().find(|&&(id, _)| id == sent_txid_bytes);
+        assert!(sent_entry.is_some(), "sent txid should appear in transaction callback data");
         let &(_, net_amount) = sent_entry.unwrap();
         // Internal transfer: net_amount = received - sent = (send_amount + change) - input = -fee.
         // The fee must be negative, non-zero, and small (< 0.001 DASH).
@@ -401,20 +412,27 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             "internal transfer net_amount should equal -fee (small negative), got: {}",
             net_amount
         );
-        drop(mempool_received_txs);
+        drop(received_txs);
 
-        // Verify the mempool callback delivered a well-formed BIP-32 account
-        // path (e.g. `m/44'/1'/0'`).
-        let mempool_paths = tracker.mempool_account_paths.lock().unwrap();
+        // Verify the off-chain callback delivered the BIP-44 account
+        // discriminant + index 0 (default test account).
+        let received_types = tracker.received_account_types.lock().unwrap();
+        let received_indices = tracker.received_account_indices.lock().unwrap();
         assert!(
-            mempool_paths.iter().all(|p| p.starts_with("m/")),
-            "mempool callback should deliver a BIP-32 account path, got: {:?}",
-            *mempool_paths
+            received_types.iter().all(|t| *t == FFIAccountType::StandardBIP44),
+            "off-chain callback should deliver FFIAccountType::StandardBIP44, got: {:?}",
+            *received_types
         );
-        drop(mempool_paths);
+        assert!(
+            received_indices.iter().all(|i| *i == 0),
+            "off-chain BIP-44 callback should deliver account_index = 0, got: {:?}",
+            *received_indices
+        );
+        drop(received_indices);
+        drop(received_types);
 
         // The post-sync block confirms a transaction that was already known
-        // from the mempool, so the corresponding `BlockProcessChange` update
+        // from the mempool, so the corresponding `BlockProcessed` change
         // must carry `FFIRecordAction::Updated` rather than `Inserted`. Slice
         // by the pre-captured index so only post-sync entries are checked,
         // avoiding masking by any `Updated` that might appear during initial
@@ -435,9 +453,10 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         );
         drop(block_actions);
 
-        let block_records_after = tracker.block_process_change_record_count.load(Ordering::SeqCst);
+        let block_records_after =
+            tracker.block_processed_wallet_record_count.load(Ordering::SeqCst);
         tracing::info!(
-            "Block-process record callback verified: {} -> {}",
+            "Block-processed record callback verified: {} -> {}",
             block_records_before,
             block_records_after
         );
