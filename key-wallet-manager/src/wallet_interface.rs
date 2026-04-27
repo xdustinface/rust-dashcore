@@ -110,6 +110,14 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// i.e. the wallets that still need filter coverage at that height.
     fn wallets_behind(&self, height: CoreBlockHeight) -> BTreeSet<WalletId>;
 
+    /// Return the wallet IDs that still need filter coverage at heights up to
+    /// and including `height`. Equivalent to `wallets_behind(height + 1)` but
+    /// expresses the inclusive intent at the call site, so callers don't have
+    /// to compensate the strict-less-than semantics with `+ 1`.
+    fn wallets_not_yet_at(&self, height: CoreBlockHeight) -> BTreeSet<WalletId> {
+        self.wallets_behind(height.saturating_add(1))
+    }
+
     /// Return the per-wallet committed sync checkpoint, or `0` if unknown.
     fn wallet_synced_height(&self, wallet_id: &WalletId) -> CoreBlockHeight;
 
