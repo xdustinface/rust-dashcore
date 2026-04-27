@@ -652,13 +652,25 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         }
         let batch_filters = batch.filters();
 
+        // Per-wallet `synced_height` snapshot so heights below the wallet's
+        // own progress are skipped during the rescan. Without this, a new
+        // address could spuriously match a height the wallet already
+        // processed and `track_block_match` would funnel the result into the
+        // `AlreadyProcessed` arm and silently drop it.
+        let synced_heights: HashMap<WalletId, u32> = {
+            let wallet = self.wallet.read().await;
+            new_addresses.keys().map(|id| (*id, wallet.wallet_synced_height(id))).collect()
+        };
+
         let mut block_to_wallets: BTreeMap<FilterMatchKey, BTreeSet<WalletId>> = BTreeMap::new();
         for (wallet_id, addresses) in new_addresses {
             if addresses.is_empty() {
                 continue;
             }
             let addresses_vec: Vec<_> = addresses.iter().cloned().collect();
-            let matches = check_compact_filters_for_addresses(batch_filters, addresses_vec, 0);
+            let min_synced = synced_heights.get(wallet_id).copied().unwrap_or(0);
+            let matches =
+                check_compact_filters_for_addresses(batch_filters, addresses_vec, min_synced);
             for key in matches {
                 block_to_wallets.entry(key).or_default().insert(*wallet_id);
             }
@@ -708,26 +720,22 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
     async fn scan_batch(&mut self, batch_start: u32) -> SyncResult<Vec<SyncEvent>> {
         let mut events = Vec::new();
 
-        let Some(batch) = self.active_batches.get_mut(&batch_start) else {
-            tracing::debug!("scan_batch: batch {} not found", batch_start);
-            return Ok(events);
+        let (batch_end, filters_empty) = {
+            let Some(batch) = self.active_batches.get_mut(&batch_start) else {
+                tracing::debug!("scan_batch: batch {} not found", batch_start);
+                return Ok(events);
+            };
+
+            tracing::debug!(
+                "scan_batch: batch {}-{} has {} filters",
+                batch.start_height(),
+                batch.end_height(),
+                batch.filters().len()
+            );
+
+            batch.mark_scanned();
+            (batch.end_height(), batch.filters().is_empty())
         };
-
-        tracing::debug!(
-            "scan_batch: batch {}-{} has {} filters",
-            batch.start_height(),
-            batch.end_height(),
-            batch.filters().len()
-        );
-
-        batch.mark_scanned();
-        let batch_end = batch.end_height();
-
-        // Get all filters in the batch
-        if batch.filters().is_empty() {
-            tracing::debug!("scan_batch: batch filters are empty, returning early");
-            return Ok(events);
-        }
 
         // Snapshot per-wallet state for the wallets behind this batch's range.
         // A wallet whose `synced_height >= batch_end` is fully covered and is
@@ -754,11 +762,17 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         let scanned_wallets: BTreeSet<WalletId> = behind.clone();
 
         // Record which wallets we're scanning for so the commit phase advances
-        // only their per-wallet `synced_height`. This is recorded even when
-        // there are no addresses to scan, otherwise zero-address wallets would
-        // never make progress.
+        // only their per-wallet `synced_height`. Recorded unconditionally
+        // before any early return so that batches taking the empty-filter or
+        // empty-address fast path still advance the per-wallet height when
+        // committed.
         if let Some(batch) = self.active_batches.get_mut(&batch_start) {
             batch.set_scanned_wallets(scanned_wallets);
+        }
+
+        if filters_empty {
+            tracing::debug!("scan_batch: batch filters are empty, returning early");
+            return Ok(events);
         }
 
         if wallet_states.is_empty() {
@@ -1329,6 +1343,86 @@ mod tests {
         let attr_b = blocks.get(&key_b).expect("entry for wallet_b's match");
         assert!(attr_b.contains(&wallet_b));
         assert!(!attr_b.contains(&wallet_a));
+    }
+
+    /// `rescan_batch` honours each wallet's own `synced_height`: a new
+    /// address belonging to a wallet that has already advanced past a height
+    /// must not produce a `BlocksNeeded` for that height, even when the
+    /// filter for that height matches the new address. Two wallets at
+    /// different heights are exercised so that both the include-above and
+    /// skip-below paths run.
+    #[tokio::test]
+    async fn test_rescan_batch_skips_below_per_wallet_synced_height() {
+        let wallet_low: WalletId = [0xA1; 32];
+        let wallet_high: WalletId = [0xA2; 32];
+        let address_low = dashcore::Address::dummy(Network::Regtest, 41);
+        let address_high = dashcore::Address::dummy(Network::Regtest, 42);
+
+        let multi = MultiMockWallet::new();
+        let multi = Arc::new(RwLock::new(multi));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_low,
+                MockWalletState {
+                    addresses: vec![],
+                    synced_height: 20,
+                    last_processed_height: 20,
+                },
+            );
+            w.insert_wallet(
+                wallet_high,
+                MockWalletState {
+                    addresses: vec![],
+                    synced_height: 60,
+                    last_processed_height: 60,
+                },
+            );
+        }
+        let mut manager = create_multi_test_manager(multi).await;
+        manager.set_state(SyncState::Syncing);
+
+        // Filters at 30 (matches wallet_low) and 70 (matches wallet_high).
+        // For wallet_low (synced=20), height 30 is fresh and 70 is also fresh
+        // since 70 > 20. For wallet_high (synced=60), height 30 is below its
+        // synced_height so it must be skipped, while 70 is fresh.
+        let (key_30, f_30) = filter_for_address(30, &address_low);
+        let (key_70, f_70) = filter_for_address(70, &address_high);
+        let mut filters: HashMap<FilterMatchKey, BlockFilter> = HashMap::new();
+        filters.insert(key_30.clone(), f_30);
+        filters.insert(key_70.clone(), f_70);
+
+        let mut batch = FiltersBatch::new(0, 99, filters);
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+
+        // wallet_high also "discovers" address_low to demonstrate that even
+        // when a new address would match a low height, the per-wallet
+        // synced_height filter prevents emitting it.
+        let mut new_addresses: HashMap<WalletId, HashSet<Address>> = HashMap::new();
+        new_addresses.insert(wallet_low, HashSet::from([address_low.clone()]));
+        new_addresses.insert(wallet_high, HashSet::from([address_low.clone(), address_high]));
+
+        let events = manager.rescan_batch(0, &new_addresses).await.unwrap();
+
+        let blocks = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::BlocksNeeded {
+                    blocks,
+                } => Some(blocks),
+                _ => None,
+            })
+            .expect("BlocksNeeded event");
+
+        // wallet_low must see height 30, wallet_high must NOT (synced=60>30).
+        let attr_30 = blocks.get(&key_30).expect("entry at height 30 for wallet_low");
+        assert!(attr_30.contains(&wallet_low));
+        assert!(!attr_30.contains(&wallet_high));
+
+        // wallet_high must see height 70 since 70 > 60.
+        let attr_70 = blocks.get(&key_70).expect("entry at height 70 for wallet_high");
+        assert!(attr_70.contains(&wallet_high));
     }
 
     /// `scan_batch` for a behind wallet with no monitored addresses still
