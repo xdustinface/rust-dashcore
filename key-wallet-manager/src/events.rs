@@ -7,7 +7,6 @@
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::Txid;
-use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::WalletCoreBalance;
 
@@ -23,18 +22,15 @@ pub enum RecordAction {
     Updated,
 }
 
-/// A single transaction record delivered by a wallet event, paired with the
-/// account it belongs to and whether it is a fresh insertion or an update to
-/// a previously stored record.
+/// A transaction record paired with the action that just happened to it
+/// (`Inserted` for a fresh record, `Updated` for a record whose state changed).
 ///
 /// Used as a single value by `TransactionReceived` and as a `Vec` by
 /// `BlockProcessed`, so consumers can share a single record-handling code
-/// path across both events.
+/// path across both events. The owning account is available on
+/// `record.account_type`.
 #[derive(Debug, Clone)]
-pub struct RecordChange {
-    /// Account within the wallet that the record belongs to. The full BIP-32
-    /// derivation path is recoverable via `account_type.derivation_path(network)`.
-    pub account_type: AccountType,
+pub struct TransactionRecordUpdate {
     /// Whether the record is new or an update to a previously stored one.
     pub action: RecordAction,
     /// The full transaction record.
@@ -49,7 +45,7 @@ pub struct RecordChange {
 #[derive(Debug, Clone)]
 pub enum WalletEvent {
     /// A wallet-relevant transaction was first seen off-chain (mempool, or
-    /// directly via an InstantSend lock — in that case `change.record.context`
+    /// directly via an InstantSend lock — in that case `update.record.context`
     /// is `InstantSend(..)`).
     TransactionReceived {
         /// ID of the affected wallet.
@@ -58,7 +54,7 @@ pub enum WalletEvent {
         ///
         /// Boxed to keep the enum compact: `TransactionRecord` is large and
         /// would otherwise inflate every variant to its size.
-        change: Box<RecordChange>,
+        update: Box<TransactionRecordUpdate>,
         /// Wallet balance after the transaction was recorded.
         balance: WalletCoreBalance,
     },
@@ -75,7 +71,7 @@ pub enum WalletEvent {
     },
     /// A block was processed for a wallet. Carries the newly-recorded and
     /// state-modified transaction records plus the post-block balance.
-    /// `changes` may be empty when only the balance shifted (e.g. a
+    /// `updates` may be empty when only the balance shifted (e.g. a
     /// coinbase maturing as the scanned height advanced past its threshold).
     BlockProcessed {
         /// ID of the affected wallet.
@@ -83,7 +79,7 @@ pub enum WalletEvent {
         /// Height of the block that was processed.
         height: CoreBlockHeight,
         /// Transaction records recorded or updated by this block.
-        changes: Vec<RecordChange>,
+        updates: Vec<TransactionRecordUpdate>,
         /// Wallet balance after the block was processed.
         balance: WalletCoreBalance,
     },
@@ -127,13 +123,13 @@ impl WalletEvent {
     pub fn description(&self) -> String {
         match self {
             WalletEvent::TransactionReceived {
-                change,
+                update,
                 balance,
                 ..
             } => {
                 format!(
                     "TransactionReceived(txid={}, context={}, balance={})",
-                    change.record.txid, change.record.context, balance
+                    update.record.txid, update.record.context, balance
                 )
             }
             WalletEvent::TransactionInstantSendLocked {
@@ -145,14 +141,14 @@ impl WalletEvent {
             }
             WalletEvent::BlockProcessed {
                 height,
-                changes,
+                updates,
                 balance,
                 ..
             } => {
                 format!(
-                    "BlockProcessed(height={}, changes={}, balance={})",
+                    "BlockProcessed(height={}, updates={}, balance={})",
                     height,
-                    changes.len(),
+                    updates.len(),
                     balance
                 )
             }

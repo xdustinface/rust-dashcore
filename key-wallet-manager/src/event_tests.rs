@@ -47,16 +47,16 @@ async fn test_mempool_tx_emits_single_event_with_balance() {
     match &events[0] {
         WalletEvent::TransactionReceived {
             wallet_id: wid,
-            change,
+            update,
             balance,
         } => {
             assert_eq!(*wid, wallet_id);
-            assert_eq!(change.record.txid, tx.txid());
-            assert_eq!(change.record.context, TransactionContext::Mempool);
-            assert_eq!(change.record.net_amount, TX_AMOUNT as i64);
-            assert_eq!(change.action, RecordAction::Inserted);
+            assert_eq!(update.record.txid, tx.txid());
+            assert_eq!(update.record.context, TransactionContext::Mempool);
+            assert_eq!(update.record.net_amount, TX_AMOUNT as i64);
+            assert_eq!(update.action, RecordAction::Inserted);
             assert!(matches!(
-                change.account_type,
+                update.record.account_type,
                 AccountType::Standard {
                     index: 0,
                     standard_account_type: StandardAccountType::BIP44Account
@@ -82,12 +82,12 @@ async fn test_mempool_tx_with_instant_lock_emits_received_event_with_locked_bala
     match &events[0] {
         WalletEvent::TransactionReceived {
             wallet_id: wid,
-            change,
+            update,
             balance,
         } => {
             assert_eq!(*wid, wallet_id);
-            assert!(matches!(change.record.context, TransactionContext::InstantSend(_)));
-            assert_eq!(change.action, RecordAction::Inserted);
+            assert!(matches!(update.record.context, TransactionContext::InstantSend(_)));
+            assert_eq!(update.action, RecordAction::Inserted);
             assert_eq!(balance.confirmed(), TX_AMOUNT);
             assert_eq!(balance.unconfirmed(), 0);
         }
@@ -261,23 +261,23 @@ async fn test_block_with_new_tx_emits_inserted_update() {
         WalletEvent::BlockProcessed {
             wallet_id: wid,
             height,
-            changes,
+            updates,
             balance,
         } => {
             assert_eq!(*wid, wallet_id);
             assert_eq!(*height, 100);
-            assert_eq!(changes.len(), 1);
+            assert_eq!(updates.len(), 1);
             assert!(matches!(
-                changes[0].account_type,
+                updates[0].record.account_type,
                 AccountType::Standard {
                     index: 0,
                     standard_account_type: StandardAccountType::BIP44Account
                 }
             ));
-            assert_eq!(changes[0].action, RecordAction::Inserted);
-            assert_eq!(changes[0].record.txid, tx.txid());
+            assert_eq!(updates[0].action, RecordAction::Inserted);
+            assert_eq!(updates[0].record.txid, tx.txid());
             assert!(matches!(
-                changes[0].record.context,
+                updates[0].record.context,
                 TransactionContext::InBlock(info) if info.height() == 100
             ));
             assert_eq!(balance.confirmed(), TX_AMOUNT);
@@ -304,14 +304,14 @@ async fn test_block_confirming_known_mempool_tx_emits_updated_update() {
         WalletEvent::BlockProcessed {
             wallet_id: wid,
             height,
-            changes,
+            updates,
             balance,
         } => {
             assert_eq!(*wid, wallet_id);
             assert_eq!(*height, 200);
-            assert_eq!(changes.len(), 1);
-            assert_eq!(changes[0].action, RecordAction::Updated);
-            assert_eq!(changes[0].record.txid, tx.txid());
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].action, RecordAction::Updated);
+            assert_eq!(updates[0].record.txid, tx.txid());
             // Confirmation moves balance from unconfirmed to confirmed
             assert_eq!(balance.confirmed(), TX_AMOUNT);
             assert_eq!(balance.unconfirmed(), 0);
@@ -392,21 +392,21 @@ async fn test_block_with_index_less_account_tx_carries_account_type() {
     match block_event {
         WalletEvent::BlockProcessed {
             wallet_id: wid,
-            changes,
+            updates,
             ..
         } => {
             assert_eq!(*wid, wallet_id);
-            let identity_change = changes
+            let identity_update = updates
                 .iter()
-                .find(|c| matches!(c.account_type, AccountType::IdentityRegistration))
+                .find(|u| matches!(u.record.account_type, AccountType::IdentityRegistration))
                 .unwrap_or_else(|| {
                     panic!(
-                        "expected a change for AccountType::IdentityRegistration, got: {:?}",
-                        changes
+                        "expected an update for AccountType::IdentityRegistration, got: {:?}",
+                        updates
                     )
                 });
-            assert_eq!(identity_change.action, RecordAction::Inserted);
-            assert_eq!(identity_change.record.txid, tx.txid());
+            assert_eq!(identity_update.action, RecordAction::Inserted);
+            assert_eq!(identity_update.record.txid, tx.txid());
         }
         _ => unreachable!(),
     }

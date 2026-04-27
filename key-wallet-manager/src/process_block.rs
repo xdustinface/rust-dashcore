@@ -1,5 +1,5 @@
 use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
-use crate::{RecordAction, RecordChange, WalletEvent, WalletId, WalletManager};
+use crate::{RecordAction, TransactionRecordUpdate, WalletEvent, WalletId, WalletManager};
 use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
@@ -21,7 +21,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         let info = BlockInfo::new(height, block.block_hash(), block.header.time);
 
         let snapshot = self.snapshot_balances();
-        let mut per_wallet_changes: BTreeMap<WalletId, Vec<RecordChange>> = BTreeMap::new();
+        let mut per_wallet_updates: BTreeMap<WalletId, Vec<TransactionRecordUpdate>> =
+            BTreeMap::new();
 
         for tx in &block.txdata {
             let context = TransactionContext::InBlock(info);
@@ -40,20 +41,18 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             result.new_addresses.extend(check_result.new_addresses);
 
             for (wallet_id, records) in check_result.per_wallet_new_records {
-                let entry = per_wallet_changes.entry(wallet_id).or_default();
+                let entry = per_wallet_updates.entry(wallet_id).or_default();
                 for record in records {
-                    entry.push(RecordChange {
-                        account_type: record.account_type,
+                    entry.push(TransactionRecordUpdate {
                         action: RecordAction::Inserted,
                         record,
                     });
                 }
             }
             for (wallet_id, records) in check_result.per_wallet_updated_records {
-                let entry = per_wallet_changes.entry(wallet_id).or_default();
+                let entry = per_wallet_updates.entry(wallet_id).or_default();
                 for record in records {
-                    entry.push(RecordChange {
-                        account_type: record.account_type,
+                    entry.push(TransactionRecordUpdate {
                         action: RecordAction::Updated,
                         record,
                     });
@@ -70,14 +69,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 
         for (wallet_id, info) in &self.wallet_infos {
             let new_balance = info.balance();
-            let changes = per_wallet_changes.remove(wallet_id).unwrap_or_default();
+            let updates = per_wallet_updates.remove(wallet_id).unwrap_or_default();
             let balance_changed = snapshot.get(wallet_id).copied() != Some(new_balance);
 
-            if !changes.is_empty() || balance_changed {
+            if !updates.is_empty() || balance_changed {
                 let event = WalletEvent::BlockProcessed {
                     wallet_id: *wallet_id,
                     height,
-                    changes,
+                    updates,
                     balance: new_balance,
                 };
                 let _ = self.event_sender.send(event);
@@ -124,8 +123,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             for record in records {
                 let event = WalletEvent::TransactionReceived {
                     wallet_id,
-                    change: Box::new(RecordChange {
-                        account_type: record.account_type,
+                    update: Box::new(TransactionRecordUpdate {
                         action: RecordAction::Inserted,
                         record,
                     }),
@@ -198,7 +196,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 let event = WalletEvent::BlockProcessed {
                     wallet_id: *wallet_id,
                     height,
-                    changes: Vec::new(),
+                    updates: Vec::new(),
                     balance: new_balance,
                 };
                 let _ = self.event_sender.send(event);
@@ -347,12 +345,12 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             if let WalletEvent::TransactionReceived {
                 balance,
-                change,
+                update,
                 ..
             } = event
             {
-                assert_eq!(change.record.txid, tx.txid(), "event should carry the mempool tx");
-                assert_eq!(change.action, RecordAction::Inserted);
+                assert_eq!(update.record.txid, tx.txid(), "event should carry the mempool tx");
+                assert_eq!(update.action, RecordAction::Inserted);
                 assert!(balance.unconfirmed() > 0, "unconfirmed balance should increase");
                 found = true;
                 break;
@@ -398,16 +396,16 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             if let WalletEvent::BlockProcessed {
                 height,
-                changes,
+                updates,
                 balance,
                 ..
             } = event
             {
                 assert_eq!(height, 100);
                 assert!(balance.confirmed() > 0, "confirmed balance should increase after block");
-                assert_eq!(changes.len(), 1);
-                assert_eq!(changes[0].action, RecordAction::Inserted);
-                assert_eq!(changes[0].record.txid, tx.txid());
+                assert_eq!(updates.len(), 1);
+                assert_eq!(updates[0].action, RecordAction::Inserted);
+                assert_eq!(updates[0].record.txid, tx.txid());
                 found = true;
                 break;
             }

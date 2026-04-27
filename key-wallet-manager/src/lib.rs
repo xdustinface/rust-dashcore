@@ -20,7 +20,7 @@ mod process_block;
 mod wallet_interface;
 
 pub use error::WalletError;
-pub use events::{RecordAction, RecordChange, WalletEvent};
+pub use events::{RecordAction, TransactionRecordUpdate, WalletEvent};
 pub use matching::{check_compact_filters_for_addresses, FilterMatchKey};
 pub use wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 

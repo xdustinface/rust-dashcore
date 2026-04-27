@@ -15,7 +15,7 @@ use key_wallet::account::StandardAccountType;
 use key_wallet::AccountType;
 use key_wallet_ffi::managed_account::FFITransactionRecord;
 use key_wallet_ffi::types::FFIBalance;
-use key_wallet_manager::{RecordAction, RecordChange, WalletEvent};
+use key_wallet_manager::{RecordAction, TransactionRecordUpdate, WalletEvent};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
@@ -652,10 +652,10 @@ impl FFIAccountType {
     }
 }
 
-/// FFI-friendly form of `RecordChange`: a `TransactionRecord` paired with the
-/// account it belongs to and whether it is a fresh insertion or an update to
-/// an existing record. Used as a single value by `on_transaction_received`
-/// and as an array element by `on_block_processed`.
+/// FFI-friendly form of `TransactionRecordUpdate`: a `TransactionRecord`
+/// paired with the account it belongs to and whether it is a fresh insertion
+/// or an update to an existing record. Used as a single value by
+/// `on_transaction_received` and as an array element by `on_block_processed`.
 #[repr(C)]
 pub struct FFIRecordChange {
     /// Discriminant identifying the account variant (see `FFIAccountType`).
@@ -670,13 +670,14 @@ pub struct FFIRecordChange {
 }
 
 impl FFIRecordChange {
-    fn from_record_change(change: &RecordChange) -> Self {
-        let (account_type, account_index) = FFIAccountType::from_account_type(&change.account_type);
+    fn from_record_update(update: &TransactionRecordUpdate) -> Self {
+        let (account_type, account_index) =
+            FFIAccountType::from_account_type(&update.record.account_type);
         Self {
             account_type,
             account_index,
-            action: FFIRecordAction::from(change.action),
-            record: FFITransactionRecord::from(&change.record),
+            action: FFIRecordAction::from(update.action),
+            record: FFITransactionRecord::from(&update.record),
         }
     }
 }
@@ -685,7 +686,7 @@ impl FFIRecordChange {
 ///
 /// Fires when a wallet-relevant transaction is first seen off-chain — either
 /// in the mempool, or directly via an InstantSend lock (in that case the
-/// record's `context` is `InstantSend(..)`). `change.action` is always
+/// record's `context` is `InstantSend(..)`). `update.action` is always
 /// `Inserted` for this callback.
 ///
 /// All pointer parameters are borrowed and only valid for the duration of the
@@ -694,7 +695,7 @@ impl FFIRecordChange {
 pub type OnTransactionReceivedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
-        change: *const FFIRecordChange,
+        update: *const FFIRecordChange,
         balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
@@ -718,21 +719,21 @@ pub type OnTransactionInstantSendLockedCallback = Option<
 
 /// Callback for `WalletEvent::BlockProcessed`.
 ///
-/// Fires once per wallet affected by a processed block. `changes` points to
-/// an array of `change_count` `FFIRecordChange` entries covering records
+/// Fires once per wallet affected by a processed block. `updates` points to
+/// an array of `update_count` `FFIRecordChange` entries covering records
 /// newly recorded or updated by this block. The array may be empty (and
-/// `changes` will be null) when only the wallet's balance shifted (e.g. a
+/// `updates` will be null) when only the wallet's balance shifted (e.g. a
 /// coinbase maturing). `balance` is the wallet's balance *after* the block
 /// was processed.
 ///
-/// The `changes` array and all its contents are borrowed and only valid for
+/// The `updates` array and all its contents are borrowed and only valid for
 /// the duration of the callback.
 pub type OnWalletBlockProcessedCallback = Option<
     extern "C" fn(
         wallet_id: *const c_char,
         height: u32,
-        changes: *const FFIRecordChange,
-        change_count: u32,
+        updates: *const FFIRecordChange,
+        update_count: u32,
         balance: *const FFIBalance,
         user_data: *mut c_void,
     ),
@@ -752,7 +753,7 @@ pub type OnSyncedHeightUpdatedCallback =
 /// Set only the callbacks you're interested in; unset callbacks will be ignored.
 ///
 /// All pointer parameters passed to callbacks (wallet IDs, txids, records,
-/// balances, changes) are borrowed and only valid for the duration of the
+/// balances, updates) are borrowed and only valid for the duration of the
 /// callback invocation. Callers must copy any data they need to retain.
 #[repr(C)]
 #[derive(Clone)]
@@ -871,18 +872,18 @@ impl FFIWalletEventCallbacks {
         match event {
             WalletEvent::TransactionReceived {
                 wallet_id,
-                change,
+                update,
                 balance,
             } => {
                 if let Some(cb) = self.on_transaction_received {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
-                    let ffi_change = FFIRecordChange::from_record_change(change.as_ref());
+                    let ffi_update = FFIRecordChange::from_record_update(update.as_ref());
                     let ffi_balance = FFIBalance::from(*balance);
 
                     cb(
                         c_wallet_id.as_ptr(),
-                        &ffi_change as *const FFIRecordChange,
+                        &ffi_update as *const FFIRecordChange,
                         &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
@@ -914,35 +915,35 @@ impl FFIWalletEventCallbacks {
             WalletEvent::BlockProcessed {
                 wallet_id,
                 height,
-                changes,
+                updates,
                 balance,
             } => {
                 if let Some(cb) = self.on_block_processed {
                     let wallet_id_hex = hex::encode(wallet_id);
                     let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
-                    let ffi_changes: Vec<FFIRecordChange> =
-                        changes.iter().map(FFIRecordChange::from_record_change).collect();
+                    let ffi_updates: Vec<FFIRecordChange> =
+                        updates.iter().map(FFIRecordChange::from_record_update).collect();
                     let ffi_balance = FFIBalance::from(*balance);
 
-                    // Pass a null `changes` pointer when the array is empty so
+                    // Pass a null `updates` pointer when the array is empty so
                     // C/Swift consumers that null-check before reading don't
                     // see a non-null dangling pointer paired with a zero count.
-                    let changes_ptr = if ffi_changes.is_empty() {
+                    let updates_ptr = if ffi_updates.is_empty() {
                         ptr::null()
                     } else {
-                        ffi_changes.as_ptr()
+                        ffi_updates.as_ptr()
                     };
 
                     cb(
                         c_wallet_id.as_ptr(),
                         *height,
-                        changes_ptr,
-                        ffi_changes.len() as u32,
+                        updates_ptr,
+                        ffi_updates.len() as u32,
                         &ffi_balance as *const FFIBalance,
                         self.user_data,
                     );
 
-                    drop(ffi_changes);
+                    drop(ffi_updates);
                 }
             }
             WalletEvent::SyncedHeightUpdated {

@@ -141,13 +141,13 @@ pub(super) async fn wait_for_mempool_tx(
             _ = &mut timeout => return None,
             result = receiver.recv() => {
                 match result {
-                    Ok(WalletEvent::TransactionReceived { ref change, .. })
+                    Ok(WalletEvent::TransactionReceived { ref update, .. })
                         if matches!(
-                            change.record.context,
+                            update.record.context,
                             TransactionContext::Mempool | TransactionContext::InstantSend(_)
                         ) =>
                     {
-                        return Some(change.record.txid);
+                        return Some(update.record.txid);
                     }
                     Ok(_) => continue,
                     Err(_) => return None,
