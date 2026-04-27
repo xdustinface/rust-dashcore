@@ -16,6 +16,7 @@ use key_wallet_ffi::types::FFIBalance;
 use key_wallet_manager::{RecordAction, WalletEvent};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
+use std::ptr;
 
 // ============================================================================
 // Sync Event Types (for FFISyncEventCallbacks)
@@ -822,10 +823,19 @@ impl FFIWalletEventCallbacks {
                         .collect();
                     let ffi_balance = FFIBalance::from(*balance);
 
+                    // Pass a null `updates` pointer when the array is empty so
+                    // C/Swift consumers that null-check before reading don't
+                    // see a non-null dangling pointer paired with a zero count.
+                    let updates_ptr = if ffi_updates.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_updates.as_ptr()
+                    };
+
                     cb(
                         c_wallet_id.as_ptr(),
                         *height,
-                        ffi_updates.as_ptr(),
+                        updates_ptr,
                         ffi_updates.len() as u32,
                         &ffi_balance as *const FFIBalance,
                         self.user_data,
