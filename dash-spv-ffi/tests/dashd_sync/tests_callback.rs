@@ -274,11 +274,20 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
             tracker.mempool_transaction_received_count.load(Ordering::SeqCst);
         let block_records_before = tracker.block_process_change_record_count.load(Ordering::SeqCst);
 
-        // Send DASH to the wallet and mine a block
+        // Send DASH to the wallet. Wait for the mempool callback before mining
+        // so the SPV node observes the transaction in the mempool. If we mine
+        // immediately, the block path can deliver the transaction first and
+        // the mempool callback would never fire.
         let receive_address = ctx.get_receive_address(&wallet_id);
         let send_amount = Amount::from_sat(100_000_000);
         let txid = dashd.node.send_to_address(&receive_address, send_amount);
         tracing::info!("Sent {} to wallet, txid: {}", send_amount, txid);
+
+        tracker.wait_for_callback(
+            &tracker.mempool_transaction_received_count,
+            mempool_received_before,
+            "mempool_transaction_received",
+        );
 
         let miner_address = dashd.node.get_new_address_from_wallet("default");
         dashd.node.generate_blocks(1, &miner_address);
@@ -286,12 +295,7 @@ fn test_callbacks_post_sync_transactions_and_disconnect() {
         // Wait for incremental sync to complete
         ctx.wait_for_sync(dashd.initial_height + 1);
 
-        // Wait for wallet callbacks (they travel on a separate channel from sync events)
-        tracker.wait_for_callback(
-            &tracker.mempool_transaction_received_count,
-            mempool_received_before,
-            "mempool_transaction_received",
-        );
+        // Wait for the block-record callback (mempool callback already observed above).
         tracker.wait_for_callback(
             &tracker.block_process_change_record_count,
             block_records_before,
