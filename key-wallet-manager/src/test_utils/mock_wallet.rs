@@ -359,3 +359,146 @@ impl WalletInterface for NonMatchingMockWallet {
         "NonMatchingWallet (test implementation)".to_string()
     }
 }
+
+/// Per-wallet state held inside `MultiMockWallet`.
+#[derive(Default)]
+pub struct MockWalletState {
+    pub addresses: Vec<Address>,
+    pub synced_height: CoreBlockHeight,
+    pub last_processed_height: CoreBlockHeight,
+}
+
+/// Multi-wallet mock that holds independent state for several wallet IDs,
+/// enabling tests that exercise per-wallet attribution paths.
+pub struct MultiMockWallet {
+    wallets: std::collections::BTreeMap<WalletId, MockWalletState>,
+    event_sender: broadcast::Sender<WalletEvent>,
+    /// Track every block processed for assertions.
+    processed: Arc<Mutex<Vec<(WalletId, dashcore::BlockHash, u32)>>>,
+}
+
+impl Default for MultiMockWallet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MultiMockWallet {
+    pub fn new() -> Self {
+        let (event_sender, _) = broadcast::channel(16);
+        Self {
+            wallets: std::collections::BTreeMap::new(),
+            event_sender,
+            processed: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Insert or replace a wallet's state.
+    pub fn insert_wallet(&mut self, wallet_id: WalletId, state: MockWalletState) {
+        self.wallets.insert(wallet_id, state);
+    }
+
+    /// Mutable access to a wallet's state, panicking if absent.
+    pub fn wallet_mut(&mut self, wallet_id: &WalletId) -> &mut MockWalletState {
+        self.wallets.get_mut(wallet_id).expect("wallet present")
+    }
+
+    pub fn processed(&self) -> Arc<Mutex<Vec<(WalletId, dashcore::BlockHash, u32)>>> {
+        self.processed.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl WalletInterface for MultiMockWallet {
+    async fn process_block_for_wallets(
+        &mut self,
+        block: &Block,
+        height: CoreBlockHeight,
+        wallets: &BTreeSet<WalletId>,
+    ) -> BlockProcessingResult {
+        let hash = block.block_hash();
+        let mut processed = self.processed.lock().await;
+        for wallet_id in wallets {
+            if let Some(state) = self.wallets.get_mut(wallet_id) {
+                processed.push((*wallet_id, hash, height));
+                if height > state.last_processed_height {
+                    state.last_processed_height = height;
+                }
+            }
+        }
+        BlockProcessingResult::default()
+    }
+
+    async fn process_mempool_transaction(
+        &mut self,
+        _tx: &Transaction,
+        _instant_lock: Option<InstantLock>,
+    ) -> MempoolTransactionResult {
+        MempoolTransactionResult::default()
+    }
+
+    fn monitored_addresses(&self) -> Vec<Address> {
+        self.wallets.values().flat_map(|s| s.addresses.iter().cloned()).collect()
+    }
+
+    fn monitored_addresses_for(&self, wallet_id: &WalletId) -> Vec<Address> {
+        self.wallets.get(wallet_id).map(|s| s.addresses.clone()).unwrap_or_default()
+    }
+
+    fn watched_outpoints(&self) -> Vec<OutPoint> {
+        Vec::new()
+    }
+
+    fn last_processed_height(&self) -> CoreBlockHeight {
+        self.wallets.values().map(|s| s.last_processed_height).max().unwrap_or(0)
+    }
+
+    fn synced_height(&self) -> CoreBlockHeight {
+        self.wallets.values().map(|s| s.synced_height).min().unwrap_or(0)
+    }
+
+    fn wallets_behind(&self, height: CoreBlockHeight) -> BTreeSet<WalletId> {
+        self.wallets
+            .iter()
+            .filter_map(|(id, s)| {
+                if s.synced_height < height {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn wallet_synced_height(&self, wallet_id: &WalletId) -> CoreBlockHeight {
+        self.wallets.get(wallet_id).map(|s| s.synced_height).unwrap_or(0)
+    }
+
+    fn update_wallet_synced_height(&mut self, wallet_id: &WalletId, height: CoreBlockHeight) {
+        if let Some(state) = self.wallets.get_mut(wallet_id) {
+            if height > state.synced_height {
+                state.synced_height = height;
+            }
+        }
+    }
+
+    fn update_wallet_last_processed_height(
+        &mut self,
+        wallet_id: &WalletId,
+        height: CoreBlockHeight,
+    ) {
+        if let Some(state) = self.wallets.get_mut(wallet_id) {
+            if height > state.last_processed_height {
+                state.last_processed_height = height;
+            }
+        }
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
+        self.event_sender.subscribe()
+    }
+
+    async fn describe(&self) -> String {
+        "MultiMockWallet (test implementation)".to_string()
+    }
+}
