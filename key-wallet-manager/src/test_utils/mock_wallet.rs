@@ -285,9 +285,12 @@ impl WalletInterface for NonMatchingMockWallet {
     async fn process_block_for_wallets(
         &mut self,
         _block: &Block,
-        _height: u32,
-        _wallets: &BTreeSet<WalletId>,
+        height: u32,
+        wallets: &BTreeSet<WalletId>,
     ) -> BlockProcessingResult {
+        if wallets.contains(&self.wallet_id) && height > self.last_processed_height {
+            self.last_processed_height = height;
+        }
         BlockProcessingResult::default()
     }
 
