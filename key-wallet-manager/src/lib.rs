@@ -89,6 +89,9 @@ pub struct CheckTransactionsResult {
     /// Records whose state was updated by this check (confirmation or
     /// InstantSend lock on a previously stored record), grouped by wallet.
     pub per_wallet_updated_records: BTreeMap<WalletId, Vec<(DerivationPath, TransactionRecord)>>,
+    /// Number of records dropped because `AccountType::derivation_path` failed.
+    /// Tests can assert this remains zero to catch silent record loss.
+    pub dropped_records_missing_path: u32,
 }
 
 /// High-level wallet manager that manages multiple wallets
@@ -504,7 +507,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                     }
 
                     let network = self.network;
-                    let to_path_pairs = |records: Vec<(AccountType, TransactionRecord)>| {
+                    let mut dropped = 0u32;
+                    let mut to_path_pairs = |records: Vec<(AccountType, TransactionRecord)>| {
                         records
                             .into_iter()
                             .filter_map(|(account_type, record)| {
@@ -516,6 +520,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                                             error = %e,
                                             "Skipping wallet event: failed to derive account path"
                                         );
+                                        dropped += 1;
                                         None
                                     }
                                 }
@@ -539,6 +544,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                             .or_default()
                             .extend(updated_records_with_path);
                     }
+                    result.dropped_records_missing_path =
+                        result.dropped_records_missing_path.saturating_add(dropped);
                 }
 
                 result.new_addresses.extend(check_result.new_addresses);
