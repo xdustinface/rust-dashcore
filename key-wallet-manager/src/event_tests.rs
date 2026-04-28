@@ -15,6 +15,7 @@ use dashcore::{
 };
 use key_wallet::account::StandardAccountType;
 use key_wallet::AccountType;
+use std::collections::BTreeSet;
 
 fn make_block(txdata: Vec<Transaction>, seed: u8, time: u32) -> Block {
     Block {
@@ -226,7 +227,8 @@ async fn test_late_instant_send_lock_after_block_confirmation_emits_event() {
 
     // Confirm the transaction in a block first.
     let block = make_block(vec![tx.clone()], 0xe3, 4000);
-    manager.process_block(&block, 300).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 300, &wallets).await;
 
     let mut rx = manager.subscribe_events();
     let lock = InstantLock {
@@ -274,7 +276,8 @@ async fn test_block_with_new_tx_emits_inserted_record() {
     let tx = create_tx_paying_to(&addr, 0xcc);
     let block = make_block(vec![tx.clone()], 0xcc, 1000);
 
-    let result = manager.process_block(&block, 100).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    let result = manager.process_block_for_wallets(&block, 100, &wallets).await;
     assert_eq!(result.new_txids.len(), 1);
 
     let events = drain_events(&mut rx);
@@ -321,7 +324,8 @@ async fn test_block_confirming_known_mempool_tx_emits_updated_record() {
 
     let mut rx = manager.subscribe_events();
     let block = make_block(vec![tx.clone()], 0xdd, 2000);
-    manager.process_block(&block, 200).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 200, &wallets).await;
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 1, "one BlockProcessed expected, got {:?}", events);
@@ -409,7 +413,8 @@ async fn test_block_with_index_less_account_tx_carries_account_type() {
 
     let mut rx = manager.subscribe_events();
     let block = make_block(vec![tx.clone()], 0xee, 9999);
-    manager.process_block(&block, 9000).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 9000, &wallets).await;
 
     let events = drain_events(&mut rx);
     let block_event = events
@@ -442,11 +447,12 @@ async fn test_block_with_index_less_account_tx_carries_account_type() {
 
 #[tokio::test]
 async fn test_empty_block_for_idle_wallet_emits_nothing() {
-    let (mut manager, _wallet_id, _addr) = setup_manager_with_wallet();
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
     let mut rx = manager.subscribe_events();
     let block = make_block(Vec::new(), 0x55, 3000);
 
-    manager.process_block(&block, 50).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 50, &wallets).await;
     assert_no_events(&mut rx);
 }
 
@@ -460,13 +466,14 @@ async fn test_block_processed_carries_matured_coinbase_record() {
     let coinbase_tx = make_coinbase_paying_to(&addr, 5_000_000_000);
     let coinbase_height = 100;
     let coinbase_block = make_block(vec![coinbase_tx.clone()], 0xc0, 4000);
-    manager.process_block(&coinbase_block, coinbase_height).await;
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&coinbase_block, coinbase_height, &wallets).await;
 
     // Advance to maturity height. With coinbase_height = 100, maturity is at
     // height 200. Processing block 200 must surface the matured record.
     let mut rx = manager.subscribe_events();
     let mature_block = make_block(Vec::new(), 0xc1, 5000);
-    manager.process_block(&mature_block, coinbase_height + 100).await;
+    manager.process_block_for_wallets(&mature_block, coinbase_height + 100, &wallets).await;
 
     let events = drain_events(&mut rx);
     let block_event = events
@@ -501,11 +508,11 @@ async fn test_block_processed_carries_matured_coinbase_record() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_update_synced_height_emits_event_per_wallet() {
+async fn test_update_wallet_synced_height_emits_event_per_wallet() {
     let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
     let mut rx = manager.subscribe_events();
 
-    manager.update_synced_height(1000);
+    manager.update_wallet_synced_height(&wallet_id, 1000);
 
     let synced_events: Vec<_> = drain_events(&mut rx)
         .into_iter()
@@ -521,15 +528,15 @@ async fn test_update_synced_height_emits_event_per_wallet() {
 }
 
 #[tokio::test]
-async fn test_update_synced_height_does_not_re_emit_when_unchanged() {
-    let (mut manager, _wallet_id, _addr) = setup_manager_with_wallet();
+async fn test_update_wallet_synced_height_does_not_re_emit_when_unchanged() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
     let mut rx = manager.subscribe_events();
 
-    manager.update_synced_height(2000);
+    manager.update_wallet_synced_height(&wallet_id, 2000);
     drain_events(&mut rx);
 
     // Re-calling with the same height must not emit another SyncHeightAdvanced
-    manager.update_synced_height(2000);
+    manager.update_wallet_synced_height(&wallet_id, 2000);
     let events = drain_events(&mut rx);
     assert!(
         !events.iter().any(|e| matches!(e, WalletEvent::SyncHeightAdvanced { .. })),
@@ -538,7 +545,7 @@ async fn test_update_synced_height_does_not_re_emit_when_unchanged() {
     );
 
     // Going backwards also must not emit
-    manager.update_synced_height(1500);
+    manager.update_wallet_synced_height(&wallet_id, 1500);
     let events = drain_events(&mut rx);
     assert!(
         !events.iter().any(|e| matches!(e, WalletEvent::SyncHeightAdvanced { .. })),
