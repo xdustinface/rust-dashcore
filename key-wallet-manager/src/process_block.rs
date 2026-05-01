@@ -1,3 +1,4 @@
+use crate::events::diff_account_balances;
 use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 use crate::{WalletEvent, WalletId, WalletManager};
 use async_trait::async_trait;
@@ -5,9 +6,11 @@ use core::fmt::Write as _;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, Transaction};
+use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::{BlockInfo, TransactionContext};
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+use key_wallet::WalletCoreBalance;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::broadcast;
 
@@ -80,10 +83,21 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         };
 
         // Refresh cached balances for affected wallets before emitting so
-        // every event carries a post-change balance.
+        // every event carries a post-change balance, snapshotting before
+        // and after to surface only accounts whose balance actually
+        // changed. The cached `.balance` field is stale until
+        // `update_balance()` runs, so the pre-snapshot taken here captures
+        // the pre-transaction state.
+        let mut per_wallet_account_diff: BTreeMap<
+            WalletId,
+            BTreeMap<AccountType, WalletCoreBalance>,
+        > = BTreeMap::new();
         for wallet_id in &check_result.affected_wallets {
             if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
+                let prior = info.account_balances();
                 info.update_balance();
+                let current = info.account_balances();
+                per_wallet_account_diff.insert(*wallet_id, diff_account_balances(&prior, &current));
             }
         }
 
@@ -96,11 +110,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 continue;
             };
             let balance = info.balance();
+            let account_balances =
+                per_wallet_account_diff.get(&wallet_id).cloned().unwrap_or_default();
             for record in records {
                 let event = WalletEvent::TransactionDetected {
                     wallet_id,
                     record: Box::new(record),
                     balance,
+                    account_balances: account_balances.clone(),
                 };
                 let _ = self.event_sender.send(event);
             }
@@ -115,12 +132,15 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                     continue;
                 };
                 let balance = info.balance();
+                let account_balances =
+                    per_wallet_account_diff.get(&wallet_id).cloned().unwrap_or_default();
                 for record in records {
                     let event = WalletEvent::TransactionInstantLocked {
                         wallet_id,
                         txid: record.txid,
                         instant_lock: lock.clone(),
                         balance,
+                        account_balances: account_balances.clone(),
                     };
                     let _ = self.event_sender.send(event);
                 }
@@ -210,6 +230,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
     fn process_instant_send_lock(&mut self, instant_lock: InstantLock) {
         let txid = instant_lock.txid;
 
+        // `mark_instant_send_utxos` recomputes balances internally when any
+        // UTXO is newly marked, so we have to snapshot per-account balances
+        // up front to surface the diff afterwards.
+        let mut prior_account_balances: BTreeMap<
+            WalletId,
+            BTreeMap<AccountType, WalletCoreBalance>,
+        > = self.wallet_infos.iter().map(|(id, info)| (*id, info.account_balances())).collect();
+
         let mut affected_wallets = Vec::new();
         for (wallet_id, info) in self.wallet_infos.iter_mut() {
             if info.mark_instant_send_utxos(&txid, &instant_lock) {
@@ -226,11 +254,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             let Some(info) = self.wallet_infos.get(&wallet_id) else {
                 continue;
             };
+            let prior = prior_account_balances.remove(&wallet_id).unwrap_or_default();
+            let account_balances = diff_account_balances(&prior, &info.account_balances());
             let _ = self.event_sender().send(WalletEvent::TransactionInstantLocked {
                 wallet_id,
                 txid,
                 instant_lock: instant_lock.clone(),
                 balance: info.balance(),
+                account_balances,
             });
         }
     }
@@ -286,6 +317,13 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
         }
 
         let snapshot = self.snapshot_balances();
+        let mut prior_account_balances: BTreeMap<
+            WalletId,
+            BTreeMap<AccountType, WalletCoreBalance>,
+        > = wallets
+            .iter()
+            .filter_map(|id| self.wallet_infos.get(id).map(|info| (*id, info.account_balances())))
+            .collect();
         let prior_heights: BTreeMap<WalletId, CoreBlockHeight> = wallets
             .iter()
             .filter_map(|id| {
@@ -332,6 +370,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
             let updated = per_wallet_updated.remove(wallet_id).unwrap_or_default();
             let matured = per_wallet_matured.remove(wallet_id).unwrap_or_default();
             let balance_changed = snapshot.get(wallet_id).copied() != Some(new_balance);
+            let prior = prior_account_balances.remove(wallet_id).unwrap_or_default();
+            let account_balances = diff_account_balances(&prior, &info.account_balances());
 
             if !inserted.is_empty() || !updated.is_empty() || !matured.is_empty() || balance_changed
             {
@@ -342,6 +382,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                     updated,
                     matured,
                     balance: new_balance,
+                    account_balances,
                 };
                 let _ = self.event_sender.send(event);
             }

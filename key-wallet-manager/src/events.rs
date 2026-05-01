@@ -4,13 +4,52 @@
 //! triggered it and the wallet's new balance after the change. Consumers can
 //! persist the transaction(s) and balance atomically off a single event.
 
+use std::collections::BTreeMap;
+
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::Txid;
+use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::WalletCoreBalance;
 
 use crate::WalletId;
+
+/// Diff `current` against `prior` and return only the entries whose
+/// balance changed (including ones missing from `prior`). Intended for
+/// pairing two snapshots taken via
+/// [`WalletInfoInterface::account_balances`] before and after a
+/// mutation.
+pub(crate) fn diff_account_balances(
+    prior: &BTreeMap<AccountType, WalletCoreBalance>,
+    current: &BTreeMap<AccountType, WalletCoreBalance>,
+) -> BTreeMap<AccountType, WalletCoreBalance> {
+    let mut changed = BTreeMap::new();
+    for (account_type, new_balance) in current {
+        match prior.get(account_type) {
+            Some(prior_balance) if prior_balance == new_balance => {}
+            _ => {
+                changed.insert(*account_type, *new_balance);
+            }
+        }
+    }
+    changed
+}
+
+/// Render the changed-account balance map as a short bracketed list
+/// suitable for log lines, e.g. `[Standard{idx:0,BIP44}=>1.5 DASH]`.
+fn format_account_balances(map: &BTreeMap<AccountType, WalletCoreBalance>) -> String {
+    if map.is_empty() {
+        return "[]".to_string();
+    }
+    let parts: Vec<String> = map
+        .iter()
+        .map(|(account_type, balance)| {
+            format!("{}=>{}", account_type, dashcore::Amount::from_sat(balance.total()))
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
 
 /// Events emitted by the wallet manager.
 ///
@@ -29,6 +68,12 @@ pub enum WalletEvent {
         record: Box<TransactionRecord>,
         /// Wallet balance after the transaction was recorded.
         balance: WalletCoreBalance,
+        /// Post-event balance **snapshots** for accounts whose balance
+        /// changed as a result of this event. Each value is the account's
+        /// full balance after the change — not a delta. Accounts whose
+        /// balance was unchanged are omitted to keep the payload small
+        /// (most transactions touch only 1–2 accounts).
+        account_balances: BTreeMap<AccountType, WalletCoreBalance>,
     },
     /// An InstantSend lock was applied to a previously-seen off-chain
     /// wallet-relevant transaction.
@@ -41,6 +86,10 @@ pub enum WalletEvent {
         instant_lock: InstantLock,
         /// Wallet balance after the status change.
         balance: WalletCoreBalance,
+        /// Post-event balance **snapshots** for accounts whose balance
+        /// changed as a result of this event. Each value is the account's
+        /// full balance after the change — not a delta.
+        account_balances: BTreeMap<AccountType, WalletCoreBalance>,
     },
     /// A block was processed for a wallet. Carries records bucketed by what
     /// happened to them in this block, plus the post-block balance.
@@ -62,6 +111,11 @@ pub enum WalletEvent {
         matured: Vec<TransactionRecord>,
         /// Wallet balance after the block was processed.
         balance: WalletCoreBalance,
+        /// Post-event balance **snapshots** for accounts whose balance
+        /// changed during processing of this block. Each value is the
+        /// account's full balance after the change — not a delta. Accounts
+        /// whose balance was unchanged are omitted.
+        account_balances: BTreeMap<AccountType, WalletCoreBalance>,
     },
     /// The wallet's scan cursor advanced because the filter pipeline
     /// committed a batch covering blocks up to `height`. No records or
@@ -104,19 +158,29 @@ impl WalletEvent {
             WalletEvent::TransactionDetected {
                 record,
                 balance,
+                account_balances,
                 ..
             } => {
                 format!(
-                    "TransactionDetected(txid={}, context={}, balance={})",
-                    record.txid, record.context, balance
+                    "TransactionDetected(txid={}, context={}, balance={}, account_balances={})",
+                    record.txid,
+                    record.context,
+                    balance,
+                    format_account_balances(account_balances),
                 )
             }
             WalletEvent::TransactionInstantLocked {
                 txid,
                 balance,
+                account_balances,
                 ..
             } => {
-                format!("TransactionInstantLocked(txid={}, balance={})", txid, balance)
+                format!(
+                    "TransactionInstantLocked(txid={}, balance={}, account_balances={})",
+                    txid,
+                    balance,
+                    format_account_balances(account_balances),
+                )
             }
             WalletEvent::BlockProcessed {
                 height,
@@ -124,15 +188,17 @@ impl WalletEvent {
                 updated,
                 matured,
                 balance,
+                account_balances,
                 ..
             } => {
                 format!(
-                    "BlockProcessed(height={}, inserted={}, updated={}, matured={}, balance={})",
+                    "BlockProcessed(height={}, inserted={}, updated={}, matured={}, balance={}, account_balances={})",
                     height,
                     inserted.len(),
                     updated.len(),
                     matured.len(),
-                    balance
+                    balance,
+                    format_account_balances(account_balances),
                 )
             }
             WalletEvent::SyncHeightAdvanced {

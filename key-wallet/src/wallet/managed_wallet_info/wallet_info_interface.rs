@@ -2,10 +2,10 @@
 //!
 //! This trait allows WalletManager to work with different wallet info implementations
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::managed_account_operations::ManagedAccountOperations;
-use crate::account::ManagedAccountTrait;
+use crate::account::{AccountType, ManagedAccountTrait};
 use crate::managed_account::managed_account_collection::ManagedAccountCollection;
 use crate::transaction_checking::TransactionContext;
 use crate::transaction_checking::WalletTransactionChecker;
@@ -75,6 +75,15 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
 
     /// Update the wallet balance
     fn update_balance(&mut self);
+
+    /// Per-account balances keyed by `AccountType`.
+    fn account_balances(&self) -> BTreeMap<AccountType, WalletCoreBalance> {
+        self.accounts()
+            .all_accounts()
+            .iter()
+            .map(|acc| (acc.managed_account_type().to_account_type(), *acc.balance()))
+            .collect()
+    }
 
     /// Get transaction history
     fn transaction_history(&self) -> Vec<&TransactionRecord>;
