@@ -16,6 +16,8 @@ pub struct MasternodesProgress {
     block_header_tip_height: u32,
     /// Number of mnlistdiffs processed in the current sync session.
     diffs_processed: u32,
+    /// Number of QRInfo requests sent in the current sync session.
+    qr_infos_requested: u32,
     /// The last time a mnlistdiff was stored/processed or the last manager state change.
     last_activity: Instant,
 }
@@ -28,6 +30,7 @@ impl Default for MasternodesProgress {
             target_height: 0,
             block_header_tip_height: 0,
             diffs_processed: 0,
+            qr_infos_requested: 0,
             last_activity: Instant::now(),
         }
     }
@@ -55,6 +58,11 @@ impl MasternodesProgress {
     /// Number of mnlistdiffs processed in the current sync session.
     pub fn diffs_processed(&self) -> u32 {
         self.diffs_processed
+    }
+
+    /// Number of QRInfo requests sent in the current sync session.
+    pub fn qr_infos_requested(&self) -> u32 {
+        self.qr_infos_requested
     }
 
     /// The last time a mnlistdiff was stored/processed or the last manager state change.
@@ -94,6 +102,11 @@ impl MasternodesProgress {
         self.bump_last_activity();
     }
 
+    pub fn add_qr_infos_requested(&mut self, count: u32) {
+        self.qr_infos_requested += count;
+        self.bump_last_activity();
+    }
+
     pub fn bump_last_activity(&mut self) {
         self.last_activity = Instant::now();
     }
@@ -103,11 +116,12 @@ impl fmt::Display for MasternodesProgress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:?} {}/{} | diffs_processed: {}, last_activity: {}s",
+            "{:?} {}/{} | diffs_processed: {}, qr_infos_requested: {}, last_activity: {}s",
             self.state,
             self.current_height,
             self.target_height,
             self.diffs_processed,
+            self.qr_infos_requested,
             self.last_activity.elapsed().as_secs()
         )
     }
