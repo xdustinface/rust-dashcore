@@ -160,10 +160,7 @@ impl MasternodeListEngine {
                     );
                 }
                 Err(e) => {
-                    return_statuses.insert(
-                        quorum.quorum_entry.quorum_hash,
-                        LLMQEntryVerificationStatus::Invalid(e),
-                    );
+                    return_statuses.insert(quorum.quorum_entry.quorum_hash, e.into());
                 }
             }
         }
