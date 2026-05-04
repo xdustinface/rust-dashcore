@@ -219,4 +219,28 @@ mod tests {
             assert_eq!(actual, expected, "case: {error:?}");
         }
     }
+
+    #[test]
+    fn skip_status_display_formats_new_variants() {
+        let h = dummy_hash(1);
+        let cases: Vec<(LLMQEntryVerificationSkipStatus, String)> = vec![
+            (LLMQEntryVerificationSkipStatus::MissingSnapshot(h), format!("MissingSnapshot({h})")),
+            (
+                LLMQEntryVerificationSkipStatus::MissingChainLock(42, h),
+                format!("MissingChainLock(42, {h})"),
+            ),
+            (
+                LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(h),
+                format!("MissingRotationChainLockSigs({h})"),
+            ),
+            (
+                LLMQEntryVerificationSkipStatus::MissingRotationChainLockSig(2, h),
+                format!("MissingRotationChainLockSig(h - 2, {h})"),
+            ),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(status.to_string(), expected, "case: {status:?}");
+        }
+    }
 }
