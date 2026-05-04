@@ -105,9 +105,7 @@ impl From<QuorumValidationError> for LLMQEntryVerificationStatus {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(hash))
             }
             QuorumValidationError::RequiredChainLockNotPresent(height, block_hash) => {
-                Self::Skipped(LLMQEntryVerificationSkipStatus::MissingChainLock(
-                    height, block_hash,
-                ))
+                Self::Skipped(LLMQEntryVerificationSkipStatus::MissingChainLock(height, block_hash))
             }
             QuorumValidationError::RequiredRotatedChainLockSigsNotPresent(quorum_hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(
@@ -227,9 +225,9 @@ mod tests {
             QuorumValidationError::RequiredChainLockNotPresent(7, hash).into();
         assert_eq!(
             status,
-            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissingChainLock(
-                7, hash,
-            ))
+            LLMQEntryVerificationStatus::Skipped(
+                LLMQEntryVerificationSkipStatus::MissingChainLock(7, hash,)
+            )
         );
     }
 

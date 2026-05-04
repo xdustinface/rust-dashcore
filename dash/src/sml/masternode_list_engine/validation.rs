@@ -170,3 +170,89 @@ impl MasternodeListEngine {
         return_statuses
     }
 }
+
+#[cfg(all(test, feature = "quorum_validation"))]
+mod tests {
+    use hashes::Hash;
+
+    use super::*;
+    use crate::bls_sig_utils::{BLSPublicKey, BLSSignature};
+    use crate::hash_types::QuorumVVecHash;
+    use crate::sml::llmq_entry_verification::{
+        LLMQEntryVerificationSkipStatus, LLMQEntryVerificationStatus,
+    };
+    use crate::sml::llmq_type::LLMQType;
+    use crate::sml::quorum_entry::qualified_quorum_entry::QualifiedQuorumEntry;
+    use crate::transaction::special_transaction::quorum_commitment::QuorumEntry;
+
+    fn rotating_quorum(
+        quorum_hash: QuorumHash,
+        quorum_index: i16,
+        valid_structure: bool,
+    ) -> QualifiedQuorumEntry {
+        let (signers, valid_members, public_key, threshold_sig, agg_sig) = if valid_structure {
+            (
+                vec![true; 4],
+                vec![true; 4],
+                BLSPublicKey::from([1; 48]),
+                BLSSignature::from([1; 96]),
+                BLSSignature::from([1; 96]),
+            )
+        } else {
+            (
+                vec![false; 4],
+                vec![false; 4],
+                BLSPublicKey::from([0; 48]),
+                BLSSignature::from([0; 96]),
+                BLSSignature::from([0; 96]),
+            )
+        };
+        QuorumEntry {
+            version: 2,
+            llmq_type: LLMQType::LlmqtypeTestDIP0024,
+            quorum_hash,
+            quorum_index: Some(quorum_index),
+            signers,
+            valid_members,
+            quorum_public_key: public_key,
+            quorum_vvec_hash: QuorumVVecHash::all_zeros(),
+            threshold_sig,
+            all_commitment_aggregated_signature: agg_sig,
+        }
+        .into()
+    }
+
+    #[test]
+    fn rotation_cycle_statuses_classify_infra_error_as_skipped_and_preserve_invalid() {
+        let engine = MasternodeListEngine::default();
+
+        let broken_hash = QuorumHash::from_byte_array([1; 32]);
+        let unknown_hash = QuorumHash::from_byte_array([2; 32]);
+        let broken = rotating_quorum(broken_hash, 0, false);
+        let unknown_block = rotating_quorum(unknown_hash, 1, true);
+
+        let statuses =
+            engine.validate_rotation_cycle_quorums_validation_statuses(&[&broken, &unknown_block]);
+
+        assert!(
+            matches!(
+                statuses.get(&broken_hash),
+                Some(LLMQEntryVerificationStatus::Invalid(
+                    QuorumValidationError::InsufficientSigners { .. }
+                )),
+            ),
+            "structurally-broken quorum must keep its Invalid status, got {:?}",
+            statuses.get(&broken_hash),
+        );
+        assert!(
+            matches!(
+                statuses.get(&unknown_hash),
+                Some(LLMQEntryVerificationStatus::Skipped(
+                    LLMQEntryVerificationSkipStatus::UnknownBlock(_),
+                )),
+            ),
+            "infrastructure-error quorum must surface as Skipped, got {:?}",
+            statuses.get(&unknown_hash),
+        );
+    }
+}
