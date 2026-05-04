@@ -3,9 +3,9 @@ use core::fmt::{Display, Formatter};
 #[cfg(feature = "bincode")]
 use bincode::{Decode, Encode};
 
-use crate::BlockHash;
 use crate::prelude::CoreBlockHeight;
 use crate::sml::quorum_validation_error::QuorumValidationError;
+use crate::{BlockHash, QuorumHash};
 
 #[derive(Clone, Ord, PartialOrd, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "bincode", derive(Encode, Decode))]
@@ -20,7 +20,7 @@ pub enum LLMQEntryVerificationSkipStatus {
     /// DKG successfully committed, so `apply_diff` extracts no
     /// `rotation_sig` and `feed_qr_info` can't populate the 4-sig tuple for
     /// the quorums in `lastCommitmentPerIndex`.
-    MissingRotationChainLockSigs(BlockHash),
+    MissingRotationChainLockSigs(QuorumHash),
     OtherContext(String),
 }
 
