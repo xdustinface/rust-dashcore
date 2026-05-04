@@ -111,6 +111,12 @@ impl MasternodeListEngine {
             Err(e) => {
                 let status: LLMQEntryVerificationStatus = e.into();
                 for quorum in quorums {
+                    if matches!(
+                        return_statuses.get(&quorum.quorum_entry.quorum_hash),
+                        Some(LLMQEntryVerificationStatus::Invalid(_))
+                    ) {
+                        continue;
+                    }
                     return_statuses.insert(quorum.quorum_entry.quorum_hash, status.clone());
                 }
                 return return_statuses;
