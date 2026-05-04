@@ -25,6 +25,12 @@ pub enum LLMQEntryVerificationSkipStatus {
     /// `rotation_sig` and `feed_qr_info` can't populate the 4-sig tuple for
     /// the quorums in `lastCommitmentPerIndex`.
     MissingRotationChainLockSigs(QuorumHash),
+    /// A specific rotation chain-lock signature at offset `h - n` was not
+    /// present for the masternode diff at the given block hash. The first
+    /// field is the rotation offset, the second is the diff block hash.
+    /// Distinct from `MissingRotationChainLockSigs`, which covers the case
+    /// where the entire 4-sig tuple is absent.
+    MissingRotationChainLockSig(u8, BlockHash),
     OtherContext(String),
 }
 
@@ -46,6 +52,12 @@ impl Display for LLMQEntryVerificationSkipStatus {
                 }
                 LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(quorum_hash) => {
                     format!("MissingRotationChainLockSigs({})", quorum_hash)
+                }
+                LLMQEntryVerificationSkipStatus::MissingRotationChainLockSig(
+                    offset,
+                    block_hash,
+                ) => {
+                    format!("MissingRotationChainLockSig(h - {}, {})", offset, block_hash)
                 }
                 LLMQEntryVerificationSkipStatus::OtherContext(message) => {
                     format!("OtherContext({message})")
@@ -76,15 +88,24 @@ impl From<QuorumValidationError> for LLMQEntryVerificationStatus {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(block_hash))
             }
             QuorumValidationError::RequiredMasternodeListNotPresent(height)
-            | QuorumValidationError::RequiredBlockHeightNotPresent(height) => {
+            | QuorumValidationError::RequiredBlockHeightNotPresent(height)
+            | QuorumValidationError::VerifyingMasternodeListNotPresent(height) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissedList(height))
             }
             QuorumValidationError::RequiredSnapshotNotPresent(hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(hash))
             }
+            QuorumValidationError::RequiredChainLockNotPresent(_, block_hash) => {
+                Self::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(block_hash))
+            }
             QuorumValidationError::RequiredRotatedChainLockSigsNotPresent(quorum_hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(
                     quorum_hash,
+                ))
+            }
+            QuorumValidationError::RequiredRotatedChainLockSigNotPresent(offset, block_hash) => {
+                Self::Skipped(LLMQEntryVerificationSkipStatus::MissingRotationChainLockSig(
+                    offset, block_hash,
                 ))
             }
             other => Self::Invalid(other),
@@ -172,6 +193,42 @@ mod tests {
             LLMQEntryVerificationStatus::Skipped(
                 LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(hash),
             )
+        );
+    }
+
+    #[test]
+    fn required_rotated_chain_lock_sig_not_present_maps_to_skipped() {
+        let hash = dummy_hash(4);
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredRotatedChainLockSigNotPresent(2, hash).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(
+                LLMQEntryVerificationSkipStatus::MissingRotationChainLockSig(2, hash),
+            )
+        );
+    }
+
+    #[test]
+    fn required_chain_lock_not_present_maps_to_skipped_unknown_block() {
+        let hash = dummy_hash(5);
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredChainLockNotPresent(7, hash).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(
+                hash,
+            ))
+        );
+    }
+
+    #[test]
+    fn verifying_masternode_list_not_present_maps_to_skipped_missed_list() {
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::VerifyingMasternodeListNotPresent(123).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissedList(123))
         );
     }
 
