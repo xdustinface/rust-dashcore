@@ -18,6 +18,12 @@ pub enum LLMQEntryVerificationSkipStatus {
     /// by the caller. Distinct from `UnknownBlock` so retry/back-off logic
     /// can target snapshot fetches separately from block fetches.
     MissingSnapshot(BlockHash),
+    /// The chain lock at the given height/block hash was not provided by the
+    /// caller. The block itself may be known; the chain-lock signature for
+    /// it just hasn't been fetched yet. Distinct from `UnknownBlock` so
+    /// retry logic can dispatch to a chain-lock fetch instead of a block
+    /// fetch.
+    MissingChainLock(CoreBlockHeight, BlockHash),
     /// The quorum entry came through without an attached
     /// `VerifyingChainLockSignaturesType::Rotating`. Typically happens when
     /// a QRInfo's historical diff covers a block range in which no rotating
@@ -49,6 +55,9 @@ impl Display for LLMQEntryVerificationSkipStatus {
                 }
                 LLMQEntryVerificationSkipStatus::MissingSnapshot(block_hash) => {
                     format!("MissingSnapshot({})", block_hash)
+                }
+                LLMQEntryVerificationSkipStatus::MissingChainLock(height, block_hash) => {
+                    format!("MissingChainLock({}, {})", height, block_hash)
                 }
                 LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(quorum_hash) => {
                     format!("MissingRotationChainLockSigs({})", quorum_hash)
@@ -95,8 +104,10 @@ impl From<QuorumValidationError> for LLMQEntryVerificationStatus {
             QuorumValidationError::RequiredSnapshotNotPresent(hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(hash))
             }
-            QuorumValidationError::RequiredChainLockNotPresent(_, block_hash) => {
-                Self::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(block_hash))
+            QuorumValidationError::RequiredChainLockNotPresent(height, block_hash) => {
+                Self::Skipped(LLMQEntryVerificationSkipStatus::MissingChainLock(
+                    height, block_hash,
+                ))
             }
             QuorumValidationError::RequiredRotatedChainLockSigsNotPresent(quorum_hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(
@@ -210,14 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn required_chain_lock_not_present_maps_to_skipped_unknown_block() {
+    fn required_chain_lock_not_present_maps_to_skipped_missing_chain_lock() {
         let hash = dummy_hash(5);
         let status: LLMQEntryVerificationStatus =
             QuorumValidationError::RequiredChainLockNotPresent(7, hash).into();
         assert_eq!(
             status,
-            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(
-                hash,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissingChainLock(
+                7, hash,
             ))
         );
     }
