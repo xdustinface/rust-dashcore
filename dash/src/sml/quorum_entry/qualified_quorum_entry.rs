@@ -96,40 +96,21 @@ mod tests {
     }
 
     #[test]
-    fn update_quorum_status_classifies_infra_error_as_skipped() {
+    fn update_quorum_status_delegates_to_classifier() {
         let mut entry = dummy_qualified_quorum_entry();
-        let snapshot_hash = QuorumHash::from_byte_array([7; 32]);
+        entry.update_quorum_status(Ok(()));
+        assert_eq!(entry.verified, LLMQEntryVerificationStatus::Verified);
 
+        let snapshot_hash = QuorumHash::from_byte_array([7; 32]);
+        let mut entry = dummy_qualified_quorum_entry();
         entry.update_quorum_status(Err(QuorumValidationError::RequiredSnapshotNotPresent(
             snapshot_hash,
         )));
-
         assert_eq!(
             entry.verified,
             LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(
                 snapshot_hash,
             )),
         );
-    }
-
-    #[test]
-    fn update_quorum_status_classifies_bad_data_error_as_invalid() {
-        let mut entry = dummy_qualified_quorum_entry();
-
-        entry.update_quorum_status(Err(QuorumValidationError::InvalidQuorumPublicKey));
-
-        assert_eq!(
-            entry.verified,
-            LLMQEntryVerificationStatus::Invalid(QuorumValidationError::InvalidQuorumPublicKey),
-        );
-    }
-
-    #[test]
-    fn update_quorum_status_marks_ok_as_verified() {
-        let mut entry = dummy_qualified_quorum_entry();
-
-        entry.update_quorum_status(Ok(()));
-
-        assert_eq!(entry.verified, LLMQEntryVerificationStatus::Verified);
     }
 }
