@@ -105,3 +105,83 @@ impl Display for LLMQEntryVerificationStatus {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use hashes::Hash;
+
+    use super::*;
+
+    fn dummy_hash(byte: u8) -> BlockHash {
+        BlockHash::from_byte_array([byte; 32])
+    }
+
+    #[test]
+    fn required_block_not_present_maps_to_skipped_unknown_block() {
+        let hash = dummy_hash(1);
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredBlockNotPresent(hash, "ctx".to_string()).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(
+                hash,
+            ))
+        );
+    }
+
+    #[test]
+    fn required_masternode_list_not_present_maps_to_skipped_missed_list() {
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredMasternodeListNotPresent(42).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissedList(42))
+        );
+    }
+
+    #[test]
+    fn required_block_height_not_present_maps_to_skipped_missed_list() {
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredBlockHeightNotPresent(99).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissedList(99))
+        );
+    }
+
+    #[test]
+    fn required_snapshot_not_present_maps_to_skipped_missing_snapshot() {
+        let hash = dummy_hash(2);
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredSnapshotNotPresent(hash).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(
+                hash,
+            ))
+        );
+    }
+
+    #[test]
+    fn required_rotated_chain_lock_sigs_not_present_maps_to_skipped() {
+        let hash = dummy_hash(3);
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::RequiredRotatedChainLockSigsNotPresent(hash).into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Skipped(
+                LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(hash),
+            )
+        );
+    }
+
+    #[test]
+    fn other_error_maps_to_invalid() {
+        let status: LLMQEntryVerificationStatus =
+            QuorumValidationError::InvalidQuorumPublicKey.into();
+        assert_eq!(
+            status,
+            LLMQEntryVerificationStatus::Invalid(QuorumValidationError::InvalidQuorumPublicKey)
+        );
+    }
+}
