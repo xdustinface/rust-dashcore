@@ -171,9 +171,7 @@ mod tests {
     use super::*;
     use crate::bls_sig_utils::{BLSPublicKey, BLSSignature};
     use crate::hash_types::QuorumVVecHash;
-    use crate::sml::llmq_entry_verification::{
-        LLMQEntryVerificationSkipStatus, LLMQEntryVerificationStatus,
-    };
+    use crate::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
     use crate::sml::llmq_type::LLMQType;
     use crate::sml::quorum_entry::qualified_quorum_entry::QualifiedQuorumEntry;
     use crate::transaction::special_transaction::quorum_commitment::QuorumEntry;
@@ -233,12 +231,7 @@ mod tests {
             statuses.get(&broken_hash),
         );
         assert!(
-            matches!(
-                statuses.get(&unknown_hash),
-                Some(LLMQEntryVerificationStatus::Skipped(
-                    LLMQEntryVerificationSkipStatus::UnknownBlock(_),
-                )),
-            ),
+            matches!(statuses.get(&unknown_hash), Some(LLMQEntryVerificationStatus::Skipped(_))),
             "infrastructure-error quorum must surface as Skipped, got {:?}",
             statuses.get(&unknown_hash),
         );
@@ -258,12 +251,7 @@ mod tests {
 
         for hash in [hash_a, hash_b] {
             assert!(
-                matches!(
-                    statuses.get(&hash),
-                    Some(LLMQEntryVerificationStatus::Skipped(
-                        LLMQEntryVerificationSkipStatus::UnknownBlock(_),
-                    )),
-                ),
+                matches!(statuses.get(&hash), Some(LLMQEntryVerificationStatus::Skipped(_))),
                 "every quorum must be Skipped when find_rotated_masternodes_for_quorums errors and no entry was pre-marked Invalid, got {:?} for {:?}",
                 statuses.get(&hash),
                 hash,
