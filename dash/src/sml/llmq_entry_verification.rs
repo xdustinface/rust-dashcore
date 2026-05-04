@@ -14,6 +14,10 @@ pub enum LLMQEntryVerificationSkipStatus {
     NotMarkedForVerification,
     MissedList(CoreBlockHeight),
     UnknownBlock(BlockHash),
+    /// The snapshot required to validate this quorum entry was not provided
+    /// by the caller. Distinct from `UnknownBlock` so retry/back-off logic
+    /// can target snapshot fetches separately from block fetches.
+    MissingSnapshot(BlockHash),
     /// The quorum entry came through without an attached
     /// `VerifyingChainLockSignaturesType::Rotating`. Typically happens when
     /// a QRInfo's historical diff covers a block range in which no rotating
@@ -36,6 +40,9 @@ impl Display for LLMQEntryVerificationSkipStatus {
                 }
                 LLMQEntryVerificationSkipStatus::UnknownBlock(block_hash) => {
                     format!("UnknownBlock({})", block_hash)
+                }
+                LLMQEntryVerificationSkipStatus::MissingSnapshot(block_hash) => {
+                    format!("MissingSnapshot({})", block_hash)
                 }
                 LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(quorum_hash) => {
                     format!("MissingRotationChainLockSigs({})", quorum_hash)
@@ -73,7 +80,7 @@ impl From<QuorumValidationError> for LLMQEntryVerificationStatus {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissedList(height))
             }
             QuorumValidationError::RequiredSnapshotNotPresent(hash) => {
-                Self::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(hash))
+                Self::Skipped(LLMQEntryVerificationSkipStatus::MissingSnapshot(hash))
             }
             QuorumValidationError::RequiredRotatedChainLockSigsNotPresent(quorum_hash) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::MissingRotationChainLockSigs(
