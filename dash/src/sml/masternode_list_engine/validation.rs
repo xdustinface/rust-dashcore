@@ -89,19 +89,15 @@ impl MasternodeListEngine {
         // first let's do basic structure validation
         for quorum in quorums {
             if let Err(e) = quorum.quorum_entry.validate_structure() {
-                return_statuses.insert(
-                    quorum.quorum_entry.quorum_hash,
-                    LLMQEntryVerificationStatus::Invalid(e),
-                );
+                return_statuses.insert(quorum.quorum_entry.quorum_hash, e.into());
             } else if !quorum.quorum_entry.llmq_type.is_rotating_quorum_type() {
                 return_statuses.insert(
                     quorum.quorum_entry.quorum_hash,
-                    LLMQEntryVerificationStatus::Invalid(
-                        QuorumValidationError::ExpectedOnlyRotatedQuorums(
-                            quorum.quorum_entry.quorum_hash,
-                            quorum.quorum_entry.llmq_type,
-                        ),
-                    ),
+                    QuorumValidationError::ExpectedOnlyRotatedQuorums(
+                        quorum.quorum_entry.quorum_hash,
+                        quorum.quorum_entry.llmq_type,
+                    )
+                    .into(),
                 );
             }
         }
