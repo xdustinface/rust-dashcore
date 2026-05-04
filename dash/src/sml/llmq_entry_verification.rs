@@ -96,6 +96,11 @@ impl From<QuorumValidationError> for LLMQEntryVerificationStatus {
             QuorumValidationError::RequiredBlockNotPresent(block_hash, _) => {
                 Self::Skipped(LLMQEntryVerificationSkipStatus::UnknownBlock(block_hash))
             }
+            // `VerifyingMasternodeListNotPresent` is grouped here because the
+            // verifying masternode list at the validation height is caller-
+            // supplied infrastructure, not quorum data. Treating it as
+            // `Skipped` mirrors the sibling `RequiredMasternodeListNotPresent`
+            // case and lets the caller refetch instead of rejecting the quorum.
             QuorumValidationError::RequiredMasternodeListNotPresent(height)
             | QuorumValidationError::RequiredBlockHeightNotPresent(height)
             | QuorumValidationError::VerifyingMasternodeListNotPresent(height) => {
