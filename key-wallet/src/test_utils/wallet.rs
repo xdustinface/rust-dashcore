@@ -1,7 +1,8 @@
 use dashcore::{Address, Network, Transaction, Txid};
 
 use crate::{
-    account::{ManagedCoreAccount, TransactionRecord},
+    account::{ManagedCoreFundsAccount, TransactionRecord},
+    managed_account::managed_account_trait::ManagedAccountTrait,
     transaction_checking::{TransactionCheckResult, TransactionContext, WalletTransactionChecker},
     wallet::{initialization::WalletAccountCreationOptions, ManagedWalletInfo},
     ExtendedPubKey, Utxo, Wallet,
@@ -55,13 +56,13 @@ impl TestWalletContext {
     }
 
     /// Returns the first BIP44 managed account (immutable).
-    pub fn bip44_account(&self) -> &ManagedCoreAccount {
+    pub fn bip44_account(&self) -> &ManagedCoreFundsAccount {
         self.managed_wallet.first_bip44_managed_account().expect("Should have BIP44 account")
     }
 
     /// Returns a transaction record by txid from the first BIP44 account.
     pub fn transaction(&self, txid: &Txid) -> &TransactionRecord {
-        self.bip44_account().transactions.get(txid).expect("Should have transaction")
+        self.bip44_account().transactions().get(txid).expect("Should have transaction")
     }
 
     /// Returns the first UTXO from the first BIP44 account.

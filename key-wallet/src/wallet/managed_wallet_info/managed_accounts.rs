@@ -7,9 +7,10 @@ use super::{managed_account_operations::ManagedAccountOperations, ManagedWalletI
 use crate::account::BLSAccount;
 #[cfg(feature = "eddsa")]
 use crate::account::EdDSAAccount;
-use crate::account::{Account, AccountType, ManagedCoreAccount};
+use crate::account::{Account, AccountType, ManagedCoreFundsAccount};
 use crate::bip32::ExtendedPubKey;
 use crate::error::{Error, Result};
+use crate::managed_account::managed_account_trait::ManagedAccountTrait;
 use crate::wallet::{Wallet, WalletType};
 
 impl ManagedAccountOperations for ManagedWalletInfo {
@@ -42,7 +43,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
         })?;
 
         // Create the ManagedAccount from the Account
-        let managed_account = ManagedCoreAccount::from_account(account);
+        let managed_account = ManagedCoreFundsAccount::from_account(account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
@@ -117,7 +118,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
         let account = Account::new(None, account_type, account_xpub, self.network)?;
 
         // Create the ManagedAccount from the Account
-        let managed_account = ManagedCoreAccount::from_account(&account);
+        let managed_account = ManagedCoreFundsAccount::from_account(&account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
@@ -162,7 +163,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
         })?;
 
         // Create the ManagedAccount from the BLS Account
-        let managed_account = ManagedCoreAccount::from_bls_account(bls_account);
+        let managed_account = ManagedCoreFundsAccount::from_bls_account(bls_account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
@@ -234,7 +235,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
             BLSAccount::from_public_key_bytes(None, account_type, bls_public_key, self.network)?;
 
         // Create the ManagedAccount from the BLS Account
-        let managed_account = ManagedCoreAccount::from_bls_account(&bls_account);
+        let managed_account = ManagedCoreFundsAccount::from_bls_account(&bls_account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
@@ -280,7 +281,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
             })?;
 
         // Create the ManagedAccount from the EdDSA Account
-        let managed_account = ManagedCoreAccount::from_eddsa_account(eddsa_account);
+        let managed_account = ManagedCoreFundsAccount::from_eddsa_account(eddsa_account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
@@ -356,7 +357,7 @@ impl ManagedAccountOperations for ManagedWalletInfo {
         )?;
 
         // Create the ManagedAccount from the EdDSA Account
-        let managed_account = ManagedCoreAccount::from_eddsa_account(&eddsa_account);
+        let managed_account = ManagedCoreFundsAccount::from_eddsa_account(&eddsa_account);
 
         // Check if managed account already exists
         if self.accounts.contains_managed_account_type(managed_account.managed_type()) {
