@@ -139,7 +139,7 @@ Functions: 63
 
 ### Account Management
 
-Functions: 109
+Functions: 108
 
 | Function | Description | Module |
 |----------|-------------|--------|
@@ -237,7 +237,6 @@ Functions: 109
 | `managed_core_account_get_external_address_pool` | Get the external address pool from a managed account  This function returns... | managed_account |
 | `managed_core_account_get_index` | Get the account index from a managed account  Returns the primary account... | managed_account |
 | `managed_core_account_get_internal_address_pool` | Get the internal address pool from a managed account  This function returns... | managed_account |
-| `managed_core_account_get_is_watch_only` | Check if a managed account is watch-only  # Safety  - `account` must be a... | managed_account |
 | `managed_core_account_get_network` | Get the network of a managed account  # Safety  - `account` must be a valid... | managed_account |
 | `managed_core_account_get_transaction_count` | Get the number of transactions in a managed account  # Safety  - `account`... | managed_account |
 | `managed_core_account_get_transactions` | Get all transactions from a managed account  Returns an array of... | managed_account |
@@ -3148,22 +3147,6 @@ Get the internal address pool from a managed account  This function returns the 
 
 **Safety:**
 - `account` must be a valid pointer to an FFIManagedCoreAccount instance - The returned pool must be freed with `address_pool_free` when no longer needed
-
-**Module:** `managed_account`
-
----
-
-#### `managed_core_account_get_is_watch_only`
-
-```c
-managed_core_account_get_is_watch_only(account: *const FFIManagedCoreAccount,) -> bool
-```
-
-**Description:**
-Check if a managed account is watch-only  # Safety  - `account` must be a valid pointer to an FFIManagedCoreAccount instance
-
-**Safety:**
-- `account` must be a valid pointer to an FFIManagedCoreAccount instance
 
 **Module:** `managed_account`
 
