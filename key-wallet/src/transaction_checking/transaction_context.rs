@@ -73,6 +73,19 @@ impl TransactionContext {
         matches!(self, TransactionContext::InstantSend(_))
     }
 
+    /// Returns whether the transaction has been mined in a block that is
+    /// itself chainlocked — the strongest finality signal we have, and
+    /// the only one we treat as truly "finalized".
+    ///
+    /// `InBlock` alone is not enough (the block can still be reorganized
+    /// out), and `InstantSend` alone is not enough either (the
+    /// surrounding block confirmation may still arrive and write the
+    /// height / block hash before the chainlock catches up). Only
+    /// `InChainLockedBlock` qualifies.
+    pub fn is_chain_locked(&self) -> bool {
+        matches!(self, TransactionContext::InChainLockedBlock(_))
+    }
+
     /// Returns the block info if confirmed.
     pub fn block_info(&self) -> Option<&BlockInfo> {
         match self {

@@ -44,6 +44,26 @@ pub trait ManagedAccountTrait {
     /// Get mutable transactions
     fn transactions_mut(&mut self) -> &mut BTreeMap<Txid, TransactionRecord>;
 
+    /// Returns `true` if this account has already processed `txid`,
+    /// whether it is still represented as a full record in `transactions`
+    /// or has been pruned (under the default feature configuration) and
+    /// is now only retained as a finalized-txid marker. Used by callers
+    /// that need to distinguish a brand-new sighting from a re-processing
+    /// (mempool → block, IS-lock arrival, chainlock, …).
+    fn has_transaction(&self, txid: &Txid) -> bool;
+
+    /// Returns `true` if `txid` has been mined in a block that is itself
+    /// chainlocked — the only finality signal we treat as terminal
+    /// (mirrors [`crate::transaction_checking::TransactionContext::is_chain_locked`]).
+    ///
+    /// `InBlock` alone is not enough (the block can still be reorganized
+    /// out), and `InstantSend` alone is not enough either (the
+    /// surrounding block confirmation may still arrive and write the
+    /// height / block hash before the chainlock catches up). Only
+    /// `InChainLockedBlock` qualifies. This is the trigger for dropping
+    /// the full record under the default feature configuration.
+    fn transaction_is_finalized(&self, txid: &Txid) -> bool;
+
     /// Return the current monitor revision.
     ///
     /// Bumped whenever the monitored address set changes (e.g. new addresses
