@@ -71,11 +71,16 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     fn update_balance(&mut self);
 
     /// Per-account balances keyed by `AccountType`.
+    ///
+    /// Only funds-bearing accounts (Standard, CoinJoin, DashPay) carry a
+    /// balance — keys-only accounts (identity, asset-lock, provider) are
+    /// excluded from the result entirely rather than reported with a zero
+    /// balance.
     fn account_balances(&self) -> BTreeMap<AccountType, WalletCoreBalance> {
         self.accounts()
-            .all_accounts()
+            .all_funding_accounts()
             .iter()
-            .map(|acc| (acc.managed_account_type().to_account_type(), acc.balance))
+            .map(|funds| (funds.managed_account_type().to_account_type(), funds.balance))
             .collect()
     }
 
@@ -188,7 +193,7 @@ impl WalletInfoInterface for ManagedWalletInfo {
 
     fn utxos(&self) -> BTreeSet<&Utxo> {
         let mut utxos = BTreeSet::new();
-        for account in self.accounts.all_accounts() {
+        for account in self.accounts.all_funding_accounts() {
             utxos.extend(account.utxos.values());
         }
         utxos
@@ -205,11 +210,12 @@ impl WalletInfoInterface for ManagedWalletInfo {
     }
 
     fn update_balance(&mut self) {
+        // Only funds-bearing accounts contribute to the wallet balance.
         let mut balance = WalletCoreBalance::default();
         let last_processed_height = self.last_processed_height();
-        for account in self.accounts.all_accounts_mut() {
-            account.update_balance(last_processed_height);
-            balance += account.balance;
+        for funds in self.accounts.all_funding_accounts_mut() {
+            funds.update_balance(last_processed_height);
+            balance += funds.balance;
         }
         self.balance = balance;
     }
@@ -231,10 +237,9 @@ impl WalletInfoInterface for ManagedWalletInfo {
     }
 
     fn immature_transactions(&self) -> Vec<Transaction> {
+        // Coinbase UTXOs only live on funds-bearing accounts.
         let mut immature_txids: BTreeSet<Txid> = BTreeSet::new();
-
-        // Find txids of immature coinbase UTXOs
-        for account in self.accounts.all_accounts() {
+        for account in self.accounts.all_funding_accounts() {
             for utxo in account.utxos.values() {
                 if utxo.is_coinbase && !utxo.is_mature(self.last_processed_height()) {
                     immature_txids.insert(utxo.outpoint.txid);
@@ -242,9 +247,9 @@ impl WalletInfoInterface for ManagedWalletInfo {
             }
         }
 
-        // Get the actual transactions
+        // Look up the matching transaction records on the same funds accounts.
         let mut transactions = Vec::new();
-        for account in self.accounts.all_accounts() {
+        for account in self.accounts.all_funding_accounts() {
             for (txid, record) in account.transactions() {
                 if immature_txids.contains(txid) {
                     transactions.push(record.transaction.clone());
@@ -272,8 +277,9 @@ impl WalletInfoInterface for ManagedWalletInfo {
         if new_height <= old_height {
             return Vec::new();
         }
+        // Coinbase records only land on funds-bearing accounts.
         let mut matured = Vec::new();
-        for account in self.accounts.all_accounts() {
+        for account in self.accounts.all_funding_accounts() {
             for record in account.transactions().values() {
                 if !record.transaction.is_coin_base() {
                     continue;
@@ -295,7 +301,7 @@ impl WalletInfoInterface for ManagedWalletInfo {
             return false;
         }
         let mut any_changed = false;
-        for account in self.accounts.all_accounts_mut() {
+        for mut account in self.accounts.all_accounts_mut() {
             if account.mark_utxos_instant_send(txid) {
                 any_changed = true;
             }

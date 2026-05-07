@@ -14,8 +14,12 @@ use crate::account::TransactionRecord;
 use crate::managed_account::address_pool;
 use crate::managed_account::managed_account_trait::ManagedAccountTrait;
 use crate::managed_account::managed_account_type::ManagedAccountType;
+use crate::managed_account::transaction_record::TransactionDirection;
+use crate::transaction_checking::account_checker::AccountMatch;
+use crate::transaction_checking::transaction_router::TransactionType;
+use crate::transaction_checking::TransactionContext;
 use crate::Network;
-use dashcore::Txid;
+use dashcore::{Transaction, Txid};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -158,6 +162,120 @@ impl ManagedCoreKeysAccount {
         .expect("Should succeed with NoKeySource");
 
         Self::new(managed_type, account.network)
+    }
+
+    /// Record a new transaction for this keys account.
+    ///
+    /// The keys-account record is intentionally a thin marker: it captures
+    /// "this tx involved this keys account" plus the `net_amount` flowing
+    /// to our addresses, and no more. The wallet-level details
+    /// (per-input UTXO origins, per-output roles) live on the **funding
+    /// account's** record — keys-account flows (identity registration,
+    /// asset lock, provider-key registration / update) are typically
+    /// funded from a Standard or CoinJoin account in the same wallet,
+    /// and that account's `record_transaction` already populates
+    /// `input_details` (from its UTXO set) and `output_details`
+    /// (classified into receive / change / sent). Duplicating that work
+    /// on the keys-account side would double-count and de-sync if the
+    /// classification ever changes.
+    ///
+    /// Direction is [`TransactionDirection::Internal`]: from the wallet's
+    /// perspective these txs move funds from one of its accounts to
+    /// another, even when only the keys account is matched here.
+    pub(crate) fn record_transaction(
+        &mut self,
+        tx: &Transaction,
+        account_match: &AccountMatch,
+        context: TransactionContext,
+        transaction_type: TransactionType,
+    ) -> TransactionRecord {
+        let net_amount = account_match.received as i64 - account_match.sent as i64;
+
+        let tx_record = TransactionRecord::new(
+            tx.clone(),
+            self.managed_account_type.to_account_type(),
+            context.clone(),
+            transaction_type,
+            TransactionDirection::Internal,
+            Vec::new(),
+            Vec::new(),
+            net_amount,
+        );
+
+        let record = tx_record.clone();
+        let txid = tx.txid();
+        self.transactions.insert(txid, tx_record);
+
+        // If this first sighting is already chainlocked (e.g. a wallet
+        // rescan from storage), drop the full record now and keep only the
+        // txid in `finalized_txids`. No-op when the feature is on (we want
+        // to keep the full record).
+        #[cfg(not(feature = "keep-finalized-transactions"))]
+        if context.is_chain_locked() {
+            self.drop_finalized_transaction(&txid);
+        }
+
+        record
+    }
+
+    /// Re-process a transaction with updated context for this keys account.
+    ///
+    /// Mirrors [`ManagedCoreFundsAccount::confirm_transaction`](crate::managed_account::ManagedCoreFundsAccount::confirm_transaction)
+    /// but without UTXO updates. Returns the updated record only when the
+    /// confirmation status actually changes (e.g. mempool → in-block).
+    pub(crate) fn confirm_transaction(
+        &mut self,
+        tx: &Transaction,
+        account_match: &AccountMatch,
+        context: TransactionContext,
+        transaction_type: TransactionType,
+    ) -> Option<TransactionRecord> {
+        let txid = tx.txid();
+
+        // Already finalized via a chainlock: the tx is immutable —
+        // no record update, no event needed.
+        if self.transaction_is_finalized(&txid) {
+            return None;
+        }
+
+        if !self.has_transaction(&txid) {
+            // Genuinely new sighting — delegate to record_transaction
+            // (which handles finalize-on-record itself).
+            let record = self.record_transaction(tx, account_match, context, transaction_type);
+            return Some(record);
+        }
+
+        let mut changed = false;
+        if let Some(tx_record) = self.transactions.get_mut(&txid) {
+            debug_assert_eq!(
+                tx_record.transaction_type,
+                transaction_type,
+                "transaction_type changed between recordings for {}",
+                tx.txid()
+            );
+            if tx_record.context != context {
+                let was_confirmed = tx_record.context.confirmed();
+                tx_record.update_context(context.clone());
+                changed = !was_confirmed;
+            }
+        }
+
+        let record_after = if changed {
+            self.transactions.get(&txid).cloned()
+        } else {
+            None
+        };
+
+        // Drop the full record on chainlock when the feature is off; the
+        // surrounding block-confirmation event has already updated context.
+        #[cfg(not(feature = "keep-finalized-transactions"))]
+        if context.is_chain_locked() {
+            self.drop_finalized_transaction(&txid);
+        }
+
+        let _ = account_match;
+
+        record_after
     }
 }
 
