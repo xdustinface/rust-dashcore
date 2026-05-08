@@ -10,7 +10,7 @@ use std::sync::Arc;
 use dashcore::bip158::BlockFilter;
 use dashcore::Address;
 
-use super::backfill::{BackfillWorker, PendingAdvance};
+use super::backfill::BackfillWorker;
 use super::batch::FiltersBatch;
 use super::block_match_tracker::{BlockMatchTracker, BlockTrackResult};
 use super::pipeline::FiltersPipeline;
@@ -133,20 +133,27 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
 
     /// Drive one sweep of the backfill worker over pending sync ranges.
     ///
-    /// Returns block hashes whose download should be requested via the
-    /// existing block-needed channel. The orchestrator wakes this when
-    /// `pending_rescans` becomes non-empty.
-    pub(super) async fn backfill_tick(&mut self) -> SyncResult<Vec<dashcore::BlockHash>> {
+    /// Returns matched blocks keyed by their `FilterMatchKey`, each with
+    /// the per-sync-range advance obligations the block-processing path
+    /// must satisfy when the block arrives. The orchestrator wraps the
+    /// result in a `SyncEvent::BackfillBlocksNeeded`.
+    pub(super) async fn backfill_tick(
+        &mut self,
+    ) -> SyncResult<
+        std::collections::BTreeMap<FilterMatchKey, Vec<key_wallet_manager::BackfillAdvance>>,
+    > {
         self.backfill.tick().await
     }
 
     /// Notify the backfill worker that a block it requested has been
-    /// processed. Returns the obligation so the caller can co-emit
-    /// `WalletEvent::RescanBlockProcessed` with this block's tx records.
+    /// processed (the wallet's `process_backfill_block_for_wallets` path
+    /// already advanced `caught_up_to` and emitted
+    /// `RescanBlockProcessed`). Removes the block from the worker's
+    /// pending set. Returns `true` when the hash was a backfill block.
     pub(super) async fn backfill_block_processed(
         &mut self,
         hash: &dashcore::BlockHash,
-    ) -> Option<PendingAdvance> {
+    ) -> bool {
         self.backfill.on_block_processed(hash).await
     }
 

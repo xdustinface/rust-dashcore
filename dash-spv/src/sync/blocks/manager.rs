@@ -3,6 +3,7 @@
 //! Downloads blocks that matched wallet filters and processes them in height order.
 //! Subscribes to BlockNeeded events and emits BlockProcessed events.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -12,7 +13,8 @@ use crate::error::SyncResult;
 use crate::network::RequestSender;
 use crate::storage::{BlockHeaderStorage, BlockStorage};
 use crate::sync::{BlocksProgress, SyncEvent, SyncManager, SyncState};
-use key_wallet_manager::WalletInterface;
+use dashcore::BlockHash;
+use key_wallet_manager::{BackfillAdvance, WalletInterface};
 
 /// Blocks manager for downloading and processing matching blocks.
 ///
@@ -39,6 +41,11 @@ pub struct BlocksManager<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterf
     pub(super) pipeline: BlocksPipeline,
     /// Whether FiltersSyncComplete has been received.
     pub(super) filters_sync_complete: bool,
+    /// Per-block backfill obligations carried alongside the pipeline. A
+    /// block whose hash is keyed here is processed via
+    /// `process_backfill_block_for_wallets`, which emits
+    /// `WalletEvent::RescanBlockProcessed` and calls `advance_rescan`.
+    pub(super) backfill_advances: HashMap<BlockHash, Vec<BackfillAdvance>>,
 }
 
 impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H, B, W> {
@@ -60,6 +67,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             wallet,
             pipeline: BlocksPipeline::new(),
             filters_sync_complete: false,
+            backfill_advances: HashMap::new(),
         }
     }
 
@@ -74,7 +82,11 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
     /// Process buffered blocks in height order.
     ///
     /// Uses the pipeline's height-ordering logic to ensure blocks are processed
-    /// in the correct sequence.
+    /// in the correct sequence. A block whose hash is recorded in
+    /// `backfill_advances` is processed via the backfill path (one
+    /// `RescanBlockProcessed` event per advance, atomic with
+    /// `advance_rescan`); other blocks take the forward-sync path
+    /// (`BlockProcessed`).
     pub(super) async fn process_buffered_blocks(&mut self) -> SyncResult<Vec<SyncEvent>> {
         let mut events = Vec::new();
 
@@ -82,11 +94,19 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
         while let Some((block, height, interested)) = self.pipeline.take_next_ordered_block() {
             let hash = block.block_hash();
 
-            // Process the block only for the wallets whose filter matched it.
-            // Already-synced wallets that did not match are not touched.
-            let mut wallet = self.wallet.write().await;
-            let result = wallet.process_block_for_wallets(&block, height, &interested).await;
-            drop(wallet);
+            let backfill_advances = self.backfill_advances.remove(&hash);
+
+            let result = if let Some(advances) = backfill_advances.as_ref() {
+                let mut wallet = self.wallet.write().await;
+                let r = wallet.process_backfill_block_for_wallets(&block, height, advances).await;
+                drop(wallet);
+                r
+            } else {
+                let mut wallet = self.wallet.write().await;
+                let r = wallet.process_block_for_wallets(&block, height, &interested).await;
+                drop(wallet);
+                r
+            };
 
             let total_relevant = result.relevant_tx_count();
             let new_addresses_total: usize = result.new_addresses.values().map(|v| v.len()).sum();
@@ -122,8 +142,17 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             }
             // Only count new transactions to avoid double-counting during rescans
             self.progress.add_transactions(result.new_txids.len() as u32);
-            self.progress.update_last_processed(height);
+            // Backfill blocks live below the forward edge — do not bump
+            // last_processed_height backwards.
+            if backfill_advances.is_none() {
+                self.progress.update_last_processed(height);
+            }
 
+            // Forward sync emits BlockProcessed for downstream consumers
+            // (FiltersManager tracks in-flight, etc.). Backfill blocks emit
+            // BlockProcessed too so FiltersManager's BlockMatchTracker can
+            // clear its in-flight state — they're distinguishable by
+            // FiltersManager via the worker's pending_advances.
             events.push(SyncEvent::BlockProcessed {
                 block_hash: hash,
                 height,

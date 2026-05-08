@@ -1,5 +1,7 @@
 use crate::events::{diff_account_balances, project_derived_addresses, DerivedAddress};
-use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
+use crate::wallet_interface::{
+    BackfillAdvance, BlockProcessingResult, MempoolTransactionResult, WalletInterface,
+};
 use crate::{PendingRescan, WalletEvent, WalletId, WalletManager};
 use async_trait::async_trait;
 use core::fmt::Write as _;
@@ -63,6 +65,60 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         self.finalize_block_advance(
             height,
             wallets,
+            per_wallet_inserted,
+            per_wallet_updated,
+            per_wallet_derived,
+        );
+
+        result
+    }
+
+    async fn process_backfill_block_for_wallets(
+        &mut self,
+        block: &Block,
+        height: CoreBlockHeight,
+        advances: &[BackfillAdvance],
+    ) -> BlockProcessingResult {
+        let mut result = BlockProcessingResult::default();
+        if advances.is_empty() {
+            return result;
+        }
+        let wallets: BTreeSet<WalletId> = advances.iter().map(|a| a.wallet_id).collect();
+        let info = BlockInfo::new(height, block.block_hash(), block.header.time);
+
+        let mut per_wallet_inserted: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
+        let mut per_wallet_updated: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
+        let mut per_wallet_derived: BTreeMap<WalletId, Vec<DerivedAddressInfo>> = BTreeMap::new();
+
+        for tx in &block.txdata {
+            let context = TransactionContext::InBlock(info);
+            let check_result =
+                self.check_transaction_in_wallets(tx, context, &wallets, true, false).await;
+
+            if !check_result.affected_wallets.is_empty() {
+                if check_result.is_new_transaction {
+                    result.new_txids.push(tx.txid());
+                } else {
+                    result.existing_txids.push(tx.txid());
+                }
+            }
+
+            for (wallet_id, derived) in check_result.new_addresses {
+                let addresses = derived.iter().map(|d| d.info.address.clone()).collect::<Vec<_>>();
+                result.new_addresses.entry(wallet_id).or_default().extend(addresses);
+                per_wallet_derived.entry(wallet_id).or_default().extend(derived);
+            }
+            for (wallet_id, records) in check_result.per_wallet_new_records {
+                per_wallet_inserted.entry(wallet_id).or_default().extend(records);
+            }
+            for (wallet_id, records) in check_result.per_wallet_updated_records {
+                per_wallet_updated.entry(wallet_id).or_default().extend(records);
+            }
+        }
+
+        self.finalize_backfill_block_advance(
+            height,
+            advances,
             per_wallet_inserted,
             per_wallet_updated,
             per_wallet_derived,
@@ -557,6 +613,139 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                     fully_converged_through: new_conv,
                 });
             }
+        }
+    }
+
+    /// Backfill counterpart of [`Self::finalize_block_advance`]. Applies the
+    /// same balance-snapshot / address-derivation projection but emits
+    /// [`WalletEvent::RescanBlockProcessed`] (one per advance entry) so a
+    /// downstream persister writes the records and the `caught_up_to`
+    /// advance atomically. Calls `advance_rescan` after emission so the
+    /// `ConvergenceChanged` event order stays "records first, then watermark".
+    fn finalize_backfill_block_advance(
+        &mut self,
+        height: CoreBlockHeight,
+        advances: &[BackfillAdvance],
+        mut per_wallet_inserted: BTreeMap<WalletId, Vec<TransactionRecord>>,
+        mut per_wallet_updated: BTreeMap<WalletId, Vec<TransactionRecord>>,
+        mut per_wallet_derived: BTreeMap<WalletId, Vec<DerivedAddressInfo>>,
+    ) {
+        if advances.is_empty() {
+            return;
+        }
+        let wallets: BTreeSet<WalletId> = advances.iter().map(|a| a.wallet_id).collect();
+
+        let snapshot = self.snapshot_balances();
+        let mut prior_account_balances: BTreeMap<
+            WalletId,
+            BTreeMap<AccountType, WalletCoreBalance>,
+        > = wallets
+            .iter()
+            .filter_map(|id| self.wallet_infos.get(id).map(|info| (*id, info.account_balances())))
+            .collect();
+
+        let mut per_wallet_matured: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
+        for wallet_id in &wallets {
+            let Some(info) = self.wallet_infos.get(wallet_id) else {
+                continue;
+            };
+            let old_height = info.last_processed_height();
+            if height > old_height {
+                let matured = info.matured_coinbase_records(old_height, height);
+                if !matured.is_empty() {
+                    per_wallet_matured.insert(*wallet_id, matured);
+                }
+            }
+        }
+
+        // Refresh balances; do NOT advance last_processed_height for backfill
+        // blocks since they live below the wallet's forward edge and would
+        // bump the cursor backwards otherwise.
+        for wallet_id in &wallets {
+            if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
+                info.update_balance();
+            }
+        }
+
+        let mut per_wallet_balance: BTreeMap<WalletId, WalletCoreBalance> = BTreeMap::new();
+        let mut per_wallet_account_diff: BTreeMap<
+            WalletId,
+            BTreeMap<AccountType, WalletCoreBalance>,
+        > = BTreeMap::new();
+        for wallet_id in &wallets {
+            let Some(info) = self.wallet_infos.get(wallet_id) else {
+                continue;
+            };
+            let new_balance = info.balance();
+            per_wallet_balance.insert(*wallet_id, new_balance);
+            let prior = prior_account_balances.remove(wallet_id).unwrap_or_default();
+            per_wallet_account_diff
+                .insert(*wallet_id, diff_account_balances(&prior, &info.account_balances()));
+        }
+
+        // Drain per-wallet record / derivation maps so each wallet's events
+        // carry the right slice. Multiple advances on the same wallet (a
+        // block matched by two sync ranges of one wallet) split records
+        // across the first advance only, since records are
+        // wallet-attributed not range-attributed; later same-wallet advances
+        // ship empty record slices.
+        let mut wallet_inserted: BTreeMap<WalletId, Vec<TransactionRecord>> = wallets
+            .iter()
+            .map(|id| (*id, per_wallet_inserted.remove(id).unwrap_or_default()))
+            .collect();
+        let mut wallet_updated: BTreeMap<WalletId, Vec<TransactionRecord>> = wallets
+            .iter()
+            .map(|id| (*id, per_wallet_updated.remove(id).unwrap_or_default()))
+            .collect();
+        let mut wallet_derived: BTreeMap<WalletId, Vec<DerivedAddressInfo>> = wallets
+            .iter()
+            .map(|id| (*id, per_wallet_derived.remove(id).unwrap_or_default()))
+            .collect();
+
+        for advance in advances {
+            let wallet_id = advance.wallet_id;
+            let inserted = wallet_inserted.remove(&wallet_id).unwrap_or_default();
+            let updated = wallet_updated.remove(&wallet_id).unwrap_or_default();
+            let matured = per_wallet_matured.remove(&wallet_id).unwrap_or_default();
+            let derived_for_wallet = wallet_derived.remove(&wallet_id).unwrap_or_default();
+            let addresses_derived: Vec<DerivedAddress> =
+                project_derived_addresses(derived_for_wallet);
+            let balance =
+                per_wallet_balance.get(&wallet_id).copied().unwrap_or_default();
+            let account_balances =
+                per_wallet_account_diff.get(&wallet_id).cloned().unwrap_or_default();
+            let balance_changed = snapshot.get(&wallet_id).copied() != Some(balance);
+
+            if !inserted.is_empty()
+                || !updated.is_empty()
+                || !matured.is_empty()
+                || !addresses_derived.is_empty()
+                || balance_changed
+            {
+                let event = WalletEvent::RescanBlockProcessed {
+                    wallet_id,
+                    height,
+                    pool: advance.pool,
+                    indexes: advance.indexes.clone(),
+                    advance_to: advance.advance_to,
+                    inserted,
+                    updated,
+                    matured,
+                    balance,
+                    account_balances,
+                    addresses_derived,
+                };
+                let _ = self.event_sender.send(event);
+            }
+        }
+
+        for advance in advances {
+            self.advance_rescan(
+                &advance.wallet_id,
+                advance.pool,
+                advance.indexes.clone(),
+                advance.advance_to,
+            );
         }
     }
 }

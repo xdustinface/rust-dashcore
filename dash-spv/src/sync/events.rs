@@ -3,7 +3,7 @@ use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::sml::masternode_list_engine::QRInfoFeedResult;
 use dashcore::{Address, BlockHash, Txid};
-use key_wallet_manager::{FilterMatchKey, WalletId};
+use key_wallet_manager::{BackfillAdvance, FilterMatchKey, WalletId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Events that managers can emit and subscribe to.
@@ -90,6 +90,23 @@ pub enum SyncEvent {
         /// Blocks to download (height-ordered by `FilterMatchKey`), each
         /// associated with the wallet ids that need it.
         blocks: BTreeMap<FilterMatchKey, BTreeSet<WalletId>>,
+    },
+
+    /// Backfill worker matched filters below a wallet's `synced_height` and
+    /// needs the corresponding blocks downloaded. Each block carries the
+    /// per-sync-range advance obligations so the block-processing path can
+    /// emit `WalletEvent::RescanBlockProcessed` and call `advance_rescan`
+    /// atomically once the block is processed.
+    ///
+    /// Routes through the same `BlocksManager` pipeline as `BlocksNeeded`,
+    /// deduplicating against forward sync via `BlockMatchTracker`.
+    ///
+    /// Emitted by: `FiltersManager`
+    /// Consumed by: `BlocksManager`
+    BackfillBlocksNeeded {
+        /// Blocks to download, each with the per-sync-range advances that
+        /// the block's processing must satisfy.
+        blocks: BTreeMap<FilterMatchKey, Vec<BackfillAdvance>>,
     },
 
     /// Block downloaded and processed through wallet.
@@ -223,6 +240,12 @@ impl SyncEvent {
                 blocks,
             } => {
                 format!("BlocksNeeded(count={})", blocks.len())
+            }
+            SyncEvent::BackfillBlocksNeeded {
+                blocks,
+            } => {
+                let advances: usize = blocks.values().map(|v| v.len()).sum();
+                format!("BackfillBlocksNeeded(blocks={}, advances={})", blocks.len(), advances)
             }
             SyncEvent::BlockProcessed {
                 height,

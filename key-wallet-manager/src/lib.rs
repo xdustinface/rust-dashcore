@@ -24,7 +24,9 @@ pub use error::WalletError;
 pub use events::{DerivedAddress, WalletEvent};
 pub use matching::{check_compact_filters_for_addresses, FilterMatchKey};
 pub use rescan::PendingRescan;
-pub use wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
+pub use wallet_interface::{
+    BackfillAdvance, BlockProcessingResult, MempoolTransactionResult, WalletInterface,
+};
 
 use dashcore::blockdata::transaction::Transaction;
 use dashcore::prelude::CoreBlockHeight;

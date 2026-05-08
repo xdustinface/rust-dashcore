@@ -5,7 +5,7 @@ use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, OutPoint, Transaction, Txid};
 use key_wallet::transaction_checking::TransactionContext;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
@@ -371,6 +371,24 @@ pub struct MockWalletState {
     pub last_processed_height: CoreBlockHeight,
 }
 
+#[derive(Debug, Clone)]
+pub struct MockPendingRange {
+    pub pool: key_wallet::managed_account::address_pool::AddressPoolType,
+    pub indexes: core::ops::Range<u32>,
+    pub since_height: CoreBlockHeight,
+    pub addresses: Vec<Address>,
+    pub caught_up_to: Option<CoreBlockHeight>,
+}
+
+impl MockPendingRange {
+    pub fn is_complete(&self) -> bool {
+        match self.caught_up_to {
+            Some(c) => c + 1 >= self.since_height,
+            None => self.since_height == 0,
+        }
+    }
+}
+
 /// Multi-wallet mock that holds independent state for several wallet IDs,
 /// enabling tests that exercise per-wallet attribution paths.
 pub struct MultiMockWallet {
@@ -378,6 +396,13 @@ pub struct MultiMockWallet {
     event_sender: broadcast::Sender<WalletEvent>,
     /// Track every block processed for assertions.
     processed: Arc<Mutex<Vec<(WalletId, dashcore::BlockHash, u32)>>>,
+    /// Per-wallet birth heights for backfill tests; defaults to 0 when
+    /// not explicitly set.
+    birth_heights: std::collections::BTreeMap<WalletId, CoreBlockHeight>,
+    /// Per-wallet pending sync ranges for backfill tests. Built directly
+    /// without a real `ManagedWalletInfo` so the routing path can be
+    /// exercised in isolation.
+    pending_ranges: std::collections::BTreeMap<WalletId, Vec<MockPendingRange>>,
 }
 
 impl Default for MultiMockWallet {
@@ -393,7 +418,13 @@ impl MultiMockWallet {
             wallets: std::collections::BTreeMap::new(),
             event_sender,
             processed: Arc::new(Mutex::new(Vec::new())),
+            birth_heights: std::collections::BTreeMap::new(),
+            pending_ranges: std::collections::BTreeMap::new(),
         }
+    }
+
+    pub fn set_birth_height(&mut self, wallet_id: WalletId, height: CoreBlockHeight) {
+        self.birth_heights.insert(wallet_id, height);
     }
 
     /// Insert or replace a wallet's state.
@@ -408,6 +439,30 @@ impl MultiMockWallet {
 
     pub fn processed(&self) -> Arc<Mutex<Vec<(WalletId, dashcore::BlockHash, u32)>>> {
         self.processed.clone()
+    }
+
+    /// Push a pending sync range onto a wallet for the backfill worker
+    /// to discover. Tests use this instead of mutating real address
+    /// pools.
+    pub fn push_sync_range_for_test(
+        &mut self,
+        wallet_id: WalletId,
+        pool: key_wallet::managed_account::address_pool::AddressPoolType,
+        indexes: core::ops::Range<u32>,
+        since_height: CoreBlockHeight,
+        addresses: Vec<Address>,
+    ) {
+        self.pending_ranges.entry(wallet_id).or_default().push(MockPendingRange {
+            pool,
+            indexes,
+            since_height,
+            addresses,
+            caught_up_to: None,
+        });
+    }
+
+    pub fn pending_ranges_for(&self, wallet_id: &WalletId) -> Vec<MockPendingRange> {
+        self.pending_ranges.get(wallet_id).cloned().unwrap_or_default()
     }
 }
 
@@ -499,6 +554,95 @@ impl WalletInterface for MultiMockWallet {
 
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
+    }
+
+    fn pending_rescans(&self) -> Vec<crate::PendingRescan> {
+        let mut out = Vec::new();
+        for (wallet_id, ranges) in &self.pending_ranges {
+            let birth = self.birth_heights.get(wallet_id).copied().unwrap_or(0);
+            for range in ranges {
+                if range.is_complete() {
+                    continue;
+                }
+                let ceiling = range.since_height.saturating_sub(1);
+                let resume_from = range
+                    .caught_up_to
+                    .map(|c| c.saturating_add(1).max(birth))
+                    .unwrap_or(birth);
+                if resume_from > ceiling {
+                    continue;
+                }
+                out.push(crate::PendingRescan {
+                    wallet_id: *wallet_id,
+                    pool: range.pool,
+                    indexes: range.indexes.clone(),
+                    addresses: range.addresses.clone(),
+                    floor: birth,
+                    ceiling,
+                    resume_from,
+                });
+            }
+        }
+        out
+    }
+
+    fn advance_rescan(
+        &mut self,
+        wallet_id: &WalletId,
+        pool: key_wallet::managed_account::address_pool::AddressPoolType,
+        indexes: core::ops::Range<u32>,
+        scanned_through: CoreBlockHeight,
+    ) {
+        let Some(ranges) = self.pending_ranges.get_mut(wallet_id) else {
+            return;
+        };
+        for range in ranges.iter_mut() {
+            if range.pool == pool && range.indexes == indexes {
+                let cap = range.since_height.saturating_sub(1);
+                let new = scanned_through.min(cap);
+                if range.caught_up_to.map(|c| new > c).unwrap_or(true) {
+                    range.caught_up_to = Some(new);
+                }
+            }
+        }
+        ranges.retain(|r| !r.is_complete());
+    }
+
+    async fn process_backfill_block_for_wallets(
+        &mut self,
+        block: &Block,
+        height: CoreBlockHeight,
+        advances: &[crate::BackfillAdvance],
+    ) -> BlockProcessingResult {
+        let hash = block.block_hash();
+        {
+            let mut processed = self.processed.lock().await;
+            for advance in advances {
+                processed.push((advance.wallet_id, hash, height));
+            }
+        }
+        for advance in advances {
+            let _ = self.event_sender.send(WalletEvent::RescanBlockProcessed {
+                wallet_id: advance.wallet_id,
+                height,
+                pool: advance.pool,
+                indexes: advance.indexes.clone(),
+                advance_to: advance.advance_to,
+                inserted: Vec::new(),
+                updated: Vec::new(),
+                matured: Vec::new(),
+                balance: key_wallet::WalletCoreBalance::default(),
+                account_balances: BTreeMap::new(),
+                addresses_derived: Vec::new(),
+            });
+            self.advance_rescan(
+                &advance.wallet_id,
+                advance.pool,
+                advance.indexes.clone(),
+                advance.advance_to,
+            );
+        }
+        BlockProcessingResult::default()
     }
 
     async fn describe(&self) -> String {

@@ -105,6 +105,50 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
         event: &SyncEvent,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        // React to BackfillBlocksNeeded events: queue the blocks like
+        // forward sync but record the per-block advance obligations so
+        // the wallet processing path forks to the backfill flow.
+        if let SyncEvent::BackfillBlocksNeeded {
+            blocks,
+        } = event
+        {
+            if blocks.is_empty() {
+                return Ok(vec![]);
+            }
+
+            tracing::debug!("Backfill blocks needed: {} blocks", blocks.len());
+
+            let mut to_queue: Vec<(FilterMatchKey, BTreeSet<WalletId>)> =
+                Vec::with_capacity(blocks.len());
+            let block_storage = self.block_storage.read().await;
+            for (key, advances) in blocks {
+                let interested: BTreeSet<WalletId> =
+                    advances.iter().map(|a| a.wallet_id).collect();
+                self.backfill_advances.insert(*key.hash(), advances.clone());
+
+                if let Ok(Some(hashed_block)) = block_storage.load_block(key.height()).await {
+                    if hashed_block.hash() == key.hash() {
+                        self.pipeline.add_from_storage(
+                            hashed_block.block().clone(),
+                            key.height(),
+                            interested,
+                        );
+                        self.progress.add_from_storage(1);
+                        continue;
+                    }
+                }
+                to_queue.push((key.clone(), interested));
+            }
+            drop(block_storage);
+
+            self.pipeline.queue(to_queue);
+            self.progress.set_state(SyncState::Syncing);
+            if self.pipeline.has_pending_requests() {
+                self.send_pending(requests).await?;
+            }
+            return self.process_buffered_blocks().await;
+        }
+
         // React to BlocksNeeded events
         if let SyncEvent::BlocksNeeded {
             blocks,

@@ -164,11 +164,10 @@ impl<
                 // `tracker.track` residual.
                 self.tracker.record_processed(*height, *block_hash, wallets);
 
-                // If the backfill worker requested this block, advance the
-                // owning sync range. The atomic `RescanBlockProcessed` event
-                // emission is bundled in the integration follow-up that
-                // finalizes the persister contract; advancing here keeps
-                // `caught_up_to` honest in the meantime.
+                // If the backfill worker had this block in flight, the
+                // wallet's `process_backfill_block_for_wallets` path already
+                // advanced `caught_up_to` and emitted `RescanBlockProcessed`,
+                // so just clear the worker's pending entry.
                 let _ = self.backfill_block_processed(block_hash).await;
 
                 // Check if this block is part of our tracked blocks
@@ -256,12 +255,17 @@ impl<
         events.extend(self.try_process_batch().await?);
 
         // Drive one sweep of the backfill worker over pending sync ranges.
-        // Block-request routing for backfill matches lands in the
-        // integration commit that finalizes the `RescanBlockProcessed`
-        // atomicity contract; until then `tick` still advances ranges that
-        // have no historical matches in their window and parks any matched
-        // blocks for the follow-up dispatcher.
-        let _ = self.backfill_tick().await?;
+        // Matched blocks are dispatched to `BlocksManager` via
+        // `BackfillBlocksNeeded`; the manager consults the per-block
+        // advance map to call `process_backfill_block_for_wallets` and
+        // emit `RescanBlockProcessed` atomically with the
+        // `caught_up_to` advance.
+        let backfill_blocks = self.backfill_tick().await?;
+        if !backfill_blocks.is_empty() {
+            events.push(SyncEvent::BackfillBlocksNeeded {
+                blocks: backfill_blocks,
+            });
+        }
 
         Ok(events)
     }

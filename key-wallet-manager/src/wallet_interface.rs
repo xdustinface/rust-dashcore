@@ -55,6 +55,20 @@ impl BlockProcessingResult {
     }
 }
 
+/// One backfill obligation associated with a block: which sync range to
+/// advance, and to what height. The block itself (height, hash, wallet
+/// attribution) lives outside this struct in the event and pipeline
+/// carriers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillAdvance {
+    pub wallet_id: WalletId,
+    pub pool: AddressPoolType,
+    pub indexes: Range<u32>,
+    /// Where `caught_up_to` should land after this block is processed —
+    /// the chunk_end of the backfill sweep that produced the match.
+    pub advance_to: CoreBlockHeight,
+}
+
 /// Trait for wallet implementations to receive SPV events
 #[async_trait]
 pub trait WalletInterface: Send + Sync + 'static {
@@ -70,6 +84,37 @@ pub trait WalletInterface: Send + Sync + 'static {
         height: CoreBlockHeight,
         wallets: &BTreeSet<WalletId>,
     ) -> BlockProcessingResult;
+
+    /// Process a block discovered by the backfill worker. Bundles the
+    /// per-sync-range advance obligations so a downstream persister can
+    /// write the records and the `caught_up_to` advance atomically via
+    /// [`WalletEvent::RescanBlockProcessed`].
+    ///
+    /// The default implementation derives the wallet set from `advances`
+    /// and delegates to [`Self::process_block_for_wallets`], so minimal
+    /// mock implementations keep working unchanged. Real implementations
+    /// should override this to emit the dedicated event instead of
+    /// `BlockProcessed` for backfill blocks.
+    ///
+    /// [`WalletEvent::RescanBlockProcessed`]: crate::WalletEvent::RescanBlockProcessed
+    async fn process_backfill_block_for_wallets(
+        &mut self,
+        block: &Block,
+        height: CoreBlockHeight,
+        advances: &[BackfillAdvance],
+    ) -> BlockProcessingResult {
+        let wallets: BTreeSet<WalletId> = advances.iter().map(|a| a.wallet_id).collect();
+        let result = self.process_block_for_wallets(block, height, &wallets).await;
+        for advance in advances {
+            self.advance_rescan(
+                &advance.wallet_id,
+                advance.pool,
+                advance.indexes.clone(),
+                advance.advance_to,
+            );
+        }
+        result
+    }
 
     /// Called when a transaction is seen in the mempool.
     /// Returns whether the transaction was relevant and any new addresses generated.
