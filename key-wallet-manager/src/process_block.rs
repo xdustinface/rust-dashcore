@@ -1198,4 +1198,54 @@ mod tests {
         assert!(by_indexes.contains_key(&30));
         assert!(by_indexes.contains_key(&50));
     }
+
+    /// After `on_chain_reorg(F)` pulls a range's `caught_up_to` back to F,
+    /// the very next `pending_rescans()` call must report `resume_from = F+1`
+    /// for that range. This is what causes the backfill worker to re-cover
+    /// the affected window on its next tick — the worker reads
+    /// `pending_rescans` fresh each iteration, so a clamp at the wallet
+    /// layer surfaces directly as new work without any extra wiring.
+    #[tokio::test]
+    async fn on_chain_reorg_re_exposes_clamped_window_via_pending_rescans() {
+        use key_wallet::managed_account::address_pool::AddressSyncRange;
+
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+        manager.update_wallet_synced_height(&wallet_id, 400);
+
+        let info = manager
+            .get_wallet_info_mut(&wallet_id)
+            .expect("wallet exists");
+        for mut account in info.accounts_mut().all_accounts_mut() {
+            for pool in account.managed_account_type_mut().address_pools_mut() {
+                if pool.pool_type == AddressPoolType::External {
+                    pool.push_sync_range(AddressSyncRange {
+                        indexes: 30..40,
+                        since_height: 300,
+                        caught_up_to: Some(250),
+                    });
+                }
+            }
+        }
+
+        let pre = manager.pending_rescans();
+        let pre_resume = pre
+            .iter()
+            .find(|r| r.indexes == (30..40))
+            .map(|r| r.resume_from)
+            .expect("range 30..40 surfaced before reorg");
+        assert_eq!(pre_resume, 251, "pre-reorg resume picks up where caught_up_to left off");
+
+        manager.on_chain_reorg(150);
+
+        let post = manager.pending_rescans();
+        let post_resume = post
+            .iter()
+            .find(|r| r.indexes == (30..40))
+            .map(|r| r.resume_from)
+            .expect("range 30..40 still pending after reorg");
+        assert_eq!(
+            post_resume, 151,
+            "post-reorg resume must restart at fork+1 so backfill re-covers [151..299]",
+        );
+    }
 }

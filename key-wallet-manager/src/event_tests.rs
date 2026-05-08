@@ -1110,3 +1110,63 @@ async fn test_advance_rescan_emits_convergence_changed_and_is_idempotent() {
         events,
     );
 }
+
+/// Two pending sync ranges with different `since_height` values: completing
+/// the lower-since one first must report a convergence value capped by the
+/// remaining range, then completing the higher-since one must report the
+/// full `synced_height`. Each completion fires exactly one
+/// `ConvergenceChanged` and the values rise monotonically.
+#[tokio::test]
+async fn test_convergence_changed_rises_step_by_step_across_multi_range_completion() {
+    let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+    manager.update_wallet_synced_height(&wallet_id, 500);
+
+    push_external_sync_range(&mut manager, &wallet_id, 30..40, 100);
+    push_external_sync_range(&mut manager, &wallet_id, 60..70, 200);
+
+    // Convergence is bounded by the worst-progressed range, both at floor=0.
+    assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(0));
+
+    let mut rx = manager.subscribe_events();
+
+    // Complete the since=100 range. Convergence rises but is still bounded
+    // by the since=200 range whose caught_up_to is None (floor-1 saturates
+    // to 0), so the new value is 0 — same as before. No event expected.
+    manager.advance_rescan(&wallet_id, AddressPoolType::External, 30..40, 99);
+    let events_after_first = drain_events(&mut rx);
+    let conv_after_first: Vec<&WalletEvent> = events_after_first
+        .iter()
+        .filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. }))
+        .collect();
+    assert_eq!(
+        conv_after_first.len(),
+        0,
+        "first completion does not raise convergence (still bounded by other range): {:?}",
+        events_after_first,
+    );
+
+    // Advance the since=200 range to completion. Now no ranges remain so
+    // convergence equals synced_height=500 — a real value transition.
+    manager.advance_rescan(&wallet_id, AddressPoolType::External, 60..70, 199);
+    let events_after_second = drain_events(&mut rx);
+    let conv_after_second: Vec<&WalletEvent> = events_after_second
+        .iter()
+        .filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. }))
+        .collect();
+    assert_eq!(
+        conv_after_second.len(),
+        1,
+        "exactly one ConvergenceChanged for the second completion, got {:?}",
+        events_after_second,
+    );
+    match conv_after_second[0] {
+        WalletEvent::ConvergenceChanged {
+            wallet_id: wid,
+            fully_converged_through,
+        } => {
+            assert_eq!(*wid, wallet_id);
+            assert_eq!(*fully_converged_through, Some(500));
+        }
+        _ => unreachable!(),
+    }
+}

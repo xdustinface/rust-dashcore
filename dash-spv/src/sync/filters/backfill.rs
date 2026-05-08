@@ -340,5 +340,196 @@ mod tests {
         assert!(!worker.pending_advances.contains_key(&match_block_hash));
         assert!(!worker.on_block_processed(&match_block_hash).await);
     }
+
+    /// Regression for the original `crazy-task` blind spot: a block at H1
+    /// pays addresses at indexes the wallet hadn't derived yet, so forward
+    /// sync at H1 only matched the in-gap-limit address. A later tx at H2
+    /// extends the gap; backfill must revisit H1 and recover the missed
+    /// outputs by scanning against the post-extension address set.
+    #[tokio::test]
+    async fn backfill_recovers_missed_outputs_after_gap_limit_extension() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let wallet_id: WalletId = [0xCC; 32];
+        let pool = AddressPoolType::External;
+
+        // Index 0 was inside the original gap limit; 32..41 weren't.
+        let addr_zero = Address::dummy(Network::Regtest, 100);
+        let high_addrs: Vec<Address> =
+            (32..41).map(|i| Address::dummy(Network::Regtest, 100 + i as usize)).collect();
+
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        {
+            let mut w = multi.write().await;
+            // The wallet's monitored set today still only contains index 0;
+            // the post-extension addresses live on the pending sync range.
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![addr_zero.clone()],
+                    synced_height: 200,
+                    last_processed_height: 200,
+                },
+            );
+            w.set_birth_height(wallet_id, 0);
+            w.push_sync_range_for_test(wallet_id, pool, 32..41, 200, high_addrs.clone());
+        }
+
+        // Block at H1=50 pays all 10 outputs (index 0 plus 32..41), so its
+        // filter matches every address. Forward sync would have only checked
+        // index 0; backfill scans against the post-extension slice and must
+        // discover the high indexes.
+        let h1: u32 = 50;
+        let mut txs = vec![Transaction::dummy(&addr_zero, 0..0, &[1u64])];
+        for (i, addr) in high_addrs.iter().enumerate() {
+            txs.push(Transaction::dummy(addr, 1..2, &[(2 + i) as u64]));
+        }
+        let block_h1 = Block::dummy(h1, txs);
+        let block_h1_hash = block_h1.block_hash();
+        let filter_h1 = BlockFilter::dummy(&block_h1);
+
+        let mut headers: Vec<Header> = Header::dummy_batch(0..201);
+        headers[h1 as usize] = block_h1.header;
+        storage.block_headers().write().await.store_headers(&headers).await.unwrap();
+
+        let dummy_filter = BlockFilter::new(&[0u8; 32]);
+        let filter_store = storage.filters();
+        {
+            let mut fs = filter_store.write().await;
+            for h in 0..=200u32 {
+                let bytes = if h == h1 {
+                    filter_h1.content.clone()
+                } else {
+                    dummy_filter.content.clone()
+                };
+                fs.store_filter(h, &bytes).await.unwrap();
+            }
+        }
+
+        let mut worker: BackfillWorker<_, _, MultiMockWallet> = BackfillWorker::new(
+            storage.filters(),
+            storage.block_headers(),
+            multi.clone(),
+        );
+
+        let matched = worker.tick().await.unwrap();
+
+        assert_eq!(matched.len(), 1, "expected one matched block, got {:?}", matched);
+        let (key, advances) = matched.iter().next().unwrap();
+        assert_eq!(key.height(), h1);
+        assert_eq!(key.hash(), &block_h1_hash);
+        assert_eq!(advances.len(), 1, "one advance entry expected for the single range");
+        let adv = &advances[0];
+        assert_eq!(adv.wallet_id, wallet_id);
+        assert_eq!(adv.pool, pool);
+        assert_eq!(adv.indexes, 32..41);
+        assert!(
+            adv.advance_to <= 199,
+            "advance_to must not exceed since_height-1=199, got {}",
+            adv.advance_to,
+        );
+    }
+
+    /// `RescanBlockProcessed` must carry both the records (`inserted`) and
+    /// the `advance_to` field in a single event so a downstream persister
+    /// writes them atomically. The forward-sync `BlockProcessed` event must
+    /// not also fire for the same backfill block, otherwise the persister
+    /// would double-write.
+    #[tokio::test]
+    async fn rescan_block_processed_bundles_advance_in_a_single_event() {
+        use key_wallet_manager::BackfillAdvance;
+
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        let wallet_id: WalletId = [0xDD; 32];
+        let pool = AddressPoolType::External;
+        let address = Address::dummy(Network::Regtest, 51);
+        let mut event_rx = {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![address.clone()],
+                    synced_height: 200,
+                    last_processed_height: 200,
+                },
+            );
+            w.set_birth_height(wallet_id, 0);
+            // Push a range whose since-1 exactly matches the advance_to
+            // below so the wallet completes and drops it. That side effect
+            // confirms the "records + advance" pair is processed together.
+            w.push_sync_range_for_test(wallet_id, pool, 5..10, 50, vec![address.clone()]);
+            w.subscribe_events()
+        };
+
+        let block = Block::dummy(50, vec![Transaction::dummy(&address, 0..0, &[7u64])]);
+
+        {
+            let mut w = multi.write().await;
+            w.process_backfill_block_for_wallets(
+                &block,
+                50,
+                &[BackfillAdvance {
+                    wallet_id,
+                    pool,
+                    indexes: 5..10,
+                    advance_to: 49,
+                }],
+            )
+            .await;
+        }
+
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+
+        let rescan_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, key_wallet_manager::WalletEvent::RescanBlockProcessed { .. }))
+            .collect();
+        assert_eq!(
+            rescan_events.len(),
+            1,
+            "exactly one RescanBlockProcessed expected, got {:?}",
+            events,
+        );
+        match rescan_events[0] {
+            key_wallet_manager::WalletEvent::RescanBlockProcessed {
+                wallet_id: wid,
+                height,
+                pool: ev_pool,
+                indexes,
+                advance_to,
+                ..
+            } => {
+                assert_eq!(*wid, wallet_id);
+                assert_eq!(*height, 50);
+                assert_eq!(*ev_pool, pool);
+                assert_eq!(indexes, &(5..10));
+                assert_eq!(*advance_to, 49);
+            }
+            _ => unreachable!(),
+        }
+
+        let block_processed_for_hash = events.iter().any(|e| {
+            matches!(
+                e,
+                key_wallet_manager::WalletEvent::BlockProcessed { .. },
+            )
+        });
+        assert!(
+            !block_processed_for_hash,
+            "backfill block must not also fire BlockProcessed: {:?}",
+            events,
+        );
+
+        // Sanity: the mock's advance_rescan side effect drops the range,
+        // confirming records-and-advance are tied to the same operation.
+        let pending = multi.read().await.pending_rescans();
+        assert!(
+            pending.is_empty(),
+            "advance_to=since-1 must complete and drop the range, got {:?}",
+            pending,
+        );
+    }
 }
 
