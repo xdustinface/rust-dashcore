@@ -172,6 +172,14 @@ pub trait WalletInterface: Send + Sync + 'static {
     ) {
     }
 
+    /// React to a confirmed chain reorg to `fork_height`. Clamps every
+    /// pending sync range's `caught_up_to` to at most `fork_height` so the
+    /// backfill worker re-covers any window that progressed past the fork.
+    ///
+    /// The default implementation is a no-op, suitable for implementations
+    /// that do not track sync ranges.
+    fn on_chain_reorg(&mut self, _fork_height: CoreBlockHeight) {}
+
     /// Advance one wallet's committed sync checkpoint. Implementations must
     /// only advance forward (a value below the current is silently ignored).
     fn update_wallet_synced_height(&mut self, wallet_id: &WalletId, height: CoreBlockHeight);

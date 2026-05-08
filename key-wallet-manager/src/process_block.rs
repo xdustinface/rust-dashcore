@@ -328,6 +328,24 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         }
     }
 
+    fn on_chain_reorg(&mut self, fork_height: CoreBlockHeight) {
+        for (wallet_id, info) in self.wallet_infos.iter_mut() {
+            let prev_conv = info.convergence_height();
+            for mut account in info.accounts_mut().all_accounts_mut() {
+                for pool in account.managed_account_type_mut().address_pools_mut() {
+                    pool.clamp_caught_up_to(fork_height);
+                }
+            }
+            let new_conv = info.convergence_height();
+            if new_conv != prev_conv {
+                let _ = self.event_sender.send(WalletEvent::ConvergenceChanged {
+                    wallet_id: *wallet_id,
+                    fully_converged_through: new_conv,
+                });
+            }
+        }
+    }
+
     fn update_wallet_synced_height(&mut self, wallet_id: &WalletId, height: CoreBlockHeight) {
         if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
             if height > info.synced_height() {
@@ -925,5 +943,70 @@ mod tests {
         assert_eq!(manager.pending_rescans().len(), 0);
         assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(100));
         assert!(manager.wallets_pending_convergence(100).is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_chain_reorg_clamps_pending_sync_ranges_across_pools() {
+        use key_wallet::managed_account::address_pool::AddressSyncRange;
+
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+        manager.update_wallet_synced_height(&wallet_id, 400);
+
+        let info = manager
+            .get_wallet_info_mut(&wallet_id)
+            .expect("wallet exists");
+        for mut account in info.accounts_mut().all_accounts_mut() {
+            for pool in account.managed_account_type_mut().address_pools_mut() {
+                if pool.pool_type == AddressPoolType::External {
+                    pool.push_sync_range(AddressSyncRange {
+                        indexes: 30..40,
+                        since_height: 200,
+                        caught_up_to: Some(150),
+                    });
+                    pool.push_sync_range(AddressSyncRange {
+                        indexes: 50..60,
+                        since_height: 300,
+                        caught_up_to: Some(50),
+                    });
+                }
+            }
+        }
+
+        manager.on_chain_reorg(100);
+
+        let rescans = manager.pending_rescans();
+        let by_indexes: BTreeMap<u32, _> =
+            rescans.iter().map(|r| (r.indexes.start, r)).collect();
+
+        let info = manager.get_wallet_info(&wallet_id).expect("wallet exists");
+        let mut snapshots: Vec<(u32, u32, Option<CoreBlockHeight>)> = Vec::new();
+        for account in info.accounts().all_accounts() {
+            for pool in account.managed_account_type().address_pools() {
+                if pool.pool_type == AddressPoolType::External {
+                    for range in pool.pending_sync_ranges() {
+                        snapshots.push((
+                            range.indexes.start,
+                            range.indexes.end,
+                            range.caught_up_to,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let clamped = snapshots
+            .iter()
+            .find(|(s, _, _)| *s == 30)
+            .expect("range 30..40 must still be pending");
+        assert_eq!(clamped.2, Some(100), "above-fork range pulled back to fork height");
+
+        let unchanged = snapshots
+            .iter()
+            .find(|(s, _, _)| *s == 50)
+            .expect("range 50..60 must still be pending");
+        assert_eq!(unchanged.2, Some(50), "below-fork range left untouched");
+
+        assert!(by_indexes.contains_key(&30));
+        assert!(by_indexes.contains_key(&50));
     }
 }
