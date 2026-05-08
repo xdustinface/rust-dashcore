@@ -358,3 +358,23 @@ impl WalletInfoInterface for ManagedWalletInfo {
         self.accounts.all_accounts().iter().map(|a| a.monitor_revision()).sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_wallet_with_no_sync_ranges_converges_at_synced_height() {
+        let mut info = ManagedWalletInfo::dummy(0);
+        info.update_synced_height(1000);
+        assert_eq!(info.synced_height(), 1000);
+        assert_eq!(info.convergence_height(), Some(1000));
+    }
+
+    #[test]
+    fn fresh_wallet_with_no_sync_ranges_converges_at_birth_synced_height() {
+        let info = ManagedWalletInfo::dummy(0);
+        let synced = info.synced_height();
+        assert_eq!(info.convergence_height(), Some(synced));
+    }
+}

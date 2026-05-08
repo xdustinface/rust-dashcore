@@ -1544,4 +1544,52 @@ mod tests {
         pool.collapse_adjacent_ranges();
         assert_eq!(pool.sync_ranges.len(), 2);
     }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn legacy_serde_snapshot_loads_with_empty_sync_ranges() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let pool = AddressPool::new_without_generation(
+            base_path,
+            AddressPoolType::External,
+            10,
+            Network::Testnet,
+        );
+
+        let mut value = serde_json::to_value(&pool).unwrap();
+        value.as_object_mut().unwrap().remove("sync_ranges");
+        let restored: AddressPool = serde_json::from_value(value).unwrap();
+        assert!(restored.sync_ranges.is_empty());
+        assert_eq!(restored.gap_limit, pool.gap_limit);
+        assert_eq!(restored.network, pool.network);
+        assert_eq!(restored.pool_type, pool.pool_type);
+    }
+
+    #[cfg(feature = "bincode")]
+    #[test]
+    fn address_pool_bincode_round_trip_preserves_sync_ranges() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let mut pool = AddressPool::new_without_generation(
+            base_path,
+            AddressPoolType::External,
+            10,
+            Network::Testnet,
+        );
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 5..15,
+            since_height: 1234,
+            caught_up_to: Some(900),
+        });
+
+        let bytes = bincode::encode_to_vec(&pool, bincode::config::standard())
+            .expect("bincode encode");
+        let (restored, _): (AddressPool, _) =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("bincode decode");
+
+        assert_eq!(restored.sync_ranges.len(), 1);
+        assert_eq!(restored.sync_ranges[0].indexes, 5..15);
+        assert_eq!(restored.sync_ranges[0].since_height, 1234);
+        assert_eq!(restored.sync_ranges[0].caught_up_to, Some(900));
+    }
 }
