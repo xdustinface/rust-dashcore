@@ -2,11 +2,13 @@
 //!
 //! This module defines the trait that SPV clients use to interact with wallets.
 
-use crate::{WalletEvent, WalletId};
+use crate::{PendingRescan, WalletEvent, WalletId};
 use async_trait::async_trait;
+use core::ops::Range;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, OutPoint, Transaction, Txid};
+use key_wallet::managed_account::address_pool::AddressPoolType;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::broadcast;
 
@@ -119,7 +121,56 @@ pub trait WalletInterface: Send + Sync + 'static {
     }
 
     /// Return the per-wallet committed sync checkpoint, or `0` if unknown.
+    ///
+    /// This is the strictly monotonic forward edge. Pair with
+    /// [`Self::wallet_convergence_height`] when a consumer needs the
+    /// "everything below this is final" semantics.
     fn wallet_synced_height(&self, wallet_id: &WalletId) -> CoreBlockHeight;
+
+    /// Per-wallet convergence height, or `None` if the wallet is unknown.
+    ///
+    /// See [`key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface::convergence_height`]
+    /// for the semantics. Non-monotonic by nature.
+    ///
+    /// The default implementation falls back to
+    /// [`Self::wallet_synced_height`], which is correct for any wallet
+    /// implementation that does not track sync ranges.
+    fn wallet_convergence_height(&self, wallet_id: &WalletId) -> Option<CoreBlockHeight> {
+        Some(self.wallet_synced_height(wallet_id))
+    }
+
+    /// Wallet IDs whose `convergence_height` is strictly below `height`,
+    /// i.e. the wallets that still have pending backfill obligations
+    /// reaching that high.
+    ///
+    /// The default implementation falls back to [`Self::wallets_behind`].
+    fn wallets_pending_convergence(&self, height: CoreBlockHeight) -> BTreeSet<WalletId> {
+        self.wallets_behind(height)
+    }
+
+    /// All pending rescan obligations across all wallets, suitable for the
+    /// backfill worker to drive its sweep-line scan.
+    ///
+    /// The default implementation returns an empty vec, suitable for
+    /// implementations that do not track sync ranges.
+    fn pending_rescans(&self) -> Vec<PendingRescan> {
+        Vec::new()
+    }
+
+    /// Mark a contiguous slice of filter heights as scanned for a
+    /// particular pool's pending sync range. The wallet advances each
+    /// matching range's `caught_up_to`, dropping any that complete.
+    ///
+    /// The default implementation is a no-op, suitable for
+    /// implementations that do not track sync ranges.
+    fn advance_rescan(
+        &mut self,
+        _wallet_id: &WalletId,
+        _pool: AddressPoolType,
+        _indexes: Range<u32>,
+        _scanned_through: CoreBlockHeight,
+    ) {
+    }
 
     /// Advance one wallet's committed sync checkpoint. Implementations must
     /// only advance forward (a value below the current is silently ignored).

@@ -17,11 +17,13 @@ mod error;
 mod events;
 mod matching;
 mod process_block;
+mod rescan;
 mod wallet_interface;
 
 pub use error::WalletError;
 pub use events::{DerivedAddress, WalletEvent};
 pub use matching::{check_compact_filters_for_addresses, FilterMatchKey};
+pub use rescan::PendingRescan;
 pub use wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
 
 use dashcore::blockdata::transaction::Transaction;

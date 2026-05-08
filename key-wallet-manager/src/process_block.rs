@@ -1,12 +1,14 @@
 use crate::events::{diff_account_balances, project_derived_addresses, DerivedAddress};
 use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
-use crate::{WalletEvent, WalletId, WalletManager};
+use crate::{PendingRescan, WalletEvent, WalletId, WalletManager};
 use async_trait::async_trait;
 use core::fmt::Write as _;
+use core::ops::Range;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, Transaction};
 use key_wallet::account::AccountType;
+use key_wallet::managed_account::address_pool::AddressPoolType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::{BlockInfo, DerivedAddressInfo, TransactionContext};
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
@@ -236,6 +238,88 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         self.wallet_infos.get(wallet_id).map(|info| info.synced_height()).unwrap_or(0)
     }
 
+    fn wallet_convergence_height(&self, wallet_id: &WalletId) -> Option<CoreBlockHeight> {
+        self.wallet_infos.get(wallet_id).and_then(|info| info.convergence_height())
+    }
+
+    fn wallets_pending_convergence(&self, height: CoreBlockHeight) -> BTreeSet<WalletId> {
+        self.wallet_infos
+            .iter()
+            .filter_map(|(id, info)| {
+                let conv = info.convergence_height()?;
+                (conv < height).then_some(*id)
+            })
+            .collect()
+    }
+
+    fn pending_rescans(&self) -> Vec<PendingRescan> {
+        let mut out = Vec::new();
+        for (wallet_id, info) in self.wallet_infos.iter() {
+            let birth = info.birth_height();
+            for account in info.accounts().all_accounts() {
+                for pool in account.managed_account_type().address_pools() {
+                    let pool_type = pool.pool_type;
+                    for range in pool.pending_sync_ranges() {
+                        let ceiling = range.since_height.saturating_sub(1);
+                        let resume_from = range
+                            .caught_up_to
+                            .map(|c| c.saturating_add(1).max(birth))
+                            .unwrap_or(birth);
+                        if resume_from > ceiling {
+                            continue;
+                        }
+                        let addresses: Vec<Address> = range
+                            .indexes
+                            .clone()
+                            .filter_map(|idx| {
+                                pool.addresses.get(&idx).map(|info| info.address.clone())
+                            })
+                            .collect();
+                        out.push(PendingRescan {
+                            wallet_id: *wallet_id,
+                            pool: pool_type,
+                            indexes: range.indexes.clone(),
+                            addresses,
+                            floor: birth,
+                            ceiling,
+                            resume_from,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn advance_rescan(
+        &mut self,
+        wallet_id: &WalletId,
+        pool: AddressPoolType,
+        indexes: Range<u32>,
+        scanned_through: CoreBlockHeight,
+    ) {
+        let Some(info) = self.wallet_infos.get_mut(wallet_id) else {
+            return;
+        };
+        for mut account in info.accounts_mut().all_accounts_mut() {
+            for p in account.managed_account_type_mut().address_pools_mut() {
+                if p.pool_type != pool {
+                    continue;
+                }
+                for range in p.pending_sync_ranges_mut().iter_mut() {
+                    if range.indexes == indexes {
+                        let cap = range.since_height.saturating_sub(1);
+                        let new = scanned_through.min(cap);
+                        if range.caught_up_to.map(|c| new > c).unwrap_or(true) {
+                            range.caught_up_to = Some(new);
+                        }
+                    }
+                }
+                p.pending_sync_ranges_mut().retain(|r| !r.is_complete());
+            }
+        }
+    }
+
     fn update_wallet_synced_height(&mut self, wallet_id: &WalletId, height: CoreBlockHeight) {
         if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
             if height > info.synced_height() {
@@ -449,7 +533,10 @@ mod tests {
     use dashcore::{
         BlockHash, Network, OutPoint, ScriptBuf, TxIn, TxMerkleNode, TxOut, Txid, Witness,
     };
+    use key_wallet::account::ManagedAccountTrait;
     use key_wallet::account::StandardAccountType;
+    use key_wallet::managed_account::address_pool::AddressPoolType;
+    use key_wallet::managed_account::managed_account_type::ManagedAccountType;
     use key_wallet::mnemonic::Language;
     use key_wallet::wallet::initialization::WalletAccountCreationOptions;
     use key_wallet::wallet::managed_wallet_info::transaction_building::AccountTypePreference;
@@ -750,5 +837,73 @@ mod tests {
             manager.monitor_revision() > rev_before,
             "create_wallet_with_random_mnemonic should bump revision"
         );
+    }
+
+    fn highest_external_address(
+        manager: &WalletManager,
+        wallet_id: &WalletId,
+    ) -> (u32, Address) {
+        let info = manager.get_wallet_info(wallet_id).expect("wallet info");
+        let acct = info
+            .accounts
+            .standard_bip44_accounts
+            .get(&0)
+            .expect("BIP44 account 0 should exist on the default test wallet");
+        let pool = match acct.managed_account_type() {
+            ManagedAccountType::Standard {
+                external_addresses, ..
+            } => external_addresses,
+            _ => panic!("expected Standard account"),
+        };
+        let highest = pool.highest_generated.expect("pool should be pre-generated");
+        let addr = pool.address_at_index(highest).expect("highest address must exist");
+        (highest, addr)
+    }
+
+    #[tokio::test]
+    async fn convergence_drops_when_sync_range_added_and_rises_after_advance_rescan() {
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+
+        // Pristine wallet: no pending sync ranges, convergence == synced.
+        assert_eq!(manager.pending_rescans().len(), 0);
+        assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(0));
+        assert_eq!(manager.wallet_synced_height(&wallet_id), 0);
+
+        // Pay to the highest pre-generated External address inside a block at
+        // height 100. This forces gap-limit extension, which step 1 records as
+        // a pending sync range with `since_height = 100, caught_up_to = None`.
+        let (_highest_idx_before, highest_addr) = highest_external_address(&manager, &wallet_id);
+        let tx = create_tx_paying_to(&highest_addr, 0xa1);
+        let block = make_block(vec![tx]);
+        let wallets = BTreeSet::from([wallet_id]);
+        manager.process_block_for_wallets(&block, 100, &wallets).await;
+        manager.update_wallet_synced_height(&wallet_id, 100);
+
+        // The pending obligation surfaces as a single rescan covering the
+        // External pool of BIP44 account 0.
+        let rescans = manager.pending_rescans();
+        assert_eq!(rescans.len(), 1, "exactly one pending rescan expected");
+        let rescan = &rescans[0];
+        assert_eq!(rescan.wallet_id, wallet_id);
+        assert_eq!(rescan.pool, AddressPoolType::External);
+        assert_eq!(rescan.ceiling, 99);
+        assert_eq!(rescan.floor, 0);
+        assert_eq!(rescan.resume_from, 0);
+        let indexes = rescan.indexes.clone();
+
+        // synced advanced to 100 but convergence drops to the floor (birth-1
+        // saturates to 0) because the new range hasn't been backfilled.
+        assert_eq!(manager.wallet_synced_height(&wallet_id), 100);
+        assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(0));
+        let pending_at_50 = manager.wallets_pending_convergence(50);
+        assert!(pending_at_50.contains(&wallet_id));
+
+        // Backfill scans the full window. After advance_rescan reaches the
+        // ceiling, the range completes and is dropped.
+        manager.advance_rescan(&wallet_id, AddressPoolType::External, indexes, 99);
+
+        assert_eq!(manager.pending_rescans().len(), 0);
+        assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(100));
+        assert!(manager.wallets_pending_convergence(100).is_empty());
     }
 }

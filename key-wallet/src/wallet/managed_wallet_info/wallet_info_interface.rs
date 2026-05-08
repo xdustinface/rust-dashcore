@@ -100,7 +100,46 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     fn last_processed_height(&self) -> CoreBlockHeight;
 
     /// Return the durable wallet sync checkpoint height.
+    ///
+    /// This is the strictly monotonic forward edge advanced by forward
+    /// sync. Pair it with [`Self::convergence_height`] when a consumer
+    /// needs the looser "everything below this is final" semantics.
     fn synced_height(&self) -> CoreBlockHeight;
+
+    /// Highest height at which every currently-monitored address has been
+    /// scanned.
+    ///
+    /// Returns `Some(synced_height)` when no sync ranges are pending.
+    /// Otherwise returns the minimum of `synced_height` and the lowest
+    /// `caught_up_to.unwrap_or(birth_height.saturating_sub(1))` across all
+    /// pending ranges.
+    ///
+    /// Unlike [`Self::synced_height`], this value is **not monotonic**: it
+    /// drops when a new sync range is created (e.g. via gap-limit
+    /// extension) and rises as the backfill worker catches up.
+    fn convergence_height(&self) -> Option<CoreBlockHeight> {
+        let synced = self.synced_height();
+        let birth = self.birth_height();
+        let mut min_progress: Option<CoreBlockHeight> = None;
+
+        for account in self.accounts().all_accounts() {
+            for pool in account.managed_account_type().address_pools() {
+                for range in pool.pending_sync_ranges() {
+                    let progress =
+                        range.caught_up_to.unwrap_or_else(|| birth.saturating_sub(1));
+                    min_progress = Some(match min_progress {
+                        Some(m) => m.min(progress),
+                        None => progress,
+                    });
+                }
+            }
+        }
+
+        match min_progress {
+            Some(p) => Some(synced.min(p)),
+            None => Some(synced),
+        }
+    }
 
     /// Update chain state and process any matured transactions
     /// This should be called when the chain tip advances to a new height
