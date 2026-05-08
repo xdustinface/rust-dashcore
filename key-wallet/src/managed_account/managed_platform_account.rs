@@ -15,6 +15,7 @@ use super::address_pool::{AddressInfo, AddressPool, KeySource};
 use super::platform_address::PlatformP2PKHAddress;
 use crate::error::{Error, Result};
 use crate::Network;
+use dashcore::prelude::CoreBlockHeight;
 use dashcore::Address;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -93,12 +94,14 @@ impl ManagedPlatformAccount {
     /// This also updates the total balance by applying the delta.
     /// If the address was previously unfunded (balance 0) and becomes funded,
     /// and a `KeySource` is provided, the address will be marked as used
-    /// and the gap limit will be maintained.
+    /// and the gap limit will be maintained. `since_height` is the chain
+    /// height used as the floor for any newly recorded sync range.
     pub fn set_address_credit_balance(
         &mut self,
         address: PlatformP2PKHAddress,
         credit_balance: u64,
         key_source: Option<&KeySource>,
+        since_height: CoreBlockHeight,
     ) {
         let old_balance = self.address_balances.get(&address).copied().unwrap_or(0);
         let was_unfunded = old_balance == 0;
@@ -112,7 +115,7 @@ impl ManagedPlatformAccount {
         // If address became funded and we have a key source, update address pool
         if was_unfunded && is_now_funded {
             if let Some(ks) = key_source {
-                self.mark_and_maintain_gap_limit(&address, ks);
+                self.mark_and_maintain_gap_limit(&address, ks, since_height);
             }
         }
     }
@@ -122,12 +125,14 @@ impl ManagedPlatformAccount {
     /// Returns the new credit balance for the address.
     /// If the address was previously unfunded (balance 0) and becomes funded,
     /// and a `KeySource` is provided, the address will be marked as used
-    /// and the gap limit will be maintained.
+    /// and the gap limit will be maintained. `since_height` is the chain
+    /// height used as the floor for any newly recorded sync range.
     pub fn add_address_credit_balance(
         &mut self,
         address: PlatformP2PKHAddress,
         amount: u64,
         key_source: Option<&KeySource>,
+        since_height: CoreBlockHeight,
     ) -> u64 {
         let current = self.address_balances.get(&address).copied().unwrap_or(0);
         let was_unfunded = current == 0;
@@ -141,7 +146,7 @@ impl ManagedPlatformAccount {
         // If address became funded and we have a key source, update address pool
         if was_unfunded && is_now_funded {
             if let Some(ks) = key_source {
-                self.mark_and_maintain_gap_limit(&address, ks);
+                self.mark_and_maintain_gap_limit(&address, ks, since_height);
             }
         }
 
@@ -264,22 +269,27 @@ impl ManagedPlatformAccount {
         &mut self,
         address: &PlatformP2PKHAddress,
         key_source: &KeySource,
+        since_height: CoreBlockHeight,
     ) {
         // Mark the address as used
         self.mark_platform_address_used(address);
 
         // Maintain gap limit - generate new addresses if needed
         // We ignore errors here since this is a best-effort operation
-        let _ = self.addresses.maintain_gap_limit(key_source);
+        let _ = self.addresses.maintain_gap_limit(key_source, since_height);
     }
 
     /// Maintain the gap limit for the address pool
     ///
     /// This generates new addresses if needed to maintain the gap limit.
     /// Returns the newly generated address info entries (in derivation order).
-    pub fn maintain_gap_limit(&mut self, key_source: &KeySource) -> Result<Vec<AddressInfo>> {
+    pub fn maintain_gap_limit(
+        &mut self,
+        key_source: &KeySource,
+        since_height: CoreBlockHeight,
+    ) -> Result<Vec<AddressInfo>> {
         self.addresses
-            .maintain_gap_limit(key_source)
+            .maintain_gap_limit(key_source, since_height)
             .map_err(|e| Error::InvalidParameter(format!("Failed to maintain gap limit: {}", e)))
     }
 
@@ -415,19 +425,19 @@ mod tests {
 
         // Set address credit balance (this also updates total)
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 500, None);
+        account.set_address_credit_balance(addr, 500, None, 0);
         assert_eq!(account.address_credit_balance(&addr), 500);
         assert_eq!(account.total_credit_balance(), 500);
         assert_eq!(account.duff_balance(), 0); // 500 credits = 0 duffs (integer division)
 
         // Add to address credit balance
-        let new_balance = account.add_address_credit_balance(addr, 500, None);
+        let new_balance = account.add_address_credit_balance(addr, 500, None, 0);
         assert_eq!(new_balance, 1000);
         assert_eq!(account.total_credit_balance(), 1000);
         assert_eq!(account.duff_balance(), 1); // 1000 credits = 1 duff
 
         // Add more
-        let new_balance = account.add_address_credit_balance(addr, 200, None);
+        let new_balance = account.add_address_credit_balance(addr, 200, None, 0);
         assert_eq!(new_balance, 1200);
         assert_eq!(account.total_credit_balance(), 1200);
 
@@ -437,7 +447,7 @@ mod tests {
         assert_eq!(account.total_credit_balance(), 1100);
 
         // Update address balance directly (replacing existing)
-        account.set_address_credit_balance(addr, 600, None);
+        account.set_address_credit_balance(addr, 600, None, 0);
         assert_eq!(account.address_credit_balance(&addr), 600);
         assert_eq!(account.total_credit_balance(), 600);
     }
@@ -492,15 +502,15 @@ mod tests {
         let addr2 = PlatformP2PKHAddress::new([0x22; 20]);
         let addr3 = PlatformP2PKHAddress::new([0x33; 20]);
 
-        account.set_address_credit_balance(addr1, 100, None);
-        account.set_address_credit_balance(addr2, 200, None);
-        account.set_address_credit_balance(addr3, 300, None);
+        account.set_address_credit_balance(addr1, 100, None, 0);
+        account.set_address_credit_balance(addr2, 200, None, 0);
+        account.set_address_credit_balance(addr3, 300, None, 0);
 
         assert_eq!(account.total_credit_balance(), 600);
         assert_eq!(account.funded_address_count(), 3);
 
         // Set one to zero
-        account.set_address_credit_balance(addr2, 0, None);
+        account.set_address_credit_balance(addr2, 0, None, 0);
         assert_eq!(account.total_credit_balance(), 400);
         assert_eq!(account.funded_address_count(), 2);
     }
@@ -511,7 +521,7 @@ mod tests {
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
 
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 1000, None);
+        account.set_address_credit_balance(addr, 1000, None, 0);
 
         account.clear_balances();
         assert_eq!(account.total_credit_balance(), 0);
@@ -527,9 +537,9 @@ mod tests {
         let addr2 = PlatformP2PKHAddress::new([0x22; 20]);
         let addr3 = PlatformP2PKHAddress::new([0x33; 20]);
 
-        account.set_address_credit_balance(addr1, 100, None);
-        account.set_address_credit_balance(addr2, 0, None); // Zero balance
-        account.set_address_credit_balance(addr3, 300, None);
+        account.set_address_credit_balance(addr1, 100, None, 0);
+        account.set_address_credit_balance(addr2, 0, None, 0); // Zero balance
+        account.set_address_credit_balance(addr3, 300, None, 0);
 
         let funded = account.funded_addresses();
         assert_eq!(funded.len(), 2);
@@ -549,7 +559,7 @@ mod tests {
         assert!(!account.address_balances.contains_key(&addr));
 
         // Add to balances
-        account.set_address_credit_balance(addr, 100, None);
+        account.set_address_credit_balance(addr, 100, None, 0);
         assert!(account.contains_platform_address(&addr));
     }
 }

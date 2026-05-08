@@ -108,10 +108,18 @@ impl WalletPlatformChecker for ManagedWalletInfo {
         credit_balance: u64,
         key_source: Option<&KeySource>,
     ) -> bool {
-        // Find the account that contains this address
+        // Platform call sites have no block height in scope; the wallet's
+        // birth height is the safest floor for any sync range produced by
+        // gap-limit extension here.
+        let since_height = self.metadata.birth_height;
         for account in self.accounts.platform_payment_accounts.values_mut() {
             if account.contains_platform_address(address) {
-                account.set_address_credit_balance(*address, credit_balance, key_source);
+                account.set_address_credit_balance(
+                    *address,
+                    credit_balance,
+                    key_source,
+                    since_height,
+                );
                 return true;
             }
         }
@@ -125,12 +133,13 @@ impl WalletPlatformChecker for ManagedWalletInfo {
         credit_balance: u64,
         key_source: Option<&KeySource>,
     ) -> bool {
+        let since_height = self.metadata.birth_height;
         if let Some(account) = self.accounts.platform_payment_accounts.get_mut(account_key) {
             // Verify the address belongs to this account before modifying
             if !account.contains_platform_address(&address) {
                 return false;
             }
-            account.set_address_credit_balance(address, credit_balance, key_source);
+            account.set_address_credit_balance(address, credit_balance, key_source, since_height);
             true
         } else {
             false
@@ -143,10 +152,11 @@ impl WalletPlatformChecker for ManagedWalletInfo {
         amount: u64,
         key_source: Option<&KeySource>,
     ) -> Option<u64> {
-        // Find the account that contains this address
+        let since_height = self.metadata.birth_height;
         for account in self.accounts.platform_payment_accounts.values_mut() {
             if account.contains_platform_address(address) {
-                let new_balance = account.add_address_credit_balance(*address, amount, key_source);
+                let new_balance =
+                    account.add_address_credit_balance(*address, amount, key_source, since_height);
                 return Some(new_balance);
             }
         }
@@ -160,12 +170,14 @@ impl WalletPlatformChecker for ManagedWalletInfo {
         amount: u64,
         key_source: Option<&KeySource>,
     ) -> Option<u64> {
+        let since_height = self.metadata.birth_height;
         if let Some(account) = self.accounts.platform_payment_accounts.get_mut(account_key) {
             // Verify the address belongs to this account before modifying
             if !account.contains_platform_address(&address) {
                 return None;
             }
-            let new_balance = account.add_address_credit_balance(address, amount, key_source);
+            let new_balance =
+                account.add_address_credit_balance(address, amount, key_source, since_height);
             Some(new_balance)
         } else {
             None
@@ -243,7 +255,7 @@ mod tests {
 
         // Add some balance
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 5000, None);
+        account.set_address_credit_balance(addr, 5000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,
@@ -263,13 +275,13 @@ mod tests {
         let pool1 = create_test_pool();
         let mut account1 = ManagedPlatformAccount::new(0, 0, pool1, false);
         let addr1 = PlatformP2PKHAddress::new([0x11; 20]);
-        account1.set_address_credit_balance(addr1, 3000, None);
+        account1.set_address_credit_balance(addr1, 3000, None, 0);
 
         // Create second platform account
         let pool2 = create_test_pool();
         let mut account2 = ManagedPlatformAccount::new(1, 0, pool2, false);
         let addr2 = PlatformP2PKHAddress::new([0x22; 20]);
-        account2.set_address_credit_balance(addr2, 2000, None);
+        account2.set_address_credit_balance(addr2, 2000, None, 0);
 
         wallet_info.accounts.platform_payment_accounts.insert(
             PlatformPaymentAccountKey {
@@ -298,7 +310,7 @@ mod tests {
         let pool = create_test_pool();
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 1000, None);
+        account.set_address_credit_balance(addr, 1000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,
@@ -325,7 +337,7 @@ mod tests {
         let pool = create_test_pool();
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 1000, None);
+        account.set_address_credit_balance(addr, 1000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,
@@ -352,7 +364,7 @@ mod tests {
         let pool = create_test_pool();
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 5000, None);
+        account.set_address_credit_balance(addr, 5000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,
@@ -377,7 +389,7 @@ mod tests {
         let pool = create_test_pool();
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
-        account.set_address_credit_balance(addr, 3000, None);
+        account.set_address_credit_balance(addr, 3000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,
@@ -404,7 +416,7 @@ mod tests {
         let mut account = ManagedPlatformAccount::new(0, 0, pool, false);
         let addr = PlatformP2PKHAddress::new([0x11; 20]);
         // First set initial balance so the address is known to the account
-        account.set_address_credit_balance(addr, 1000, None);
+        account.set_address_credit_balance(addr, 1000, None, 0);
 
         let key = PlatformPaymentAccountKey {
             account: 0,

@@ -15,6 +15,7 @@ use crate::bip32::{ChildNumber, DerivationPath, ExtendedPrivKey, ExtendedPubKey}
 use crate::error::{Error, Result};
 use crate::gap_limit::DEFAULT_EXTERNAL_GAP_LIMIT;
 use crate::Network;
+use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, AddressType, ScriptBuf};
 
 /// Types of public keys used in the address pool
@@ -319,6 +320,36 @@ impl AddressInfo {
     }
 }
 
+/// A contiguous range of address indexes within a pool, tracking how far the
+/// filters covering them have been scanned.
+///
+/// A range becomes complete once `caught_up_to + 1 >= since_height`. At that
+/// point it carries no information beyond what `synced_height` already
+/// encodes and is dropped, so wallet state stays bounded regardless of how
+/// many gap extensions the wallet has seen historically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "bincode", derive(Encode, Decode))]
+pub struct AddressSyncRange {
+    /// Inclusive start, exclusive end within the pool's index space.
+    #[cfg_attr(feature = "bincode", bincode(with_serde))]
+    pub indexes: core::ops::Range<u32>,
+    /// Forward-sync height at which these indexes joined the monitored set.
+    pub since_height: CoreBlockHeight,
+    /// Highest filter height these indexes have been scanned through.
+    /// `None` means no scan past `since_height - 1` has happened yet.
+    pub caught_up_to: Option<CoreBlockHeight>,
+}
+
+impl AddressSyncRange {
+    pub fn is_complete(&self) -> bool {
+        match self.caught_up_to {
+            Some(c) => c + 1 >= self.since_height,
+            None => self.since_height == 0,
+        }
+    }
+}
+
 /// Address pool for managing HD wallet addresses
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -346,6 +377,12 @@ pub struct AddressPool {
     pub highest_used: Option<u32>,
     /// Address type preference
     pub address_type: AddressType,
+    /// Pending sync ranges covering the indexes derived in this pool, sorted
+    /// by `indexes.start` and non-overlapping. Complete ranges (where
+    /// `caught_up_to + 1 >= since_height`) are dropped, so this vector
+    /// shrinks back to empty once the backfill worker catches up.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sync_ranges: Vec<AddressSyncRange>,
 }
 
 impl AddressPool {
@@ -386,6 +423,7 @@ impl AddressPool {
             highest_generated: None,
             highest_used: None,
             address_type: AddressType::P2pkh,
+            sync_ranges: Vec::new(),
         }
     }
 
@@ -884,12 +922,23 @@ impl AddressPool {
     /// [`Address`] lets callers — in particular the wallet-manager event
     /// emission seam — surface the full derivation context (index, path,
     /// public key) for downstream persisters without re-deriving it.
-    pub fn maintain_gap_limit(&mut self, key_source: &KeySource) -> Result<Vec<AddressInfo>> {
+    ///
+    /// `since_height` is the chain height at which the newly derived
+    /// addresses joined the wallet's monitored set. Filters at heights below
+    /// `since_height` were scanned without these addresses in the query set,
+    /// so a pending [`AddressSyncRange`] is recorded for the backfill worker
+    /// to revisit them.
+    pub fn maintain_gap_limit(
+        &mut self,
+        key_source: &KeySource,
+        since_height: CoreBlockHeight,
+    ) -> Result<Vec<AddressInfo>> {
         let target = match self.highest_used {
             None => self.gap_limit - 1,
             Some(highest) => highest + self.gap_limit,
         };
 
+        let prev_top = self.highest_generated;
         let mut new_addresses = Vec::new();
         while self.highest_generated.unwrap_or(0) < target {
             let next_index = self.highest_generated.map(|h| h + 1).unwrap_or(0);
@@ -909,7 +958,99 @@ impl AddressPool {
             new_addresses.push(info);
         }
 
+        if !new_addresses.is_empty() {
+            let start = prev_top.map(|h| h + 1).unwrap_or(0);
+            let end_exclusive = self
+                .highest_generated
+                .expect("highest_generated must be set after deriving addresses")
+                + 1;
+            self.push_sync_range(AddressSyncRange {
+                indexes: start..end_exclusive,
+                since_height,
+                caught_up_to: None,
+            });
+        }
+
         Ok(new_addresses)
+    }
+
+    /// Pending sync ranges in this pool, sorted by start index.
+    pub fn pending_sync_ranges(&self) -> &[AddressSyncRange] {
+        &self.sync_ranges
+    }
+
+    /// Mutable access to pending sync ranges (used by callers that advance
+    /// `caught_up_to` together with a wallet-snapshot flush).
+    pub fn pending_sync_ranges_mut(&mut self) -> &mut Vec<AddressSyncRange> {
+        &mut self.sync_ranges
+    }
+
+    /// Insert a sync range, keeping the vector sorted by `indexes.start`,
+    /// then collapse adjacent ranges with matching scan progress and drop
+    /// any range that is already complete.
+    pub fn push_sync_range(&mut self, range: AddressSyncRange) {
+        let pos = self
+            .sync_ranges
+            .binary_search_by_key(&range.indexes.start, |r| r.indexes.start)
+            .unwrap_or_else(|p| p);
+        self.sync_ranges.insert(pos, range);
+        self.collapse_adjacent_ranges();
+        self.drop_complete_ranges();
+    }
+
+    /// Advance every pending range's `caught_up_to` toward `height`, capped
+    /// at `since_height - 1`. Ranges that reach completion are dropped.
+    pub fn advance_caught_up_to(&mut self, height: CoreBlockHeight) {
+        for range in &mut self.sync_ranges {
+            let cap = range.since_height.saturating_sub(1);
+            let new = height.min(cap);
+            match range.caught_up_to {
+                Some(c) if new > c => range.caught_up_to = Some(new),
+                None => range.caught_up_to = Some(new),
+                _ => {}
+            }
+        }
+        self.drop_complete_ranges();
+    }
+
+    /// Reorg-time clamp: if any range progressed past the fork point, pull
+    /// `caught_up_to` back to `fork_height` so the backfill worker re-covers
+    /// the affected window.
+    pub fn clamp_caught_up_to(&mut self, fork_height: CoreBlockHeight) {
+        for range in &mut self.sync_ranges {
+            if let Some(c) = range.caught_up_to {
+                if c > fork_height {
+                    range.caught_up_to = Some(fork_height);
+                }
+            }
+        }
+    }
+
+    /// Merge contiguous ranges that share the same `(since_height,
+    /// caught_up_to)`. Independently mutating accessors should call this
+    /// after batched edits.
+    pub fn collapse_adjacent_ranges(&mut self) {
+        if self.sync_ranges.len() < 2 {
+            return;
+        }
+        let mut merged: Vec<AddressSyncRange> = Vec::with_capacity(self.sync_ranges.len());
+        for range in self.sync_ranges.drain(..) {
+            match merged.last_mut() {
+                Some(prev)
+                    if prev.indexes.end == range.indexes.start
+                        && prev.since_height == range.since_height
+                        && prev.caught_up_to == range.caught_up_to =>
+                {
+                    prev.indexes.end = range.indexes.end;
+                }
+                _ => merged.push(range),
+            }
+        }
+        self.sync_ranges = merged;
+    }
+
+    fn drop_complete_ranges(&mut self) {
+        self.sync_ranges.retain(|r| !r.is_complete());
     }
 
     /// Set a custom label for an address
@@ -1235,32 +1376,42 @@ mod tests {
         assert_eq!(pool.addresses.len(), gap_limit as usize);
 
         // Calling maintain_gap_limit should not generate any new addresses when none are used
-        let new_addresses = pool.maintain_gap_limit(&key_source).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 0).unwrap();
         assert_eq!(new_addresses.len(), 0);
         assert_eq!(pool.highest_generated, Some(gap_limit - 1));
         assert_eq!(pool.addresses.len(), gap_limit as usize);
+        assert!(pool.sync_ranges.is_empty());
 
         // Mark address at index 0 as used
         pool.mark_index_used(0);
         assert_eq!(pool.highest_used, Some(0));
 
         // Should generate exactly 1 address to maintain gap_limit unused after index 0
-        let new_addresses = pool.maintain_gap_limit(&key_source).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
         assert_eq!(new_addresses.len(), 1);
         assert_eq!(new_addresses[0].index, gap_limit);
         assert_eq!(pool.highest_generated, Some(gap_limit));
         assert_eq!(pool.addresses.len(), gap_limit as usize + 1);
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].since_height, 100);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, None);
+        assert_eq!(pool.sync_ranges[0].indexes, gap_limit..(gap_limit + 1));
 
         // Mark address at index 1 and 2 as used
         pool.mark_index_used(1);
         pool.mark_index_used(2);
 
         // Should generate exactly 2 more addresses
-        let new_addresses = pool.maintain_gap_limit(&key_source).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
         assert_eq!(new_addresses.len(), 2);
         assert_eq!(new_addresses[0].index, gap_limit + 1);
         assert_eq!(new_addresses[1].index, gap_limit + 2);
         assert_eq!(pool.highest_generated, Some(gap_limit + 2));
+        // Two derivations at the same `since_height` collapse into one
+        // contiguous range covering the full extension.
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].indexes, gap_limit..(gap_limit + 3));
+        assert_eq!(pool.sync_ranges[0].since_height, 100);
         assert_eq!(pool.addresses.len(), gap_limit as usize + 3);
     }
 
@@ -1302,5 +1453,95 @@ mod tests {
         assert_eq!(found.len(), 3);
         assert_eq!(pool.used_indices.len(), 3);
         assert_eq!(pool.highest_used, Some(7));
+    }
+
+    #[test]
+    fn test_sync_range_advance_and_drop() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let key_source = test_key_source();
+        let gap_limit = 10;
+
+        let mut pool = AddressPool::new(
+            base_path,
+            AddressPoolType::External,
+            gap_limit,
+            Network::Testnet,
+            &key_source,
+        )
+        .unwrap();
+
+        pool.mark_index_used(5);
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
+        assert!(!new_addresses.is_empty());
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].since_height, 100);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, None);
+
+        pool.advance_caught_up_to(50);
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, Some(50));
+
+        pool.advance_caught_up_to(99);
+        assert!(
+            pool.sync_ranges.is_empty(),
+            "complete range should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_clamp_caught_up_to() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let mut pool = AddressPool::new_without_generation(
+            base_path,
+            AddressPoolType::External,
+            10,
+            Network::Testnet,
+        );
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 0..10,
+            since_height: 100,
+            caught_up_to: Some(50),
+        });
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 10..20,
+            since_height: 200,
+            caught_up_to: Some(150),
+        });
+
+        pool.clamp_caught_up_to(75);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, Some(50));
+        assert_eq!(pool.sync_ranges[1].caught_up_to, Some(75));
+    }
+
+    #[test]
+    fn test_collapse_adjacent_ranges() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let mut pool = AddressPool::new_without_generation(
+            base_path,
+            AddressPoolType::External,
+            10,
+            Network::Testnet,
+        );
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 0..10,
+            since_height: 100,
+            caught_up_to: None,
+        });
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 10..20,
+            since_height: 100,
+            caught_up_to: None,
+        });
+        pool.collapse_adjacent_ranges();
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].indexes, 0..20);
+
+        pool.sync_ranges.push(AddressSyncRange {
+            indexes: 20..30,
+            since_height: 200,
+            caught_up_to: None,
+        });
+        pool.collapse_adjacent_ranges();
+        assert_eq!(pool.sync_ranges.len(), 2);
     }
 }

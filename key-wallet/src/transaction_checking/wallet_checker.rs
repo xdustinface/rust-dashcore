@@ -56,6 +56,19 @@ impl WalletTransactionChecker for ManagedWalletInfo {
         // Classify the transaction
         let tx_type = TransactionRouter::classify_transaction(tx);
 
+        // Floor used for new sync ranges when this transaction triggers
+        // gap-limit extension. For confirmed contexts the block height is
+        // exact; mempool / IS-only contexts use `last_processed_height + 1`
+        // since the address must be scanned from the next block forward.
+        let since_height = match &context {
+            TransactionContext::InBlock(info) | TransactionContext::InChainLockedBlock(info) => {
+                info.height()
+            }
+            TransactionContext::Mempool | TransactionContext::InstantSend(_) => {
+                self.last_processed_height().saturating_add(1)
+            }
+        };
+
         // Get relevant account types for this transaction type
         let relevant_types = TransactionRouter::get_relevant_account_types(&tx_type);
 
@@ -190,7 +203,7 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             let owning_account_type = account.managed_account_type().to_account_type();
             for pool in account.managed_account_type_mut().address_pools_mut() {
                 let pool_type = pool.pool_type;
-                match pool.maintain_gap_limit(&key_source) {
+                match pool.maintain_gap_limit(&key_source, since_height) {
                     Ok(infos) => result.new_addresses.extend(infos.into_iter().map(|info| {
                         super::account_checker::DerivedAddressInfo {
                             account_type: owning_account_type,
