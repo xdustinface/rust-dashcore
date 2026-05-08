@@ -563,4 +563,67 @@ mod tests {
             pending,
         );
     }
+
+    /// A range whose backfill window straddles the chunk boundary must
+    /// take more than one iteration of `tick`'s inner loop. The first chunk
+    /// covers `[0..=BACKFILL_CHUNK_SIZE-1]` and advances `caught_up_to` to
+    /// `chunk_end`; the second covers `[BACKFILL_CHUNK_SIZE..=ceiling]`.
+    /// Verifies the loop's `chunk_start = chunk_end + 1` step, exercising
+    /// the cross-chunk advance the existing single-chunk tests do not.
+    #[tokio::test]
+    async fn backfill_worker_walks_multiple_chunks_for_a_long_range() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let wallet_id: WalletId = [0xEE; 32];
+        let pool = AddressPoolType::External;
+        let address = Address::dummy(Network::Regtest, 200);
+
+        // since=BACKFILL_CHUNK_SIZE+2 → ceiling=BACKFILL_CHUNK_SIZE+1, well
+        // past the first chunk's end at BACKFILL_CHUNK_SIZE-1.
+        let since: u32 = BACKFILL_CHUNK_SIZE + 2;
+        let ceiling: u32 = since - 1;
+
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![address.clone()],
+                    synced_height: since + 100,
+                    last_processed_height: since + 100,
+                },
+            );
+            w.set_birth_height(wallet_id, 0);
+            w.push_sync_range_for_test(wallet_id, pool, 5..10, since, vec![address.clone()]);
+        }
+
+        // No matching filters anywhere — every chunk hits the no-match
+        // advance path, so the range completes and drops.
+        let dummy_filter = BlockFilter::new(&[0u8; 32]);
+        let header_end = ceiling + 1;
+        let headers: Vec<Header> = Header::dummy_batch(0..header_end);
+        storage.block_headers().write().await.store_headers(&headers).await.unwrap();
+        let filter_store = storage.filters();
+        {
+            let mut fs = filter_store.write().await;
+            for h in 0..=ceiling {
+                fs.store_filter(h, &dummy_filter.content).await.unwrap();
+            }
+        }
+
+        let mut worker: BackfillWorker<_, _, MultiMockWallet> =
+            BackfillWorker::new(storage.filters(), storage.block_headers(), multi.clone());
+
+        let matched = worker.tick().await.unwrap();
+        assert!(matched.is_empty(), "no filter matches expected, got {:?}", matched);
+
+        // After two chunk iterations the no-match advance pushed
+        // `caught_up_to` to `ceiling`, completing the range.
+        let pending = multi.read().await.pending_rescans();
+        assert!(
+            pending.is_empty(),
+            "multi-chunk no-match sweep must complete and drop the range, got {:?}",
+            pending,
+        );
+    }
 }
