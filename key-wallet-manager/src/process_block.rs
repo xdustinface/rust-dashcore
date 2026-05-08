@@ -762,7 +762,7 @@ mod tests {
     };
     use key_wallet::account::ManagedAccountTrait;
     use key_wallet::account::StandardAccountType;
-    use key_wallet::managed_account::address_pool::AddressPoolType;
+    use key_wallet::managed_account::address_pool::{AddressPoolType, AddressSyncRange};
     use key_wallet::managed_account::managed_account_type::ManagedAccountType;
     use key_wallet::mnemonic::Language;
     use key_wallet::wallet::initialization::WalletAccountCreationOptions;
@@ -1136,8 +1136,6 @@ mod tests {
 
     #[tokio::test]
     async fn on_chain_reorg_clamps_pending_sync_ranges_across_pools() {
-        use key_wallet::managed_account::address_pool::AddressSyncRange;
-
         let (mut manager, wallet_id, _) = setup_manager_with_wallet();
         manager.update_wallet_synced_height(&wallet_id, 400);
 
@@ -1207,8 +1205,6 @@ mod tests {
     /// layer surfaces directly as new work without any extra wiring.
     #[tokio::test]
     async fn on_chain_reorg_re_exposes_clamped_window_via_pending_rescans() {
-        use key_wallet::managed_account::address_pool::AddressSyncRange;
-
         let (mut manager, wallet_id, _) = setup_manager_with_wallet();
         manager.update_wallet_synced_height(&wallet_id, 400);
 
