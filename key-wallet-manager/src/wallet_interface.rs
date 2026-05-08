@@ -56,16 +56,18 @@ impl BlockProcessingResult {
 }
 
 /// One backfill obligation associated with a block: which sync range to
-/// advance, and to what height. The block itself (height, hash, wallet
-/// attribution) lives outside this struct in the event and pipeline
-/// carriers.
+/// advance, and to what height. Carries both the matched block's height
+/// (so the worker can prune stale obligations on reorg or completion) and
+/// `advance_to`, the chunk_end of the backfill sweep that produced the
+/// match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillAdvance {
     pub wallet_id: WalletId,
     pub pool: AddressPoolType,
     pub indexes: Range<u32>,
-    /// Where `caught_up_to` should land after this block is processed —
-    /// the chunk_end of the backfill sweep that produced the match.
+    /// Height of the matched block whose download is awaited.
+    pub height: CoreBlockHeight,
+    /// Where `caught_up_to` should land after this block is processed.
     pub advance_to: CoreBlockHeight,
 }
 

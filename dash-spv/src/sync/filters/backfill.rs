@@ -43,31 +43,6 @@ use crate::storage::{BlockHeaderStorage, FilterStorage};
 /// Matches the forward-sync batch size so disk reads stay cache-friendly.
 const BACKFILL_CHUNK_SIZE: u32 = 5000;
 
-/// Per-block obligation tracked while waiting for a backfill block to be
-/// downloaded and processed. Held in [`BackfillWorker::pending_advances`]
-/// keyed by block hash. Multiple obligations can attach to the same block
-/// when several sync ranges share an address that matched the same filter,
-/// so the value is a `Vec`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingAdvance {
-    pub wallet_id: WalletId,
-    pub pool: AddressPoolType,
-    pub indexes: Range<u32>,
-    pub height: CoreBlockHeight,
-    pub advance_to: CoreBlockHeight,
-}
-
-impl PendingAdvance {
-    fn to_backfill_advance(&self) -> BackfillAdvance {
-        BackfillAdvance {
-            wallet_id: self.wallet_id,
-            pool: self.pool,
-            indexes: self.indexes.clone(),
-            advance_to: self.advance_to,
-        }
-    }
-}
-
 /// Sweep-line backfill worker over pending sync ranges.
 ///
 /// Owns short-lived state (`pending_advances`) plus shared references to
@@ -75,11 +50,18 @@ impl PendingAdvance {
 /// wake channel signalled when `pending_rescans` becomes non-empty) and
 /// `on_block_processed` (when a block we requested has been downloaded
 /// through the existing block path).
+///
+/// `pending_advances` is keyed by block hash because several sync ranges
+/// can share an address that matched the same filter, so the value is a
+/// `Vec<BackfillAdvance>`. Entries that no longer correspond to a live
+/// pending sync range (range completed, range advanced past `height`, or
+/// range removed by reorg clamp) are pruned at the top of every `tick`,
+/// keeping the map bounded under repeated polling and download failures.
 pub(crate) struct BackfillWorker<F, H, W> {
     filter_storage: Arc<RwLock<F>>,
     header_storage: Arc<RwLock<H>>,
     wallet: Arc<RwLock<W>>,
-    pending_advances: HashMap<BlockHash, Vec<PendingAdvance>>,
+    pending_advances: HashMap<BlockHash, Vec<BackfillAdvance>>,
 }
 
 impl<F, H, W> BackfillWorker<F, H, W>
@@ -115,6 +97,7 @@ where
         &mut self,
     ) -> SyncResult<BTreeMap<FilterMatchKey, Vec<BackfillAdvance>>> {
         let rescans = self.wallet.read().await.pending_rescans();
+        self.prune_pending_advances(&rescans);
         if rescans.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -133,6 +116,11 @@ where
         }
 
         let mut new_requests: BTreeMap<FilterMatchKey, Vec<BackfillAdvance>> = BTreeMap::new();
+        // Ranges that match in any chunk are excluded from no-match advance
+        // for every later chunk too: a range with an in-flight matched block
+        // must not have its `caught_up_to` advanced past that block's height
+        // until the block is processed and `RescanBlockProcessed` fires.
+        let mut matched_range_keys: HashSet<(WalletId, AddressPoolType, u32, u32)> = HashSet::new();
         let mut chunk_start = global_min;
         while chunk_start <= global_max {
             let chunk_end =
@@ -140,7 +128,11 @@ where
 
             let active: Vec<&PendingRescan> = rescans
                 .iter()
-                .filter(|r| r.resume_from <= chunk_end && r.ceiling >= chunk_start)
+                .filter(|r| {
+                    r.resume_from <= r.ceiling
+                        && r.resume_from <= chunk_end
+                        && r.ceiling >= chunk_start
+                })
                 .collect();
             if active.is_empty() {
                 chunk_start = chunk_end.saturating_add(1);
@@ -161,14 +153,17 @@ where
                 continue;
             }
 
+            // `check_compact_filters_for_addresses` takes the height *before*
+            // the chunk's first filter. When `chunk_start == 0` we want the
+            // matched `FilterMatchKey.height()` to equal the block height, so
+            // we pass `u32::MAX` (the result of `0u32.saturating_sub(1)`),
+            // which the matcher treats as "begin from height 0".
             let matches = check_compact_filters_for_addresses(
                 &filters,
                 address_vec,
                 chunk_start.saturating_sub(1),
             );
 
-            let mut matched_range_keys: HashSet<(WalletId, AddressPoolType, u32, u32)> =
-                HashSet::new();
             for key in &matches {
                 let height = key.height();
                 let hash = *key.hash();
@@ -176,28 +171,33 @@ where
                     if r.resume_from > height || r.ceiling < height {
                         continue;
                     }
-                    matched_range_keys.insert((
-                        r.wallet_id,
-                        r.pool,
-                        r.indexes.start,
-                        r.indexes.end,
-                    ));
-                    let pending = PendingAdvance {
+                    let range_key = (r.wallet_id, r.pool, r.indexes.start, r.indexes.end);
+                    matched_range_keys.insert(range_key);
+                    let advance = BackfillAdvance {
                         wallet_id: r.wallet_id,
                         pool: r.pool,
                         indexes: r.indexes.clone(),
                         height,
                         advance_to: chunk_end,
                     };
-                    let advance = pending.to_backfill_advance();
-                    self.pending_advances.entry(hash).or_default().push(pending);
+                    let pending = self.pending_advances.entry(hash).or_default();
+                    let already_pending = pending.iter().any(|p| {
+                        p.wallet_id == advance.wallet_id
+                            && p.pool == advance.pool
+                            && p.indexes == advance.indexes
+                    });
+                    if already_pending {
+                        continue;
+                    }
+                    pending.push(advance.clone());
                     new_requests.entry(key.clone()).or_default().push(advance);
                 }
             }
 
-            // Active ranges that did NOT match anything in this chunk advance
-            // straight to `chunk_end`. Ranges that matched defer the advance
-            // until the block actually arrives so persistence stays atomic.
+            // Active ranges that did NOT match anything in *any* chunk so far
+            // advance straight to `chunk_end`. Ranges that matched anywhere
+            // defer the advance until their matched block is processed so
+            // persistence stays atomic.
             let no_match: Vec<(WalletId, AddressPoolType, Range<u32>)> = active
                 .iter()
                 .filter(|r| {
@@ -224,6 +224,28 @@ where
         Ok(new_requests)
     }
 
+    /// Drop pending advances whose corresponding sync range is no longer
+    /// pending or has already advanced past the matched block's height.
+    /// Keeps `pending_advances` bounded across reorgs, gap-extension churn,
+    /// and download failures.
+    fn prune_pending_advances(&mut self, rescans: &[PendingRescan]) {
+        if self.pending_advances.is_empty() {
+            return;
+        }
+        let live: HashMap<(WalletId, AddressPoolType, u32, u32), CoreBlockHeight> = rescans
+            .iter()
+            .map(|r| ((r.wallet_id, r.pool, r.indexes.start, r.indexes.end), r.resume_from))
+            .collect();
+        self.pending_advances.retain(|_hash, advances| {
+            advances.retain(|adv| {
+                live.get(&(adv.wallet_id, adv.pool, adv.indexes.start, adv.indexes.end))
+                    .map(|resume| adv.height >= *resume)
+                    .unwrap_or(false)
+            });
+            !advances.is_empty()
+        });
+    }
+
     /// Called by the orchestrator after a backfill block has been processed
     /// via [`WalletInterface::process_backfill_block_for_wallets`], which
     /// already advanced `caught_up_to` and emitted
@@ -245,6 +267,20 @@ where
     ) -> SyncResult<HashMap<FilterMatchKey, BlockFilter>> {
         let filter_data = self.filter_storage.read().await.load_filters(start..end + 1).await?;
         let headers = self.header_storage.read().await.load_headers(start..end + 1).await?;
+
+        // A length mismatch means the storage layer returned a partial view
+        // for the chunk: filters truncated, headers truncated, or both. Pairing
+        // by `zip` would silently drop the tail and the caller would advance
+        // `caught_up_to` past heights that were never actually scanned,
+        // permanently masking any transactions there. Surface the
+        // inconsistency so the caller can recover.
+        if filter_data.len() != headers.len() {
+            return Err(crate::error::SyncError::Storage(format!(
+                "backfill load_filters length mismatch for range {start}..={end}: filters={}, headers={}",
+                filter_data.len(),
+                headers.len(),
+            )));
+        }
 
         let mut out = HashMap::new();
         for (idx, (data, header)) in filter_data.iter().zip(headers.iter()).enumerate() {
@@ -469,6 +505,7 @@ mod tests {
                     wallet_id,
                     pool,
                     indexes: 5..10,
+                    height: 50,
                     advance_to: 49,
                 }],
             )
