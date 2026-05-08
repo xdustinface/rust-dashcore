@@ -227,6 +227,12 @@ pub enum WalletEvent {
     /// previously-known records that just confirmed, `matured` is older
     /// coinbase records that crossed the maturity threshold as the scanned
     /// height advanced.
+    ///
+    /// `height` is **not monotonic** in this stream: within-batch rescans
+    /// (and the backfill worker introduced for sync-range coverage) can
+    /// process older blocks after newer ones. Consumers indexing by
+    /// height should accept that earlier heights may appear after later
+    /// ones and dedup on `(wallet_id, txid)` rather than on height.
     BlockProcessed {
         /// ID of the affected wallet.
         wallet_id: WalletId,
@@ -255,14 +261,58 @@ pub enum WalletEvent {
         addresses_derived: Vec<DerivedAddress>,
     },
     /// The wallet's scan cursor advanced because the filter pipeline
-    /// committed a batch covering blocks up to `height`. No records or
-    /// balance — consumers persist this as a checkpoint atomically with
-    /// any records/balance from prior `BlockProcessed` events in the batch.
+    /// committed a batch covering blocks up to `height`.
+    ///
+    /// This is the **monotonic forward edge** — `height` only ever
+    /// increases. It does **not** mean "everything below `height` is
+    /// final": a later gap-limit extension can surface a sync range
+    /// covering earlier heights that have not yet been scanned with the
+    /// newly derived addresses. Consumers needing a strict "everything
+    /// below here is final" watermark should listen for
+    /// [`WalletEvent::ConvergenceChanged`] instead.
+    ///
+    /// No records or balance — consumers persist this as a checkpoint
+    /// atomically with any records/balance from prior `BlockProcessed`
+    /// events in the batch.
     SyncHeightAdvanced {
         /// ID of the affected wallet.
         wallet_id: WalletId,
         /// New scanned height for the wallet.
         height: CoreBlockHeight,
+    },
+    /// A wallet's [`convergence_height`] changed.
+    ///
+    /// Convergence is the strict watermark: every currently-monitored
+    /// address has been scanned through this height. Unlike
+    /// [`SyncHeightAdvanced`], this value is **non-monotonic** — it drops
+    /// when a new sync range is created (e.g. via gap-limit extension)
+    /// and rises as the backfill worker catches up. May be `None` for a
+    /// fresh wallet that has not yet completed any scan.
+    ///
+    /// [`convergence_height`]: key_wallet::wallet::managed_wallet_info::WalletInfoInterface::convergence_height
+    ConvergenceChanged {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// New convergence height, or `None` if no progress has been
+        /// recorded yet for any of the wallet's pending sync ranges.
+        fully_converged_through: Option<CoreBlockHeight>,
+    },
+    /// Advisory progress for a backfill scan over one sync range.
+    ///
+    /// Emitted at most once per scanned filter chunk. Consumers that only
+    /// care about the final state should listen for
+    /// [`ConvergenceChanged`] instead.
+    RescanProgressed {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// Pool the sync range belongs to.
+        pool: AddressPoolType,
+        /// Index window of the sync range.
+        indexes: core::ops::Range<u32>,
+        /// New `caught_up_to` for the range after this chunk.
+        caught_up_to: CoreBlockHeight,
+        /// Inclusive completion target (`since_height - 1`).
+        target: CoreBlockHeight,
     },
 }
 
@@ -283,6 +333,14 @@ impl WalletEvent {
                 ..
             }
             | WalletEvent::SyncHeightAdvanced {
+                wallet_id,
+                ..
+            }
+            | WalletEvent::ConvergenceChanged {
+                wallet_id,
+                ..
+            }
+            | WalletEvent::RescanProgressed {
                 wallet_id,
                 ..
             } => *wallet_id,
@@ -347,6 +405,25 @@ impl WalletEvent {
                 ..
             } => {
                 format!("SyncHeightAdvanced(height={})", height)
+            }
+            WalletEvent::ConvergenceChanged {
+                fully_converged_through,
+                ..
+            } => match fully_converged_through {
+                Some(h) => format!("ConvergenceChanged(through={})", h),
+                None => "ConvergenceChanged(through=none)".to_string(),
+            },
+            WalletEvent::RescanProgressed {
+                pool,
+                indexes,
+                caught_up_to,
+                target,
+                ..
+            } => {
+                format!(
+                    "RescanProgressed(pool={:?}, indexes={}..{}, caught_up_to={}, target={})",
+                    pool, indexes.start, indexes.end, caught_up_to, target,
+                )
             }
         }
     }

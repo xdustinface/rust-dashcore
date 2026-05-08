@@ -301,6 +301,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         let Some(info) = self.wallet_infos.get_mut(wallet_id) else {
             return;
         };
+        let prev_conv = info.convergence_height();
         for mut account in info.accounts_mut().all_accounts_mut() {
             for p in account.managed_account_type_mut().address_pools_mut() {
                 if p.pool_type != pool {
@@ -317,6 +318,13 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 }
                 p.pending_sync_ranges_mut().retain(|r| !r.is_complete());
             }
+        }
+        let new_conv = info.convergence_height();
+        if new_conv != prev_conv {
+            let _ = self.event_sender.send(WalletEvent::ConvergenceChanged {
+                wallet_id: *wallet_id,
+                fully_converged_through: new_conv,
+            });
         }
     }
 
@@ -455,6 +463,10 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                 self.wallet_infos.get(id).map(|info| (*id, info.last_processed_height()))
             })
             .collect();
+        let prior_convergence: BTreeMap<WalletId, Option<CoreBlockHeight>> = wallets
+            .iter()
+            .filter_map(|id| self.wallet_infos.get(id).map(|info| (*id, info.convergence_height())))
+            .collect();
 
         // Collect matured coinbase records before advancing the height so the
         // (old, new] window is well-defined per wallet. Wallets whose height
@@ -518,6 +530,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                     addresses_derived,
                 };
                 let _ = self.event_sender.send(event);
+            }
+
+            let new_conv = info.convergence_height();
+            if prior_convergence.get(wallet_id).copied() != Some(new_conv) {
+                let _ = self.event_sender.send(WalletEvent::ConvergenceChanged {
+                    wallet_id: *wallet_id,
+                    fully_converged_through: new_conv,
+                });
             }
         }
     }
