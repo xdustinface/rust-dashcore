@@ -284,12 +284,12 @@ pub enum WalletEvent {
     ///
     /// Convergence is the strict watermark: every currently-monitored
     /// address has been scanned through this height. Unlike
-    /// [`SyncHeightAdvanced`], this value is **non-monotonic** — it drops
-    /// when a new sync range is created (e.g. via gap-limit extension)
-    /// and rises as the backfill worker catches up. May be `None` for a
-    /// fresh wallet that has not yet completed any scan.
+    /// [`Self::SyncHeightAdvanced`], this value is **non-monotonic** — it
+    /// drops when a new sync range is created (e.g. via gap-limit
+    /// extension) and rises as the backfill worker catches up. May be
+    /// `None` for a fresh wallet that has not yet completed any scan.
     ///
-    /// [`convergence_height`]: key_wallet::wallet::managed_wallet_info::WalletInfoInterface::convergence_height
+    /// [`convergence_height`]: key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface::convergence_height
     ConvergenceChanged {
         /// ID of the affected wallet.
         wallet_id: WalletId,
@@ -301,7 +301,7 @@ pub enum WalletEvent {
     ///
     /// Emitted at most once per scanned filter chunk. Consumers that only
     /// care about the final state should listen for
-    /// [`ConvergenceChanged`] instead.
+    /// [`Self::ConvergenceChanged`] instead.
     RescanProgressed {
         /// ID of the affected wallet.
         wallet_id: WalletId,
@@ -318,7 +318,7 @@ pub enum WalletEvent {
     /// at this height with the `caught_up_to` advance for the relevant
     /// sync range so a downstream persister writes both atomically.
     ///
-    /// Distinct from [`BlockProcessed`] (which fires from forward sync) so
+    /// Distinct from [`Self::BlockProcessed`] (which fires from forward sync) so
     /// the persister can route differently. `height` may be far below the
     /// wallet's `synced_height` because backfill walks history below each
     /// range's `since_height`.

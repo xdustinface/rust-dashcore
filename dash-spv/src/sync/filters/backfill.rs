@@ -135,9 +135,8 @@ where
         let mut new_requests: BTreeMap<FilterMatchKey, Vec<BackfillAdvance>> = BTreeMap::new();
         let mut chunk_start = global_min;
         while chunk_start <= global_max {
-            let chunk_end = chunk_start
-                .saturating_add(BACKFILL_CHUNK_SIZE.saturating_sub(1))
-                .min(global_max);
+            let chunk_end =
+                chunk_start.saturating_add(BACKFILL_CHUNK_SIZE.saturating_sub(1)).min(global_max);
 
             let active: Vec<&PendingRescan> = rescans
                 .iter()
@@ -177,7 +176,12 @@ where
                     if r.resume_from > height || r.ceiling < height {
                         continue;
                     }
-                    matched_range_keys.insert((r.wallet_id, r.pool, r.indexes.start, r.indexes.end));
+                    matched_range_keys.insert((
+                        r.wallet_id,
+                        r.pool,
+                        r.indexes.start,
+                        r.indexes.end,
+                    ));
                     let pending = PendingAdvance {
                         wallet_id: r.wallet_id,
                         pool: r.pool,
@@ -315,11 +319,8 @@ mod tests {
             }
         }
 
-        let mut worker: BackfillWorker<_, _, MultiMockWallet> = BackfillWorker::new(
-            storage.filters(),
-            storage.block_headers(),
-            multi.clone(),
-        );
+        let mut worker: BackfillWorker<_, _, MultiMockWallet> =
+            BackfillWorker::new(storage.filters(), storage.block_headers(), multi.clone());
 
         let matched = worker.tick().await.unwrap();
 
@@ -405,11 +406,8 @@ mod tests {
             }
         }
 
-        let mut worker: BackfillWorker<_, _, MultiMockWallet> = BackfillWorker::new(
-            storage.filters(),
-            storage.block_headers(),
-            multi.clone(),
-        );
+        let mut worker: BackfillWorker<_, _, MultiMockWallet> =
+            BackfillWorker::new(storage.filters(), storage.block_headers(), multi.clone());
 
         let matched = worker.tick().await.unwrap();
 
@@ -510,12 +508,9 @@ mod tests {
             _ => unreachable!(),
         }
 
-        let block_processed_for_hash = events.iter().any(|e| {
-            matches!(
-                e,
-                key_wallet_manager::WalletEvent::BlockProcessed { .. },
-            )
-        });
+        let block_processed_for_hash = events
+            .iter()
+            .any(|e| matches!(e, key_wallet_manager::WalletEvent::BlockProcessed { .. },));
         assert!(
             !block_processed_for_hash,
             "backfill block must not also fire BlockProcessed: {:?}",
@@ -532,4 +527,3 @@ mod tests {
         );
     }
 }
-

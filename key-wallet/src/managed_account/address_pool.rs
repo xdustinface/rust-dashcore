@@ -1482,10 +1482,7 @@ mod tests {
         assert_eq!(pool.sync_ranges[0].caught_up_to, Some(50));
 
         pool.advance_caught_up_to(99);
-        assert!(
-            pool.sync_ranges.is_empty(),
-            "complete range should be dropped"
-        );
+        assert!(pool.sync_ranges.is_empty(), "complete range should be dropped");
     }
 
     #[test]
@@ -1581,8 +1578,8 @@ mod tests {
             caught_up_to: Some(900),
         });
 
-        let bytes = bincode::encode_to_vec(&pool, bincode::config::standard())
-            .expect("bincode encode");
+        let bytes =
+            bincode::encode_to_vec(&pool, bincode::config::standard()).expect("bincode encode");
         let (restored, _): (AddressPool, _) =
             bincode::decode_from_slice(&bytes, bincode::config::standard())
                 .expect("bincode decode");

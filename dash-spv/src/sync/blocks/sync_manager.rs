@@ -122,8 +122,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
                 Vec::with_capacity(blocks.len());
             let block_storage = self.block_storage.read().await;
             for (key, advances) in blocks {
-                let interested: BTreeSet<WalletId> =
-                    advances.iter().map(|a| a.wallet_id).collect();
+                let interested: BTreeSet<WalletId> = advances.iter().map(|a| a.wallet_id).collect();
                 self.backfill_advances.insert(*key.hash(), advances.clone());
 
                 if let Ok(Some(hashed_block)) = block_storage.load_block(key.height()).await {

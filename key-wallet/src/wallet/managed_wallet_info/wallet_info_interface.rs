@@ -125,8 +125,7 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
         for account in self.accounts().all_accounts() {
             for pool in account.managed_account_type().address_pools() {
                 for range in pool.pending_sync_ranges() {
-                    let progress =
-                        range.caught_up_to.unwrap_or_else(|| birth.saturating_sub(1));
+                    let progress = range.caught_up_to.unwrap_or_else(|| birth.saturating_sub(1));
                     min_progress = Some(match min_progress {
                         Some(m) => m.min(progress),
                         None => progress,

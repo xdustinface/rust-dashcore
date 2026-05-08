@@ -565,10 +565,8 @@ impl WalletInterface for MultiMockWallet {
                     continue;
                 }
                 let ceiling = range.since_height.saturating_sub(1);
-                let resume_from = range
-                    .caught_up_to
-                    .map(|c| c.saturating_add(1).max(birth))
-                    .unwrap_or(birth);
+                let resume_from =
+                    range.caught_up_to.map(|c| c.saturating_add(1).max(birth)).unwrap_or(birth);
                 if resume_from > ceiling {
                     continue;
                 }

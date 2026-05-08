@@ -710,8 +710,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
             let derived_for_wallet = wallet_derived.remove(&wallet_id).unwrap_or_default();
             let addresses_derived: Vec<DerivedAddress> =
                 project_derived_addresses(derived_for_wallet);
-            let balance =
-                per_wallet_balance.get(&wallet_id).copied().unwrap_or_default();
+            let balance = per_wallet_balance.get(&wallet_id).copied().unwrap_or_default();
             let account_balances =
                 per_wallet_account_diff.get(&wallet_id).cloned().unwrap_or_default();
             let balance_changed = snapshot.get(&wallet_id).copied() != Some(balance);
@@ -1066,10 +1065,7 @@ mod tests {
         );
     }
 
-    fn highest_external_address(
-        manager: &WalletManager,
-        wallet_id: &WalletId,
-    ) -> (u32, Address) {
+    fn highest_external_address(manager: &WalletManager, wallet_id: &WalletId) -> (u32, Address) {
         let info = manager.get_wallet_info(wallet_id).expect("wallet info");
         let acct = info
             .accounts
@@ -1078,7 +1074,8 @@ mod tests {
             .expect("BIP44 account 0 should exist on the default test wallet");
         let pool = match acct.managed_account_type() {
             ManagedAccountType::Standard {
-                external_addresses, ..
+                external_addresses,
+                ..
             } => external_addresses,
             _ => panic!("expected Standard account"),
         };
@@ -1139,9 +1136,7 @@ mod tests {
         let (mut manager, wallet_id, _) = setup_manager_with_wallet();
         manager.update_wallet_synced_height(&wallet_id, 400);
 
-        let info = manager
-            .get_wallet_info_mut(&wallet_id)
-            .expect("wallet exists");
+        let info = manager.get_wallet_info_mut(&wallet_id).expect("wallet exists");
         for mut account in info.accounts_mut().all_accounts_mut() {
             for pool in account.managed_account_type_mut().address_pools_mut() {
                 if pool.pool_type == AddressPoolType::External {
@@ -1162,8 +1157,7 @@ mod tests {
         manager.on_chain_reorg(100);
 
         let rescans = manager.pending_rescans();
-        let by_indexes: BTreeMap<u32, _> =
-            rescans.iter().map(|r| (r.indexes.start, r)).collect();
+        let by_indexes: BTreeMap<u32, _> = rescans.iter().map(|r| (r.indexes.start, r)).collect();
 
         let info = manager.get_wallet_info(&wallet_id).expect("wallet exists");
         let mut snapshots: Vec<(u32, u32, Option<CoreBlockHeight>)> = Vec::new();
@@ -1208,9 +1202,7 @@ mod tests {
         let (mut manager, wallet_id, _) = setup_manager_with_wallet();
         manager.update_wallet_synced_height(&wallet_id, 400);
 
-        let info = manager
-            .get_wallet_info_mut(&wallet_id)
-            .expect("wallet exists");
+        let info = manager.get_wallet_info_mut(&wallet_id).expect("wallet exists");
         for mut account in info.accounts_mut().all_accounts_mut() {
             for pool in account.managed_account_type_mut().address_pools_mut() {
                 if pool.pool_type == AddressPoolType::External {

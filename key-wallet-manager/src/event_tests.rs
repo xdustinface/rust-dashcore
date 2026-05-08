@@ -1055,9 +1055,7 @@ fn push_external_sync_range(
     indexes: core::ops::Range<u32>,
     since_height: CoreBlockHeight,
 ) {
-    let info = manager
-        .get_wallet_info_mut(wallet_id)
-        .expect("wallet exists");
+    let info = manager.get_wallet_info_mut(wallet_id).expect("wallet exists");
     for mut account in info.accounts_mut().all_accounts_mut() {
         for pool in account.managed_account_type_mut().address_pools_mut() {
             if pool.pool_type == AddressPoolType::External {
@@ -1082,10 +1080,8 @@ async fn test_advance_rescan_emits_convergence_changed_and_is_idempotent() {
 
     manager.advance_rescan(&wallet_id, AddressPoolType::External, 30..40, 99);
     let events = drain_events(&mut rx);
-    let conv: Vec<&WalletEvent> = events
-        .iter()
-        .filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. }))
-        .collect();
+    let conv: Vec<&WalletEvent> =
+        events.iter().filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. })).collect();
     assert_eq!(conv.len(), 1, "exactly one ConvergenceChanged expected, got {:?}", events);
     match conv[0] {
         WalletEvent::ConvergenceChanged {
@@ -1100,10 +1096,8 @@ async fn test_advance_rescan_emits_convergence_changed_and_is_idempotent() {
 
     manager.advance_rescan(&wallet_id, AddressPoolType::External, 30..40, 99);
     let events = drain_events(&mut rx);
-    let conv_count = events
-        .iter()
-        .filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. }))
-        .count();
+    let conv_count =
+        events.iter().filter(|e| matches!(e, WalletEvent::ConvergenceChanged { .. })).count();
     assert_eq!(
         conv_count, 0,
         "second advance_rescan must not re-emit ConvergenceChanged, got {:?}",

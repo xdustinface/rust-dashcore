@@ -438,6 +438,9 @@ impl FFISyncEventCallbacks {
                     cb(*header_tip, *cycle, self.user_data);
                 }
             }
+            SyncEvent::BackfillBlocksNeeded {
+                ..
+            } => {}
         }
     }
 }
@@ -1058,6 +1061,15 @@ impl FFIWalletEventCallbacks {
                     cb(c_wallet_id.as_ptr(), *height, self.user_data);
                 }
             }
+            WalletEvent::ConvergenceChanged {
+                ..
+            } => {}
+            WalletEvent::RescanProgressed {
+                ..
+            } => {}
+            WalletEvent::RescanBlockProcessed {
+                ..
+            } => {}
         }
     }
 }

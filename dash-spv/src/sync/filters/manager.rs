@@ -108,11 +108,8 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         initial_progress.update_target_height(target_height);
         initial_progress.update_filter_header_tip_height(filter_header_tip);
 
-        let backfill = BackfillWorker::new(
-            filter_storage.clone(),
-            header_storage.clone(),
-            wallet.clone(),
-        );
+        let backfill =
+            BackfillWorker::new(filter_storage.clone(), header_storage.clone(), wallet.clone());
 
         Self {
             progress: initial_progress,
@@ -150,10 +147,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
     /// already advanced `caught_up_to` and emitted
     /// `RescanBlockProcessed`). Removes the block from the worker's
     /// pending set. Returns `true` when the hash was a backfill block.
-    pub(super) async fn backfill_block_processed(
-        &mut self,
-        hash: &dashcore::BlockHash,
-    ) -> bool {
+    pub(super) async fn backfill_block_processed(&mut self, hash: &dashcore::BlockHash) -> bool {
         self.backfill.on_block_processed(hash).await
     }
 
