@@ -314,6 +314,40 @@ pub enum WalletEvent {
         /// Inclusive completion target (`since_height - 1`).
         target: CoreBlockHeight,
     },
+    /// Backfill block processing — bundles transaction records discovered
+    /// at this height with the `caught_up_to` advance for the relevant
+    /// sync range so a downstream persister writes both atomically.
+    ///
+    /// Distinct from [`BlockProcessed`] (which fires from forward sync) so
+    /// the persister can route differently. `height` may be far below the
+    /// wallet's `synced_height` because backfill walks history below each
+    /// range's `since_height`.
+    RescanBlockProcessed {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// Height of the matched block that was downloaded and processed.
+        height: CoreBlockHeight,
+        /// Pool the advancing sync range belongs to.
+        pool: AddressPoolType,
+        /// Index window of the advancing sync range.
+        indexes: core::ops::Range<u32>,
+        /// New `caught_up_to` for the range after the chunk that produced
+        /// this block was scanned end-to-end.
+        advance_to: CoreBlockHeight,
+        /// Records first stored for this wallet by this backfill pass.
+        inserted: Vec<TransactionRecord>,
+        /// Previously-known records updated by this block's data.
+        updated: Vec<TransactionRecord>,
+        /// Older coinbase records whose maturity threshold was crossed.
+        matured: Vec<TransactionRecord>,
+        /// Wallet balance after the block was processed.
+        balance: WalletCoreBalance,
+        /// Per-account balance snapshot for accounts whose balance changed.
+        account_balances: BTreeMap<AccountType, WalletCoreBalance>,
+        /// Addresses derived as a side effect of gap-limit maintenance
+        /// during this block's processing.
+        addresses_derived: Vec<DerivedAddress>,
+    },
 }
 
 impl WalletEvent {
@@ -341,6 +375,10 @@ impl WalletEvent {
                 ..
             }
             | WalletEvent::RescanProgressed {
+                wallet_id,
+                ..
+            }
+            | WalletEvent::RescanBlockProcessed {
                 wallet_id,
                 ..
             } => *wallet_id,
@@ -423,6 +461,34 @@ impl WalletEvent {
                 format!(
                     "RescanProgressed(pool={:?}, indexes={}..{}, caught_up_to={}, target={})",
                     pool, indexes.start, indexes.end, caught_up_to, target,
+                )
+            }
+            WalletEvent::RescanBlockProcessed {
+                height,
+                pool,
+                indexes,
+                advance_to,
+                inserted,
+                updated,
+                matured,
+                balance,
+                account_balances,
+                addresses_derived,
+                ..
+            } => {
+                format!(
+                    "RescanBlockProcessed(height={}, pool={:?}, indexes={}..{}, advance_to={}, inserted={}, updated={}, matured={}, balance={}, account_balances={}, derived={})",
+                    height,
+                    pool,
+                    indexes.start,
+                    indexes.end,
+                    advance_to,
+                    inserted.len(),
+                    updated.len(),
+                    matured.len(),
+                    balance,
+                    format_account_balances(account_balances),
+                    addresses_derived.len(),
                 )
             }
         }

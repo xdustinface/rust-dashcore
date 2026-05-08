@@ -10,6 +10,7 @@ use std::sync::Arc;
 use dashcore::bip158::BlockFilter;
 use dashcore::Address;
 
+use super::backfill::{BackfillWorker, PendingAdvance};
 use super::batch::FiltersBatch;
 use super::block_match_tracker::{BlockMatchTracker, BlockTrackResult};
 use super::pipeline::FiltersPipeline;
@@ -71,6 +72,11 @@ pub struct FiltersManager<
     /// `BlockProcessed` and the per-wallet record of which wallets already
     /// have a given processed block applied.
     pub(super) tracker: BlockMatchTracker,
+    /// Sweep-line backfill worker covering pending sync ranges that pre-date
+    /// the current batch. Held as a field so the live pipeline can wire its
+    /// tick to a wake channel in a follow-up — for now the seam is exposed
+    /// via [`Self::backfill_tick`] and [`Self::backfill_block_processed`].
+    pub(super) backfill: BackfillWorker<F, H, W>,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -102,6 +108,12 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         initial_progress.update_target_height(target_height);
         initial_progress.update_filter_header_tip_height(filter_header_tip);
 
+        let backfill = BackfillWorker::new(
+            filter_storage.clone(),
+            header_storage.clone(),
+            wallet.clone(),
+        );
+
         Self {
             progress: initial_progress,
             header_storage,
@@ -115,7 +127,27 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             active_batches: BTreeMap::new(),
             processing_height: 0,
             tracker: BlockMatchTracker::new(),
+            backfill,
         }
+    }
+
+    /// Drive one sweep of the backfill worker over pending sync ranges.
+    ///
+    /// Returns block hashes whose download should be requested via the
+    /// existing block-needed channel. The orchestrator wakes this when
+    /// `pending_rescans` becomes non-empty.
+    pub(super) async fn backfill_tick(&mut self) -> SyncResult<Vec<dashcore::BlockHash>> {
+        self.backfill.tick().await
+    }
+
+    /// Notify the backfill worker that a block it requested has been
+    /// processed. Returns the obligation so the caller can co-emit
+    /// `WalletEvent::RescanBlockProcessed` with this block's tx records.
+    pub(super) async fn backfill_block_processed(
+        &mut self,
+        hash: &dashcore::BlockHash,
+    ) -> Option<PendingAdvance> {
+        self.backfill.on_block_processed(hash).await
     }
 
     /// Returns true if there is no in-flight processing state.
