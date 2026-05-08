@@ -358,6 +358,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             return;
         };
         let prev_conv = info.convergence_height();
+        let mut progress: Option<(CoreBlockHeight, CoreBlockHeight)> = None;
         for mut account in info.accounts_mut().all_accounts_mut() {
             for p in account.managed_account_type_mut().address_pools_mut() {
                 if p.pool_type != pool {
@@ -369,11 +370,21 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                         let new = scanned_through.min(cap);
                         if range.caught_up_to.map(|c| new > c).unwrap_or(true) {
                             range.caught_up_to = Some(new);
+                            progress = Some((new, cap));
                         }
                     }
                 }
                 p.pending_sync_ranges_mut().retain(|r| !r.is_complete());
             }
+        }
+        if let Some((caught_up_to, target)) = progress {
+            let _ = self.event_sender.send(WalletEvent::RescanProgressed {
+                wallet_id: *wallet_id,
+                pool,
+                indexes: indexes.clone(),
+                caught_up_to,
+                target,
+            });
         }
         let new_conv = info.convergence_height();
         if new_conv != prev_conv {
