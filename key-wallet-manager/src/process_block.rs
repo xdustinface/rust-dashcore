@@ -1115,13 +1115,14 @@ mod tests {
         manager.update_wallet_synced_height(&wallet_id, 100);
 
         // The pending obligation surfaces as a single rescan covering the
-        // External pool of BIP44 account 0.
+        // External pool of BIP44 account 0. The since_height=100 rounds up
+        // to the 5000-block bucket so ceiling=4999.
         let rescans = manager.pending_rescans();
         assert_eq!(rescans.len(), 1, "exactly one pending rescan expected");
         let rescan = &rescans[0];
         assert_eq!(rescan.wallet_id, wallet_id);
         assert_eq!(rescan.pool, AddressPoolType::External);
-        assert_eq!(rescan.ceiling, 99);
+        assert_eq!(rescan.ceiling, 4999);
         assert_eq!(rescan.floor, 0);
         assert_eq!(rescan.resume_from, 0);
         let indexes = rescan.indexes.clone();
@@ -1135,7 +1136,7 @@ mod tests {
 
         // Backfill scans the full window. After advance_rescan reaches the
         // ceiling, the range completes and is dropped.
-        manager.advance_rescan(&wallet_id, AddressPoolType::External, indexes, 99);
+        manager.advance_rescan(&wallet_id, AddressPoolType::External, indexes, 4999);
 
         assert_eq!(manager.pending_rescans().len(), 0);
         assert_eq!(manager.wallet_convergence_height(&wallet_id), Some(100));

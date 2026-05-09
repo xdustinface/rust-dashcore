@@ -320,6 +320,15 @@ impl AddressInfo {
     }
 }
 
+/// Round `since_height` UP to a multiple of this value when pushing a new
+/// `AddressSyncRange`. Closely-spaced gap extensions in the same window then
+/// share `since_height` and merge via `collapse_adjacent_ranges`, keeping the
+/// number of in-flight ranges bounded for active wallets.
+///
+/// Should match `dash-spv::sync::filters::backfill::BACKFILL_CHUNK_SIZE` so
+/// each rounded range aligns with one filter scan chunk.
+const SYNC_RANGE_HEIGHT_BUCKET: CoreBlockHeight = 5_000;
+
 /// A contiguous range of address indexes within a pool, tracking how far the
 /// filters covering them have been scanned.
 ///
@@ -974,17 +983,25 @@ impl AddressPool {
                 .highest_generated
                 .expect("highest_generated must be set after deriving addresses")
                 + 1;
-            // Retroactive derivations (since_height already covered by
-            // forward sync) are born complete so the prune pass discards
-            // them; the addresses were scanned before, no backfill needed.
-            let caught_up_to = if since_height <= wallet_synced_height {
-                Some(since_height.saturating_sub(1))
+            // Round up to the next bucket boundary so closely-spaced gap
+            // extensions share a `since_height` and merge into one range
+            // via `collapse_adjacent_ranges`.
+            let bucket_since_height = match since_height % SYNC_RANGE_HEIGHT_BUCKET {
+                0 => since_height,
+                rem => since_height.saturating_add(SYNC_RANGE_HEIGHT_BUCKET - rem),
+            };
+            // Retroactive derivations (the rounded `since_height` already
+            // covered by forward sync) are born complete so the prune pass
+            // discards them; the addresses were scanned before, no backfill
+            // needed.
+            let caught_up_to = if bucket_since_height <= wallet_synced_height {
+                Some(bucket_since_height.saturating_sub(1))
             } else {
                 None
             };
             self.push_sync_range(AddressSyncRange {
                 indexes: start..end_exclusive,
-                since_height,
+                since_height: bucket_since_height,
                 caught_up_to,
             });
         }
@@ -1404,14 +1421,15 @@ mod tests {
         pool.mark_index_used(0);
         assert_eq!(pool.highest_used, Some(0));
 
-        // Should generate exactly 1 address to maintain gap_limit unused after index 0
+        // Should generate exactly 1 address to maintain gap_limit unused after index 0.
+        // since_height=100 rounds up to 5000 (the bucket boundary).
         let new_addresses = pool.maintain_gap_limit(&key_source, 100, 0).unwrap();
         assert_eq!(new_addresses.len(), 1);
         assert_eq!(new_addresses[0].index, gap_limit);
         assert_eq!(pool.highest_generated, Some(gap_limit));
         assert_eq!(pool.addresses.len(), gap_limit as usize + 1);
         assert_eq!(pool.sync_ranges.len(), 1);
-        assert_eq!(pool.sync_ranges[0].since_height, 100);
+        assert_eq!(pool.sync_ranges[0].since_height, 5000);
         assert_eq!(pool.sync_ranges[0].caught_up_to, None);
         assert_eq!(pool.sync_ranges[0].indexes, gap_limit..(gap_limit + 1));
 
@@ -1425,11 +1443,11 @@ mod tests {
         assert_eq!(new_addresses[0].index, gap_limit + 1);
         assert_eq!(new_addresses[1].index, gap_limit + 2);
         assert_eq!(pool.highest_generated, Some(gap_limit + 2));
-        // Two derivations at the same `since_height` collapse into one
-        // contiguous range covering the full extension.
+        // Two derivations at the same rounded `since_height` collapse into
+        // one contiguous range covering the full extension.
         assert_eq!(pool.sync_ranges.len(), 1);
         assert_eq!(pool.sync_ranges[0].indexes, gap_limit..(gap_limit + 3));
-        assert_eq!(pool.sync_ranges[0].since_height, 100);
+        assert_eq!(pool.sync_ranges[0].since_height, 5000);
         assert_eq!(pool.addresses.len(), gap_limit as usize + 3);
     }
 
@@ -1489,17 +1507,18 @@ mod tests {
         .unwrap();
 
         pool.mark_index_used(5);
+        // since_height=100 rounds up to 5000.
         let new_addresses = pool.maintain_gap_limit(&key_source, 100, 0).unwrap();
         assert!(!new_addresses.is_empty());
         assert_eq!(pool.sync_ranges.len(), 1);
-        assert_eq!(pool.sync_ranges[0].since_height, 100);
+        assert_eq!(pool.sync_ranges[0].since_height, 5000);
         assert_eq!(pool.sync_ranges[0].caught_up_to, None);
 
-        pool.advance_caught_up_to(50);
+        pool.advance_caught_up_to(2500);
         assert_eq!(pool.sync_ranges.len(), 1);
-        assert_eq!(pool.sync_ranges[0].caught_up_to, Some(50));
+        assert_eq!(pool.sync_ranges[0].caught_up_to, Some(2500));
 
-        pool.advance_caught_up_to(99);
+        pool.advance_caught_up_to(4999);
         assert!(pool.sync_ranges.is_empty(), "complete range should be dropped");
     }
 
@@ -1582,7 +1601,10 @@ mod tests {
         .unwrap();
 
         pool.mark_index_used(0);
-        let new_addresses = pool.maintain_gap_limit(&key_source, 100, 200).unwrap();
+        // since_height=5000 (already on the bucket boundary) is below
+        // wallet_synced_height=10000, so the range is born complete and
+        // dropped by the prune pass.
+        let new_addresses = pool.maintain_gap_limit(&key_source, 5000, 10000).unwrap();
         assert!(!new_addresses.is_empty(), "an address must still be derived to maintain the gap");
         assert!(
             pool.sync_ranges.is_empty(),
@@ -1610,14 +1632,74 @@ mod tests {
         .unwrap();
 
         pool.mark_index_used(0);
-        let new_addresses = pool.maintain_gap_limit(&key_source, 200, 100).unwrap();
+        // since_height=10000 (on bucket boundary) is above wallet_synced_height=5000,
+        // so the range is genuinely-new and stays pending.
+        let new_addresses = pool.maintain_gap_limit(&key_source, 10000, 5000).unwrap();
         assert!(!new_addresses.is_empty());
         assert_eq!(pool.sync_ranges.len(), 1);
-        assert_eq!(pool.sync_ranges[0].since_height, 200);
+        assert_eq!(pool.sync_ranges[0].since_height, 10000);
         assert_eq!(
             pool.sync_ranges[0].caught_up_to, None,
             "genuinely-new derivation must have caught_up_to = None so backfill picks it up",
         );
+    }
+
+    /// Two close-but-distinct `since_height` values inside the same bucket
+    /// must round to the same `since_height` and produce a single collapsed
+    /// range. Without rounding, an active wallet's many gap extensions each
+    /// land at slightly different chain heights and accumulate as separate
+    /// ranges that the backfill worker has to track per-tick.
+    #[test]
+    fn maintain_gap_limit_rounds_since_height_up_to_bucket_so_close_extensions_collapse() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let key_source = test_key_source();
+        let gap_limit = 5;
+        let mut pool = AddressPool::new(
+            base_path,
+            AddressPoolType::External,
+            gap_limit,
+            Network::Testnet,
+            &key_source,
+        )
+        .unwrap();
+
+        // First extension at since_height=248001 → rounds up to 250000.
+        pool.mark_index_used(0);
+        let derived = pool.maintain_gap_limit(&key_source, 248001, 0).unwrap();
+        assert!(!derived.is_empty());
+        let first_extension_top = pool.highest_generated.unwrap();
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].since_height, 250000);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, None);
+        let first_indexes = pool.sync_ranges[0].indexes.clone();
+
+        // Second extension at since_height=248050 → also rounds up to 250000,
+        // and the contiguous index range merges with the first via collapse.
+        pool.mark_index_used(first_extension_top);
+        let derived = pool.maintain_gap_limit(&key_source, 248050, 0).unwrap();
+        assert!(!derived.is_empty());
+        let second_extension_top = pool.highest_generated.unwrap();
+        assert_eq!(
+            pool.sync_ranges.len(),
+            1,
+            "extensions at different heights inside one bucket must collapse, got {:?}",
+            pool.sync_ranges,
+        );
+        assert_eq!(pool.sync_ranges[0].since_height, 250000);
+        assert_eq!(pool.sync_ranges[0].indexes.start, first_indexes.start);
+        assert_eq!(pool.sync_ranges[0].indexes.end, second_extension_top + 1);
+        assert_eq!(pool.sync_ranges[0].caught_up_to, None);
+
+        // A third extension landing in the NEXT bucket stays separate.
+        pool.mark_index_used(second_extension_top);
+        pool.maintain_gap_limit(&key_source, 251000, 0).unwrap();
+        assert_eq!(
+            pool.sync_ranges.len(),
+            2,
+            "extension in the next bucket must not merge into the prior one, got {:?}",
+            pool.sync_ranges,
+        );
+        assert_eq!(pool.sync_ranges[1].since_height, 255000);
     }
 
     #[cfg(feature = "serde")]
