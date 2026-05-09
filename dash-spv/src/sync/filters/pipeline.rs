@@ -219,7 +219,9 @@ impl FiltersPipeline {
             self.batch_trackers.get_mut(&batch_start).map(|t| t.take_filters()).unwrap_or_default();
 
         self.batch_trackers.remove(&batch_start);
-        self.coordinator.receive(&batch_start);
+        if !self.coordinator.receive(&batch_start) {
+            self.coordinator.cancel_pending(&batch_start);
+        }
 
         tracing::info!(
             "Filter batch {}-{} complete ({} filters)",
@@ -250,6 +252,15 @@ impl FiltersPipeline {
         for start in self.coordinator.check_timeouts() {
             self.coordinator.enqueue_retry(start);
         }
+    }
+
+    /// Move in-flight `getcfilters` requests back to pending after a peer
+    /// disconnect so the next `send_pending` reissues them to the new peer.
+    /// Per-batch trackers and any partially-received filters within them are
+    /// preserved — `BatchTracker::insert_filter` is idempotent, so duplicates
+    /// from the new peer are harmless.
+    pub(super) fn requeue_in_flight(&mut self) {
+        self.coordinator.requeue_in_flight();
     }
 }
 
@@ -453,6 +464,67 @@ mod tests {
     // =========================================================================
     // Receive Tests
     // =========================================================================
+
+    #[test]
+    fn test_requeue_in_flight_preserves_partial_batch_receipts() {
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.target_height = 99;
+
+        // One batch in-flight (start_height 0). Receive a filter so the
+        // tracker has partial state.
+        pipeline.batch_trackers.insert(0, BatchTracker::new(99));
+        pipeline.coordinator.mark_sent(&[0]);
+        let hash = Header::dummy(50).block_hash();
+        pipeline.receive_with_data(50, hash, &dummy_filter_data(50));
+        assert_eq!(pipeline.filters_received, 1);
+        assert_eq!(pipeline.coordinator.active_count(), 1);
+
+        pipeline.requeue_in_flight();
+
+        // Batch is back in pending; tracker (and the partial filter inside it)
+        // is preserved so the new peer's response merges idempotently.
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
+        let tracker = pipeline.batch_trackers.get(&0).expect("tracker preserved");
+        assert_eq!(tracker.received(), 1);
+        assert_eq!(pipeline.filters_received, 1);
+        assert_eq!(pipeline.highest_received, 50);
+    }
+
+    #[test]
+    fn test_late_filter_after_requeue_completes_batch_without_orphaning_pending() {
+        // Regression: a late `cfilter` from the disconnected peer can complete
+        // a batch after `requeue_in_flight` moved it back to pending. Without
+        // the cancel-pending hook, the key would linger in `pending` while the
+        // tracker was gone, and the next `send_pending` would error with
+        // `SyncError::InvalidState`.
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.target_height = 2;
+
+        pipeline.batch_trackers.insert(0, BatchTracker::new(2));
+        pipeline.coordinator.mark_sent(&[0]);
+
+        // Two filters arrive before disconnect.
+        for h in 0..=1 {
+            let hash = Header::dummy(h).block_hash();
+            pipeline.receive_with_data(h, hash, &dummy_filter_data(h));
+        }
+
+        pipeline.requeue_in_flight();
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+
+        // Late buffered filter from old peer completes the batch.
+        let hash = Header::dummy(2).block_hash();
+        pipeline.receive_with_data(2, hash, &dummy_filter_data(2));
+
+        assert_eq!(pipeline.completed_batches.len(), 1);
+        assert!(pipeline.batch_trackers.is_empty());
+        // The orphaned pending key must be gone so `send_pending` does not
+        // resurrect a finished batch.
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+    }
 
     #[test]
     fn test_receive_single_filter() {
