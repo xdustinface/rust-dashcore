@@ -115,6 +115,17 @@ where
             return Ok(BTreeMap::new());
         }
 
+        // Clip to what's actually stored. During initial sync (or any time
+        // forward filter sync is still downloading) the storage may not yet
+        // hold filters past `filter_tip`; requesting them would panic in
+        // segments::get_items. The next tick re-evaluates as forward sync
+        // catches up.
+        let filter_tip = self.filter_storage.read().await.filter_tip_height().await?;
+        if global_min > filter_tip {
+            return Ok(BTreeMap::new());
+        }
+        global_max = global_max.min(filter_tip);
+
         let mut new_requests: BTreeMap<FilterMatchKey, Vec<BackfillAdvance>> = BTreeMap::new();
         // Ranges that match in any chunk are excluded from no-match advance
         // for every later chunk too: a range with an in-flight matched block
@@ -647,5 +658,64 @@ mod tests {
             "multi-chunk no-match sweep must complete and drop the range, got {:?}",
             pending,
         );
+    }
+
+    /// During initial sync the storage may hold filters only up to some
+    /// `filter_tip` while a pending sync range's `ceiling` extends beyond.
+    /// `tick` must clip its scan window to the available tip so it does not
+    /// request out-of-range offsets and panic in `segments::get_items`. The
+    /// next tick will re-evaluate as forward sync downloads more filters.
+    #[tokio::test]
+    async fn backfill_tick_skips_chunks_past_available_filter_tip() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let wallet_id: WalletId = [0xDD; 32];
+        let pool = AddressPoolType::External;
+        let address = Address::dummy(Network::Regtest, 300);
+
+        // Sync range expects backfill through ceiling 9_999, but only the
+        // first 100 filters are stored locally so far.
+        let since: u32 = 10_000;
+        let stored_through: u32 = 99;
+
+        let multi = Arc::new(RwLock::new(MultiMockWallet::new()));
+        {
+            let mut w = multi.write().await;
+            w.insert_wallet(
+                wallet_id,
+                MockWalletState {
+                    addresses: vec![address.clone()],
+                    synced_height: since + 100,
+                    last_processed_height: since + 100,
+                },
+            );
+            w.set_birth_height(wallet_id, 0);
+            w.push_sync_range_for_test(wallet_id, pool, 5..10, since, vec![address.clone()]);
+        }
+
+        let dummy_filter = BlockFilter::new(&[0u8; 32]);
+        let headers: Vec<Header> = Header::dummy_batch(0..(stored_through + 1));
+        storage.block_headers().write().await.store_headers(&headers).await.unwrap();
+        let filter_store = storage.filters();
+        {
+            let mut fs = filter_store.write().await;
+            for h in 0..=stored_through {
+                fs.store_filter(h, &dummy_filter.content).await.unwrap();
+            }
+        }
+
+        let mut worker: BackfillWorker<_, _, MultiMockWallet> =
+            BackfillWorker::new(storage.filters(), storage.block_headers(), multi.clone());
+
+        // The bug: this used to panic in segments::get_items when the
+        // chunk extended past stored_through.
+        let matched = worker.tick().await.unwrap();
+        assert!(matched.is_empty(), "no matches expected, got {:?}", matched);
+
+        // The clipped chunk had no filter matches, so the active range's
+        // caught_up_to advanced to filter_tip; range stays pending until
+        // forward sync downloads the rest.
+        let pending = multi.read().await.pending_rescans();
+        assert_eq!(pending.len(), 1, "range still pending past filter_tip");
+        assert_eq!(pending[0].resume_from, stored_through + 1);
     }
 }
