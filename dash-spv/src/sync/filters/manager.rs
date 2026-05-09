@@ -151,6 +151,15 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         self.backfill.on_block_processed(hash).await
     }
 
+    /// Snapshot the set of block hashes the backfill worker still treats
+    /// as in-flight. The orchestrator passes this to the BlocksManager
+    /// so its mirror `backfill_advances` map can drop stale entries.
+    pub(super) fn backfill_live_block_hashes(
+        &self,
+    ) -> std::collections::HashSet<dashcore::BlockHash> {
+        self.backfill.live_block_hashes()
+    }
+
     /// Returns true if there is no in-flight processing state.
     fn is_idle(&self) -> bool {
         self.active_batches.is_empty()

@@ -261,9 +261,16 @@ impl<
         // emit `RescanBlockProcessed` atomically with the
         // `caught_up_to` advance.
         let backfill_blocks = self.backfill_tick().await?;
-        if !backfill_blocks.is_empty() {
+        // Always emit if either there are new blocks to dispatch or if the
+        // worker's in-flight set has shrunk since the last tick (the
+        // BlocksManager prunes its mirror against `live_hashes`). Sending
+        // when both are empty would be a no-op, but `live_hashes` is also
+        // empty in that case so we skip to avoid event-channel chatter.
+        let live_hashes = self.backfill_live_block_hashes();
+        if !backfill_blocks.is_empty() || !live_hashes.is_empty() {
             events.push(SyncEvent::BackfillBlocksNeeded {
                 blocks: backfill_blocks,
+                live_hashes,
             });
         }
 

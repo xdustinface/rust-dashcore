@@ -160,7 +160,14 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             }
         }
 
-        // Process each affected account
+        // Process each affected account. Snapshot `synced_height` once
+        // before taking the mutable account borrow inside the loop so the
+        // borrow checker accepts both the read on `self` and the mutable
+        // walk over `self.accounts`. The value is also stable across this
+        // batch — `synced_height` is only mutated via `update_synced_height`,
+        // which the loop does not invoke.
+        let wallet_synced_height = self.synced_height();
+
         for account_match in result.affected_accounts.clone() {
             let Some(mut account) =
                 self.accounts.get_by_account_type_match_mut(&account_match.account_type_match)
@@ -203,7 +210,7 @@ impl WalletTransactionChecker for ManagedWalletInfo {
             let owning_account_type = account.managed_account_type().to_account_type();
             for pool in account.managed_account_type_mut().address_pools_mut() {
                 let pool_type = pool.pool_type;
-                match pool.maintain_gap_limit(&key_source, since_height) {
+                match pool.maintain_gap_limit(&key_source, since_height, wallet_synced_height) {
                     Ok(infos) => result.new_addresses.extend(infos.into_iter().map(|info| {
                         super::account_checker::DerivedAddressInfo {
                             account_type: owning_account_type,

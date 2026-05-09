@@ -107,6 +107,12 @@ pub enum SyncEvent {
         /// Blocks to download, each with the per-sync-range advances that
         /// the block's processing must satisfy.
         blocks: BTreeMap<FilterMatchKey, Vec<BackfillAdvance>>,
+        /// Snapshot of every block hash the backfill worker still
+        /// considers in-flight at the time of this event. The BlocksManager
+        /// uses this to prune its mirror `backfill_advances` map of
+        /// entries the worker no longer tracks (cancelled downloads,
+        /// completed ranges, reorg-clamped ranges) so neither side leaks.
+        live_hashes: std::collections::HashSet<BlockHash>,
     },
 
     /// Block downloaded and processed through wallet.
@@ -243,9 +249,15 @@ impl SyncEvent {
             }
             SyncEvent::BackfillBlocksNeeded {
                 blocks,
+                live_hashes,
             } => {
                 let advances: usize = blocks.values().map(|v| v.len()).sum();
-                format!("BackfillBlocksNeeded(blocks={}, advances={})", blocks.len(), advances)
+                format!(
+                    "BackfillBlocksNeeded(blocks={}, advances={}, live={})",
+                    blocks.len(),
+                    advances,
+                    live_hashes.len(),
+                )
             }
             SyncEvent::BlockProcessed {
                 height,

@@ -1068,8 +1068,86 @@ impl FFIWalletEventCallbacks {
                 ..
             } => {}
             WalletEvent::RescanBlockProcessed {
+                wallet_id,
+                height,
+                inserted,
+                updated,
+                matured,
+                balance,
+                account_balances,
+                addresses_derived,
                 ..
-            } => {}
+            } => {
+                // Forward to the BlockProcessed callback so FFI consumers'
+                // persisters see backfill records and balance via the
+                // same atomic dispatch path. The pool/indexes/advance_to
+                // fields are dropped at the FFI boundary because the
+                // existing BlockProcessed callback shape can't carry
+                // them; the persister still gets the records and balance
+                // it needs to write atomically per backfill block.
+                if let Some(cb) = self.on_block_processed {
+                    let wallet_id_hex = hex::encode(wallet_id);
+                    let c_wallet_id = CString::new(wallet_id_hex).unwrap_or_default();
+                    let ffi_inserted: Vec<FFITransactionRecord> =
+                        inserted.iter().map(FFITransactionRecord::from).collect();
+                    let ffi_updated: Vec<FFITransactionRecord> =
+                        updated.iter().map(FFITransactionRecord::from).collect();
+                    let ffi_matured: Vec<FFITransactionRecord> =
+                        matured.iter().map(FFITransactionRecord::from).collect();
+                    let ffi_balance = FFIBalance::from(*balance);
+                    let ffi_account_balances = FFIAccountBalance::from_map(account_balances);
+                    let ffi_addresses_derived = FFIDerivedAddress::from_slice(addresses_derived);
+
+                    let inserted_ptr = if ffi_inserted.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_inserted.as_ptr()
+                    };
+                    let updated_ptr = if ffi_updated.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_updated.as_ptr()
+                    };
+                    let matured_ptr = if ffi_matured.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_matured.as_ptr()
+                    };
+                    let account_balances_ptr = if ffi_account_balances.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_account_balances.as_ptr()
+                    };
+                    let addresses_derived_ptr = if ffi_addresses_derived.is_empty() {
+                        ptr::null()
+                    } else {
+                        ffi_addresses_derived.as_ptr()
+                    };
+
+                    cb(
+                        c_wallet_id.as_ptr(),
+                        *height,
+                        inserted_ptr,
+                        ffi_inserted.len() as u32,
+                        updated_ptr,
+                        ffi_updated.len() as u32,
+                        matured_ptr,
+                        ffi_matured.len() as u32,
+                        &ffi_balance as *const FFIBalance,
+                        account_balances_ptr,
+                        ffi_account_balances.len() as u32,
+                        addresses_derived_ptr,
+                        ffi_addresses_derived.len() as u32,
+                        self.user_data,
+                    );
+
+                    drop(ffi_inserted);
+                    drop(ffi_updated);
+                    drop(ffi_matured);
+                    drop(ffi_account_balances);
+                    drop(ffi_addresses_derived);
+                }
+            }
         }
     }
 }

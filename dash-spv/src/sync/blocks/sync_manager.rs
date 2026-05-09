@@ -110,8 +110,17 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
         // the wallet processing path forks to the backfill flow.
         if let SyncEvent::BackfillBlocksNeeded {
             blocks,
+            live_hashes,
         } = event
         {
+            // Prune entries the worker no longer tracks before inserting
+            // any new advances. This is the BlocksManager's leak guard:
+            // a backfill block whose download was cancelled, whose range
+            // completed elsewhere, or whose range was clamped by a reorg
+            // disappears from the worker's in-flight set, and the mirror
+            // here must drop accordingly.
+            self.prune_stale_backfill_advances(live_hashes);
+
             if blocks.is_empty() {
                 return Ok(vec![]);
             }

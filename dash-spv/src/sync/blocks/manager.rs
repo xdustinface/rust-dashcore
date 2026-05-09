@@ -3,7 +3,7 @@
 //! Downloads blocks that matched wallet filters and processes them in height order.
 //! Subscribes to BlockNeeded events and emits BlockProcessed events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -71,6 +71,23 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
         }
     }
 
+    /// Drop entries from `backfill_advances` whose block hash is no longer
+    /// claimed by any live pending advance in the worker. Without this
+    /// cleanup, a block that was queued via `BackfillBlocksNeeded` but
+    /// then cancelled (peer disconnect, range completed elsewhere, reorg
+    /// invalidation) would sit in the map forever, leaking memory and
+    /// shadowing future forward-sync routing for the same hash.
+    ///
+    /// `live_hashes` is the set of block hashes the
+    /// [`super::super::filters::backfill::BackfillWorker`] still considers
+    /// in-flight; everything else is stale.
+    pub(super) fn prune_stale_backfill_advances(&mut self, live_hashes: &HashSet<BlockHash>) {
+        if self.backfill_advances.is_empty() {
+            return;
+        }
+        self.backfill_advances.retain(|hash, _| live_hashes.contains(hash));
+    }
+
     pub(super) async fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<()> {
         let sent = self.pipeline.send_pending(requests).await?;
         if sent > 0 {
@@ -82,12 +99,17 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
     /// Process buffered blocks in height order.
     ///
     /// Uses the pipeline's height-ordering logic to ensure blocks are processed
-    /// in the correct sequence. A block whose hash is recorded in
-    /// `backfill_advances` is processed via the backfill path (one
-    /// `RescanBlockProcessed` event per advance, atomic with
-    /// `advance_rescan`); other blocks take the forward-sync path
-    /// (`BlockProcessed`).
+    /// in the correct sequence. A block hash recorded in `backfill_advances`
+    /// is processed via the backfill path (one `RescanBlockProcessed` event
+    /// per advance, atomic with `advance_rescan`). When the same block hash
+    /// is also in the pipeline's `interested` set (forward-sync wallets that
+    /// matched the block too), the forward-sync wallets are processed
+    /// alongside via `process_block_for_wallets` so neither side is silently
+    /// skipped.
     pub(super) async fn process_buffered_blocks(&mut self) -> SyncResult<Vec<SyncEvent>> {
+        use key_wallet_manager::WalletId;
+        use std::collections::BTreeSet;
+
         let mut events = Vec::new();
 
         // Process blocks in height order using pipeline's ordering logic
@@ -96,17 +118,43 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
 
             let backfill_advances = self.backfill_advances.remove(&hash);
 
-            let result = if let Some(advances) = backfill_advances.as_ref() {
+            // Forward-sync wallets that this block was queued for, minus
+            // any wallet already covered by a backfill advance. The two
+            // sets normally don't overlap, but if they do (a wallet
+            // catching up via forward sync also has a pending sync range
+            // matched at this height) the backfill path takes precedence
+            // because it carries the per-range `advance_to` obligation.
+            let backfill_wallets: BTreeSet<WalletId> = backfill_advances
+                .as_ref()
+                .map(|advs| advs.iter().map(|a| a.wallet_id).collect())
+                .unwrap_or_default();
+            let forward_only: BTreeSet<WalletId> =
+                interested.difference(&backfill_wallets).cloned().collect();
+            let has_forward = !forward_only.is_empty();
+
+            let mut result = if has_forward {
                 let mut wallet = self.wallet.write().await;
-                let r = wallet.process_backfill_block_for_wallets(&block, height, advances).await;
+                let r = wallet.process_block_for_wallets(&block, height, &forward_only).await;
                 drop(wallet);
                 r
             } else {
-                let mut wallet = self.wallet.write().await;
-                let r = wallet.process_block_for_wallets(&block, height, &interested).await;
-                drop(wallet);
-                r
+                key_wallet_manager::BlockProcessingResult::default()
             };
+
+            if let Some(advances) = backfill_advances.as_ref() {
+                let mut wallet = self.wallet.write().await;
+                let bf = wallet.process_backfill_block_for_wallets(&block, height, advances).await;
+                drop(wallet);
+                // Merge backfill stats into the forward-sync result so the
+                // logging and progress counters below reflect the full
+                // block. `BlockProcessingResult` exposes additive
+                // accessors via the existing fields; merge by extending.
+                result.new_txids.extend(bf.new_txids);
+                result.existing_txids.extend(bf.existing_txids);
+                for (wid, addrs) in bf.new_addresses {
+                    result.new_addresses.entry(wid).or_default().extend(addrs);
+                }
+            }
 
             let total_relevant = result.relevant_tx_count();
             let new_addresses_total: usize = result.new_addresses.values().map(|v| v.len()).sum();
@@ -142,9 +190,12 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             }
             // Only count new transactions to avoid double-counting during rescans
             self.progress.add_transactions(result.new_txids.len() as u32);
-            // Backfill blocks live below the forward edge — do not bump
-            // last_processed_height backwards.
-            if backfill_advances.is_none() {
+            // Backfill-only blocks live below the forward edge and must not
+            // bump `last_processed_height` backwards. A mixed block (some
+            // forward-sync wallets, some backfill wallets) DOES advance the
+            // forward edge for the forward-sync wallets, so the bump is
+            // gated on the forward path having actually run.
+            if has_forward {
                 self.progress.update_last_processed(height);
             }
 

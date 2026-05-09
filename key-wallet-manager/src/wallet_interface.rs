@@ -92,21 +92,24 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// write the records and the `caught_up_to` advance atomically via
     /// [`WalletEvent::RescanBlockProcessed`].
     ///
-    /// The default implementation derives the wallet set from `advances`
-    /// and delegates to [`Self::process_block_for_wallets`], so minimal
-    /// mock implementations keep working unchanged. Real implementations
-    /// should override this to emit the dedicated event instead of
-    /// `BlockProcessed` for backfill blocks.
+    /// The default implementation only calls [`Self::advance_rescan`] for
+    /// each advance and returns an empty result — it deliberately does NOT
+    /// fall back to [`Self::process_block_for_wallets`] because that path
+    /// emits [`WalletEvent::BlockProcessed`], which breaks the atomicity
+    /// contract the caller relies on (records and `advance_to` must arrive
+    /// in a single event so a downstream persister can write both
+    /// transactionally). Implementations that need to actually scan the
+    /// block's transactions during backfill MUST override this to emit
+    /// `RescanBlockProcessed` with the discovered records.
     ///
     /// [`WalletEvent::RescanBlockProcessed`]: crate::WalletEvent::RescanBlockProcessed
+    /// [`WalletEvent::BlockProcessed`]: crate::WalletEvent::BlockProcessed
     async fn process_backfill_block_for_wallets(
         &mut self,
-        block: &Block,
-        height: CoreBlockHeight,
+        _block: &Block,
+        _height: CoreBlockHeight,
         advances: &[BackfillAdvance],
     ) -> BlockProcessingResult {
-        let wallets: BTreeSet<WalletId> = advances.iter().map(|a| a.wallet_id).collect();
-        let result = self.process_block_for_wallets(block, height, &wallets).await;
         for advance in advances {
             self.advance_rescan(
                 &advance.wallet_id,
@@ -115,7 +118,7 @@ pub trait WalletInterface: Send + Sync + 'static {
                 advance.advance_to,
             );
         }
-        result
+        BlockProcessingResult::default()
     }
 
     /// Called when a transaction is seen in the mempool.

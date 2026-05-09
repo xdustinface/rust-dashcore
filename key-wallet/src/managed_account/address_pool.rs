@@ -928,10 +928,20 @@ impl AddressPool {
     /// `since_height` were scanned without these addresses in the query set,
     /// so a pending [`AddressSyncRange`] is recorded for the backfill worker
     /// to revisit them.
+    ///
+    /// `wallet_synced_height` is the wallet's current forward-edge watermark.
+    /// When `since_height <= wallet_synced_height`, the gap-limit derivation
+    /// is retroactive (running during snapshot replay or block reprocessing
+    /// for heights the wallet has already covered), so the recorded range is
+    /// born complete and the prune pass discards it on insert. Without this
+    /// guard, an active wallet's startup replay would manufacture dozens of
+    /// "pending" ranges that the backfill worker then re-scans from
+    /// `birth_height` even though the addresses were already covered.
     pub fn maintain_gap_limit(
         &mut self,
         key_source: &KeySource,
         since_height: CoreBlockHeight,
+        wallet_synced_height: CoreBlockHeight,
     ) -> Result<Vec<AddressInfo>> {
         let target = match self.highest_used {
             None => self.gap_limit - 1,
@@ -964,10 +974,18 @@ impl AddressPool {
                 .highest_generated
                 .expect("highest_generated must be set after deriving addresses")
                 + 1;
+            // Retroactive derivations (since_height already covered by
+            // forward sync) are born complete so the prune pass discards
+            // them; the addresses were scanned before, no backfill needed.
+            let caught_up_to = if since_height <= wallet_synced_height {
+                Some(since_height.saturating_sub(1))
+            } else {
+                None
+            };
             self.push_sync_range(AddressSyncRange {
                 indexes: start..end_exclusive,
                 since_height,
-                caught_up_to: None,
+                caught_up_to,
             });
         }
 
@@ -1376,7 +1394,7 @@ mod tests {
         assert_eq!(pool.addresses.len(), gap_limit as usize);
 
         // Calling maintain_gap_limit should not generate any new addresses when none are used
-        let new_addresses = pool.maintain_gap_limit(&key_source, 0).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 0, 0).unwrap();
         assert_eq!(new_addresses.len(), 0);
         assert_eq!(pool.highest_generated, Some(gap_limit - 1));
         assert_eq!(pool.addresses.len(), gap_limit as usize);
@@ -1387,7 +1405,7 @@ mod tests {
         assert_eq!(pool.highest_used, Some(0));
 
         // Should generate exactly 1 address to maintain gap_limit unused after index 0
-        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100, 0).unwrap();
         assert_eq!(new_addresses.len(), 1);
         assert_eq!(new_addresses[0].index, gap_limit);
         assert_eq!(pool.highest_generated, Some(gap_limit));
@@ -1402,7 +1420,7 @@ mod tests {
         pool.mark_index_used(2);
 
         // Should generate exactly 2 more addresses
-        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100, 0).unwrap();
         assert_eq!(new_addresses.len(), 2);
         assert_eq!(new_addresses[0].index, gap_limit + 1);
         assert_eq!(new_addresses[1].index, gap_limit + 2);
@@ -1471,7 +1489,7 @@ mod tests {
         .unwrap();
 
         pool.mark_index_used(5);
-        let new_addresses = pool.maintain_gap_limit(&key_source, 100).unwrap();
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100, 0).unwrap();
         assert!(!new_addresses.is_empty());
         assert_eq!(pool.sync_ranges.len(), 1);
         assert_eq!(pool.sync_ranges[0].since_height, 100);
@@ -1540,6 +1558,66 @@ mod tests {
         });
         pool.collapse_adjacent_ranges();
         assert_eq!(pool.sync_ranges.len(), 2);
+    }
+
+    /// On snapshot replay or block reprocessing, `maintain_gap_limit` may
+    /// derive new addresses for a height the wallet's `synced_height` is
+    /// already past. The resulting sync range covers already-scanned
+    /// territory and must be born complete so the prune pass discards it
+    /// on insert; otherwise the backfill worker re-scans dozens of ranges
+    /// that cover already-covered heights (the reported snapshot-replay
+    /// regression on active wallets).
+    #[test]
+    fn maintain_gap_limit_born_complete_when_retroactive() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let key_source = test_key_source();
+        let gap_limit = 5;
+        let mut pool = AddressPool::new(
+            base_path,
+            AddressPoolType::External,
+            gap_limit,
+            Network::Testnet,
+            &key_source,
+        )
+        .unwrap();
+
+        pool.mark_index_used(0);
+        let new_addresses = pool.maintain_gap_limit(&key_source, 100, 200).unwrap();
+        assert!(!new_addresses.is_empty(), "an address must still be derived to maintain the gap");
+        assert!(
+            pool.sync_ranges.is_empty(),
+            "retroactive derivation must be born complete and dropped on insert, got {:?}",
+            pool.sync_ranges,
+        );
+    }
+
+    /// When the wallet's `synced_height` is below `since_height`, the new
+    /// addresses joined the monitored set genuinely-new and the recorded
+    /// range must remain pending so the backfill worker scans
+    /// `[birth..since-1]` against the new address set.
+    #[test]
+    fn maintain_gap_limit_pending_when_forward_sync() {
+        let base_path = DerivationPath::from(vec![ChildNumber::from_normal_idx(0).unwrap()]);
+        let key_source = test_key_source();
+        let gap_limit = 5;
+        let mut pool = AddressPool::new(
+            base_path,
+            AddressPoolType::External,
+            gap_limit,
+            Network::Testnet,
+            &key_source,
+        )
+        .unwrap();
+
+        pool.mark_index_used(0);
+        let new_addresses = pool.maintain_gap_limit(&key_source, 200, 100).unwrap();
+        assert!(!new_addresses.is_empty());
+        assert_eq!(pool.sync_ranges.len(), 1);
+        assert_eq!(pool.sync_ranges[0].since_height, 200);
+        assert_eq!(
+            pool.sync_ranges[0].caught_up_to, None,
+            "genuinely-new derivation must have caught_up_to = None so backfill picks it up",
+        );
     }
 
     #[cfg(feature = "serde")]

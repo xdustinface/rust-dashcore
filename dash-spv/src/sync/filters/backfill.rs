@@ -153,11 +153,12 @@ where
                 continue;
             }
 
-            // `check_compact_filters_for_addresses` takes the height *before*
-            // the chunk's first filter. When `chunk_start == 0` we want the
-            // matched `FilterMatchKey.height()` to equal the block height, so
-            // we pass `u32::MAX` (the result of `0u32.saturating_sub(1)`),
-            // which the matcher treats as "begin from height 0".
+            // `check_compact_filters_for_addresses` includes a filter when
+            // `key.height() > min_height`, so we pass `chunk_start - 1` to
+            // include the chunk's first height. For `chunk_start == 0`,
+            // `0u32.saturating_sub(1) == 0`, which means filters at height
+            // 0 (genesis) are skipped — acceptable in practice because the
+            // genesis block has no spendable wallet outputs.
             let matches = check_compact_filters_for_addresses(
                 &filters,
                 address_vec,
@@ -186,10 +187,14 @@ where
                             && p.pool == advance.pool
                             && p.indexes == advance.indexes
                     });
-                    if already_pending {
-                        continue;
+                    if !already_pending {
+                        pending.push(advance.clone());
                     }
-                    pending.push(advance.clone());
+                    // Always re-emit the request so a previously-failed
+                    // download is retried. The BlocksManager pipeline will
+                    // dedup the actual network request via its own
+                    // bookkeeping, but a backfill match must never fail to
+                    // surface a request when a download was lost.
                     new_requests.entry(key.clone()).or_default().push(advance);
                 }
             }
@@ -228,14 +233,23 @@ where
     /// pending or has already advanced past the matched block's height.
     /// Keeps `pending_advances` bounded across reorgs, gap-extension churn,
     /// and download failures.
+    ///
+    /// Builds the live-key index by folding rather than collecting so two
+    /// `PendingRescan` entries that hash to the same key (same wallet, pool,
+    /// and indexes) keep the most conservative `resume_from` (the lowest)
+    /// rather than silently dropping one. In a healthy wallet the key is
+    /// already unique because pools collapse adjacent ranges; the fold makes
+    /// the prune robust against a future regression in that invariant.
     fn prune_pending_advances(&mut self, rescans: &[PendingRescan]) {
         if self.pending_advances.is_empty() {
             return;
         }
-        let live: HashMap<(WalletId, AddressPoolType, u32, u32), CoreBlockHeight> = rescans
-            .iter()
-            .map(|r| ((r.wallet_id, r.pool, r.indexes.start, r.indexes.end), r.resume_from))
-            .collect();
+        let mut live: HashMap<(WalletId, AddressPoolType, u32, u32), CoreBlockHeight> =
+            HashMap::new();
+        for r in rescans {
+            let key = (r.wallet_id, r.pool, r.indexes.start, r.indexes.end);
+            live.entry(key).and_modify(|v| *v = (*v).min(r.resume_from)).or_insert(r.resume_from);
+        }
         self.pending_advances.retain(|_hash, advances| {
             advances.retain(|adv| {
                 live.get(&(adv.wallet_id, adv.pool, adv.indexes.start, adv.indexes.end))
@@ -258,6 +272,14 @@ where
     /// [`WalletInterface::process_backfill_block_for_wallets`]: key_wallet_manager::WalletInterface::process_backfill_block_for_wallets
     pub(crate) async fn on_block_processed(&mut self, hash: &BlockHash) -> bool {
         self.pending_advances.remove(hash).is_some()
+    }
+
+    /// Snapshot the set of block hashes this worker still considers
+    /// in-flight. Used by the orchestrator to prune stale entries from
+    /// the BlocksManager's parallel `backfill_advances` map after each
+    /// tick, so cancelled or completed advances don't leak there either.
+    pub(crate) fn live_block_hashes(&self) -> HashSet<BlockHash> {
+        self.pending_advances.keys().copied().collect()
     }
 
     async fn load_filters(
