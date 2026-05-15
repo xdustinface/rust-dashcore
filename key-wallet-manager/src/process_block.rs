@@ -293,16 +293,20 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
 
     fn apply_chain_lock(&mut self, chain_lock: ChainLock) {
         for (wallet_id, info) in self.wallet_infos.iter_mut() {
-            let per_account = info.apply_chain_lock(chain_lock.clone());
-            if per_account.is_empty() {
-                continue;
+            let outcome = info.apply_chain_lock(chain_lock.clone());
+
+            // Emit a single atomic `ChainLockProcessed` whenever the
+            // wallet's `last_applied_chain_lock` advanced — carrying any
+            // net-new promotions (possibly empty when the advance
+            // promoted nothing). Replays of the same chainlock (no
+            // metadata advance) are silent.
+            if outcome.metadata_advanced {
+                let _ = self.event_sender.send(WalletEvent::ChainLockProcessed {
+                    wallet_id: *wallet_id,
+                    chain_lock: chain_lock.clone(),
+                    locked_transactions: outcome.locked_transactions,
+                });
             }
-            let event = WalletEvent::TransactionsChainlocked {
-                wallet_id: *wallet_id,
-                chain_lock: chain_lock.clone(),
-                per_account,
-            };
-            let _ = self.event_sender.send(event);
         }
     }
 

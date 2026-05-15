@@ -153,10 +153,15 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// `InChainLockedBlock` and advancing each wallet's
     /// `last_applied_chain_lock`.
     ///
-    /// Emits one [`WalletEvent::TransactionsChainlocked`] per wallet that
-    /// had at least one net-new promotion, carrying the full `ChainLock`
-    /// so consumers can persist the signing proof alongside the
-    /// promotions.
+    /// Emits at most one [`WalletEvent::ChainLockProcessed`] per
+    /// wallet, fired whenever the wallet's `last_applied_chain_lock`
+    /// advanced (strictly forward by height, or `None` → `Some`). The
+    /// event carries the full `ChainLock` plus any per-account net-new
+    /// promotions in `locked_transactions` — empty when the chainlock
+    /// advanced the metadata without promoting any record (durable
+    /// consumers that persist the chainlock metadata must still listen
+    /// for these empty-promotion events). Replays of the same chainlock
+    /// (no metadata advance) are silent.
     ///
     /// Implementations must serialize calls relative to
     /// `process_block_for_wallets` to avoid interleaving promotions with
