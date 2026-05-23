@@ -15,6 +15,13 @@ pub trait FilterStorage: Send + Sync + 'static {
     async fn load_filters(&self, range: Range<u32>) -> StorageResult<Vec<Vec<u8>>>;
 
     async fn filter_tip_height(&self) -> StorageResult<u32>;
+
+    /// Drop all filters with `height > target_height`.
+    ///
+    /// Truncating above the current tip is a no-op; truncating below
+    /// `start_height` returns an error. Changes are applied in-memory and
+    /// flushed on the next `persist`.
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()>;
 }
 
 pub struct PersistentFilterStorage {
@@ -61,5 +68,57 @@ impl FilterStorage for PersistentFilterStorage {
 
     async fn filter_tip_height(&self) -> StorageResult<u32> {
         Ok(self.filters.read().await.tip_height().unwrap_or(0))
+    }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.filters.write().await.truncate_above(target_height).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn filter_bytes(seed: u8) -> Vec<u8> {
+        vec![seed; 8]
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_and_restore() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentFilterStorage::open(tmp_dir.path()).await.unwrap();
+
+        for height in 0..10 {
+            storage.store_filter(height, &filter_bytes(height as u8)).await.unwrap();
+        }
+        assert_eq!(storage.filter_tip_height().await.unwrap(), 9);
+
+        storage.truncate_above(4).await.unwrap();
+        assert_eq!(storage.filter_tip_height().await.unwrap(), 4);
+
+        let kept = storage.load_filters(0..5).await.unwrap();
+        let expected: Vec<Vec<u8>> = (0..5u8).map(filter_bytes).collect();
+        assert_eq!(kept, expected);
+
+        for height in 5..10 {
+            storage.store_filter(height, &filter_bytes(100 + height as u8)).await.unwrap();
+        }
+        let reloaded = storage.load_filters(5..10).await.unwrap();
+        let expected: Vec<Vec<u8>> = (5..10u8).map(|h| filter_bytes(100 + h)).collect();
+        assert_eq!(reloaded, expected);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_tip_noop() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentFilterStorage::open(tmp_dir.path()).await.unwrap();
+
+        for height in 0..3 {
+            storage.store_filter(height, &filter_bytes(height as u8)).await.unwrap();
+        }
+
+        storage.truncate_above(100).await.unwrap();
+        assert_eq!(storage.filter_tip_height().await.unwrap(), 2);
     }
 }

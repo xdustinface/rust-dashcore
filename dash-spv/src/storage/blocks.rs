@@ -22,6 +22,13 @@ pub trait BlockStorage: Send + Sync + 'static {
 
     /// Load a single block by height.
     async fn load_block(&self, height: CoreBlockHeight) -> StorageResult<Option<HashedBlock>>;
+
+    /// Drop all blocks with `height > target_height`.
+    ///
+    /// Truncating above the current tip is a no-op; truncating below
+    /// `start_height` returns an error. Changes are applied in-memory and
+    /// flushed on the next `persist`.
+    async fn truncate_above(&mut self, target_height: CoreBlockHeight) -> StorageResult<()>;
 }
 
 /// Persistent storage for full blocks using segmented files.
@@ -65,6 +72,10 @@ impl BlockStorage for PersistentBlockStorage {
 
     async fn load_block(&self, height: u32) -> StorageResult<Option<HashedBlock>> {
         self.blocks.write().await.get_item(height).await
+    }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.blocks.write().await.truncate_above(target_height).await
     }
 }
 
@@ -110,6 +121,74 @@ mod tests {
 
         let loaded = storage.load_block(999).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_drops_blocks_and_allows_restore() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+
+        for height in 100..110 {
+            storage.store_block(height, HashedBlock::dummy(height, vec![])).await.unwrap();
+        }
+
+        storage.truncate_above(104).await.unwrap();
+
+        assert_eq!(storage.load_block(104).await.unwrap(), Some(HashedBlock::dummy(104, vec![])));
+        for height in 105..110 {
+            assert_eq!(storage.load_block(height).await.unwrap(), None);
+        }
+
+        let replacement = HashedBlock::dummy(105, vec![]);
+        storage.store_block(105, replacement.clone()).await.unwrap();
+        assert_eq!(storage.load_block(105).await.unwrap(), Some(replacement));
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_tip_noop_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+
+        storage.store_block(50, HashedBlock::dummy(50, vec![])).await.unwrap();
+        storage.truncate_above(1_000).await.unwrap();
+        assert_eq!(storage.load_block(50).await.unwrap(), Some(HashedBlock::dummy(50, vec![])));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_truncate_and_read() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+        for height in 0..20 {
+            storage.store_block(height, HashedBlock::dummy(height, vec![])).await.unwrap();
+        }
+
+        let shared = Arc::new(RwLock::new(storage));
+
+        let reader = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    let _ = shared.read().await.load_block(5).await.unwrap();
+                }
+            })
+        };
+
+        let writer = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                shared.write().await.truncate_above(10).await.unwrap();
+            })
+        };
+
+        reader.await.unwrap();
+        writer.await.unwrap();
+
+        let guard = shared.read().await;
+        assert_eq!(guard.load_block(5).await.unwrap(), Some(HashedBlock::dummy(5, vec![])));
+        assert_eq!(guard.load_block(15).await.unwrap(), None);
     }
 
     #[tokio::test]

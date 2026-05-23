@@ -95,6 +95,13 @@ pub trait BlockHeaderStorage: Send + Sync + 'static {
         &self,
         hash: &dashcore::BlockHash,
     ) -> StorageResult<Option<u32>>;
+
+    /// Drop all headers with `height > target_height`.
+    ///
+    /// Truncating above the current tip is a no-op; truncating below
+    /// `start_height` returns an error. Changes are applied in-memory and
+    /// flushed on the next `persist`.
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()>;
 }
 
 pub struct PersistentBlockHeaderStorage {
@@ -234,6 +241,12 @@ impl BlockHeaderStorage for PersistentBlockHeaderStorage {
     ) -> StorageResult<Option<u32>> {
         Ok(self.header_hash_index.get(hash).copied())
     }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.block_headers.write().await.truncate_above(target_height).await?;
+        self.header_hash_index.retain(|_, h| *h <= target_height);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +273,51 @@ mod tests {
         let expected_tip = BlockHeaderTip::new(4, HashedBlockHeader::from(headers[4]));
         assert_eq!(tip, expected_tip);
         assert_eq!(storage.get_tip_height().await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_drops_index_entries_and_allows_restore() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+
+        let headers = BlockHeader::dummy_batch(0..10);
+        storage.store_headers(&headers).await.unwrap();
+
+        let orphaned_hash = headers[7].block_hash();
+        assert_eq!(storage.get_header_height_by_hash(&orphaned_hash).await.unwrap(), Some(7));
+
+        storage.truncate_above(5).await.unwrap();
+
+        assert_eq!(storage.get_tip_height().await, Some(5));
+        assert_eq!(storage.get_header_height_by_hash(&orphaned_hash).await.unwrap(), None);
+
+        let kept_hash = headers[3].block_hash();
+        assert_eq!(storage.get_header_height_by_hash(&kept_hash).await.unwrap(), Some(3));
+
+        let replacement = BlockHeader::dummy_batch(100..105);
+        storage.store_headers_at_height(&replacement, 6).await.unwrap();
+        assert_eq!(storage.get_tip_height().await, Some(10));
+
+        let reloaded = storage.load_headers(6..11).await.unwrap();
+        assert_eq!(reloaded, replacement);
+
+        let new_hash = replacement[0].block_hash();
+        assert_eq!(storage.get_header_height_by_hash(&new_hash).await.unwrap(), Some(6));
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_tip_is_noop_block_headers() {
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+
+        let headers = BlockHeader::dummy_batch(0..5);
+        storage.store_headers(&headers).await.unwrap();
+
+        storage.truncate_above(100).await.unwrap();
+        assert_eq!(storage.get_tip_height().await, Some(4));
+
+        let still_indexed =
+            storage.get_header_height_by_hash(&headers[4].block_hash()).await.unwrap();
+        assert_eq!(still_indexed, Some(4));
     }
 }
