@@ -1,7 +1,7 @@
 //! Segment management and persistence for items implementing the Persistable trait.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::BufReader,
     ops::Range,
@@ -80,6 +80,9 @@ pub struct SegmentCache<I: Persistable> {
     tip_height: Option<u32>,
     start_height: Option<u32>,
     segments_dir: PathBuf,
+    /// Segment ids whose backing files must be removed on the next `persist`.
+    /// Populated by `truncate_above` for segments that are dropped entirely.
+    to_delete: HashSet<u32>,
 }
 
 impl<I: Persistable> SegmentCache<I> {
@@ -94,6 +97,7 @@ impl<I: Persistable> SegmentCache<I> {
             tip_height: None,
             start_height: None,
             segments_dir: segments_dir.clone(),
+            to_delete: HashSet::new(),
         };
 
         // Building the metadata
@@ -322,8 +326,66 @@ impl<I: Persistable> SegmentCache<I> {
         Ok(())
     }
 
+    /// Truncate the cache so that no items above `target_height` remain.
+    ///
+    /// Segments entirely above the target are dropped from memory and queued for
+    /// deletion on the next `persist`. The segment containing `target_height + 1`
+    /// has its tail slots reset to `I::sentinel()` so subsequent `Segment::insert`
+    /// calls into the same range remain sound.
+    ///
+    /// Returns an error if `target_height` is below `start_height`, since the
+    /// resulting cache would have a hole below its origin. Callers must guard
+    /// against truncating an empty cache except as a no-op (no error).
+    pub async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        let tip = match self.tip_height {
+            Some(tip) => tip,
+            None => return Ok(()),
+        };
+
+        if target_height >= tip {
+            return Ok(());
+        }
+
+        if let Some(start) = self.start_height {
+            if target_height < start {
+                return Err(StorageError::WriteFailed(format!(
+                    "truncate_above({target_height}) below start_height ({start})"
+                )));
+            }
+        }
+
+        let items_per_segment = Segment::<I>::ITEMS_PER_SEGMENT;
+        let boundary_segment_id = target_height / items_per_segment;
+        let boundary_offset = target_height % items_per_segment;
+        let max_segment_id = tip / items_per_segment;
+
+        for segment_id in (boundary_segment_id + 1)..=max_segment_id {
+            self.segments.remove(&segment_id);
+            self.evicted.remove(&segment_id);
+            self.to_delete.insert(segment_id);
+        }
+
+        if boundary_offset + 1 < items_per_segment {
+            let segment = self.get_segment_mut(&boundary_segment_id).await?;
+            segment.reset_above(boundary_offset);
+        }
+
+        self.tip_height = Some(target_height);
+
+        Ok(())
+    }
+
     pub async fn persist(&mut self, segments_dir: impl Into<PathBuf>) {
         let segments_dir = segments_dir.into();
+
+        for id in self.to_delete.drain() {
+            let path = segments_dir.join(I::segment_file_name(id));
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::error!("Failed to delete segment file {:?}: {}", path, e);
+                }
+            }
+        }
 
         for (id, segments) in self.evicted.iter_mut() {
             if let Err(e) = segments.persist(&segments_dir).await {
@@ -474,6 +536,29 @@ impl<I: Persistable> Segment<I> {
 
         self.state = SegmentState::Clean;
         Ok(())
+    }
+
+    /// Reset all slots strictly above `offset` to the sentinel value.
+    /// The slot at `offset` is preserved. Marks the segment dirty if any
+    /// slot was changed.
+    pub fn reset_above(&mut self, offset: u32) {
+        debug_assert!(offset < Self::ITEMS_PER_SEGMENT);
+
+        let sentinel = I::sentinel();
+        let start = (offset as usize) + 1;
+        let mut changed = false;
+
+        for slot in &mut self.items[start..] {
+            if *slot != sentinel {
+                *slot = sentinel.clone();
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.state = SegmentState::Dirty;
+            self.last_accessed = Instant::now();
+        }
     }
 
     pub fn insert(&mut self, item: I, offset: u32) {
@@ -652,6 +737,112 @@ mod tests {
             loaded_segment.get(MAX_ITEMS / 2 - 1..MAX_ITEMS / 2),
             [FilterHeader::dummy(MAX_ITEMS / 2 - 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_within_segment() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let items = FilterHeader::dummy_batch(0..20);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(19));
+
+        cache.truncate_above(9).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(9));
+        assert_eq!(cache.start_height(), Some(0));
+
+        let kept = cache.get_items(0..10).await.unwrap();
+        assert_eq!(kept, items[0..10]);
+
+        // Re-store into the truncated range — must not panic on the sentinel debug_assert.
+        let replacement = FilterHeader::dummy_batch(100..110);
+        cache.store_items_at_height(&replacement, 10).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(19));
+
+        let reread = cache.get_items(10..20).await.unwrap();
+        assert_eq!(reread, replacement);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_segment_boundary() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
+
+        cache.truncate_above(ITEMS_PER_SEGMENT - 1).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT - 1));
+
+        let kept = cache.get_items(0..ITEMS_PER_SEGMENT).await.unwrap();
+        assert_eq!(kept.len(), ITEMS_PER_SEGMENT as usize);
+
+        // The dropped segment file should not be on disk after persist.
+        cache.persist(tmp_dir.path()).await;
+        let dropped_segment_file = tmp_dir.path().join(FilterHeader::segment_file_name(1));
+        assert!(!dropped_segment_file.exists());
+
+        // Reload and verify the truncation is durable.
+        let mut reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT - 1));
+
+        // Re-storing into the dropped segment is sound.
+        let new_items = FilterHeader::dummy_batch(500..505);
+        reloaded.store_items_at_height(&new_items, ITEMS_PER_SEGMENT).await.unwrap();
+        assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
+        let reread = reloaded.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await.unwrap();
+        assert_eq!(reread, new_items);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_tip_is_noop() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let items = FilterHeader::dummy_batch(0..10);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+
+        cache.truncate_above(9).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(9));
+
+        cache.truncate_above(100).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(9));
+
+        let kept = cache.get_items(0..10).await.unwrap();
+        assert_eq!(kept, items);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_empty_cache_is_noop() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+
+        cache.truncate_above(0).await.unwrap();
+        cache.truncate_above(100).await.unwrap();
+        assert_eq!(cache.tip_height(), None);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_below_start_errors() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let items = FilterHeader::dummy_batch(0..5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 10).await.unwrap();
+        assert_eq!(cache.start_height(), Some(10));
+
+        assert!(cache.truncate_above(5).await.is_err());
+        assert_eq!(cache.tip_height(), Some(14));
+        assert_eq!(cache.start_height(), Some(10));
     }
 
     #[test]
