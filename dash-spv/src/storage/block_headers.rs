@@ -252,8 +252,13 @@ impl BlockHeaderStorage for PersistentBlockHeaderStorage {
     }
 
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
-        self.block_headers.write().await.truncate_above(target_height).await?;
-        self.header_hash_index.retain(|_, h| *h <= target_height);
+        let mut block_headers = self.block_headers.write().await;
+        let needs_index_prune = block_headers.tip_height().is_some_and(|tip| target_height < tip);
+        block_headers.truncate_above(target_height).await?;
+        drop(block_headers);
+        if needs_index_prune {
+            self.header_hash_index.retain(|_, h| *h <= target_height);
+        }
         Ok(())
     }
 }

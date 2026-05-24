@@ -590,7 +590,7 @@ impl<I: Persistable> Segment<I> {
     /// Reset all slots strictly above `offset` to the sentinel value.
     /// The slot at `offset` is preserved. Marks the segment dirty if any
     /// slot was changed.
-    pub fn reset_above(&mut self, offset: u32) {
+    fn reset_above(&mut self, offset: u32) {
         debug_assert!(offset < Self::ITEMS_PER_SEGMENT);
 
         let sentinel = I::sentinel();
