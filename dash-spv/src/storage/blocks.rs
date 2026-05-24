@@ -153,6 +153,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_truncate_above_persist_reopen_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        {
+            let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+            for height in 100..110 {
+                storage.store_block(height, HashedBlock::dummy(height, vec![])).await.unwrap();
+            }
+            storage.truncate_above(104).await.unwrap();
+            storage.persist(temp_dir.path()).await.unwrap();
+        }
+
+        let storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+        assert_eq!(storage.load_block(104).await.unwrap(), Some(HashedBlock::dummy(104, vec![])));
+        for height in 105..110 {
+            assert_eq!(storage.load_block(height).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn test_truncate_above_tip_noop_blocks() {
         let temp_dir = TempDir::new().unwrap();
         let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();

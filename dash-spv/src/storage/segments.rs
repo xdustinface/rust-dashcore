@@ -1010,6 +1010,61 @@ mod tests {
         assert_eq!(cache.start_height(), Some(10));
     }
 
+    #[tokio::test]
+    async fn test_sequential_truncations_within_same_segment() {
+        let tmp_dir = TempDir::new().unwrap();
+        let items = FilterHeader::dummy_batch(0..30);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+
+        cache.truncate_above(20).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(20));
+
+        cache.truncate_above(10).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(10));
+        assert_eq!(cache.start_height(), Some(0));
+
+        // Re-store into the doubly-truncated range. Both `reset_above` passes
+        // must have left the slots as sentinels for `insert` to remain sound.
+        let replacement = FilterHeader::dummy_batch(200..220);
+        cache.store_items_at_height(&replacement, 11).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(30));
+        assert_eq!(cache.get_items(11..31).await.unwrap(), replacement);
+    }
+
+    #[tokio::test]
+    async fn test_sequential_truncations_across_segment_boundaries() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT * 3);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.truncate_above(ITEMS_PER_SEGMENT * 2 + 5).await.unwrap();
+        cache.truncate_above(ITEMS_PER_SEGMENT + 5).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        // Segment 2 must be gone on disk (dropped by the second cut),
+        // segment 1 stays (its tail was reset by `reset_above`).
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(1)).exists());
+
+        let mut reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT + 5));
+        let replacement = FilterHeader::dummy_batch(500..510);
+        reloaded.store_items_at_height(&replacement, ITEMS_PER_SEGMENT + 6).await.unwrap();
+        assert_eq!(
+            reloaded.get_items(ITEMS_PER_SEGMENT + 6..ITEMS_PER_SEGMENT + 16).await.unwrap(),
+            replacement
+        );
+    }
+
     #[test]
     fn test_segment_insert_get() {
         let segment_id = 10;
