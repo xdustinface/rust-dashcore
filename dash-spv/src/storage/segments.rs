@@ -188,9 +188,13 @@ impl<I: Persistable> SegmentCache<I> {
         }
 
         // If the segment is already in the to_persist map, load it from there.
-        // If the segment is not in the to_persist map, load it from disk.
+        // If the segment is queued for deletion, return a fresh empty segment.
+        // The next `persist` will atomically overwrite the stale file.
+        // Otherwise, load it from disk.
         let segment = if let Some(segment) = self.evicted.remove(segment_id) {
             segment
+        } else if self.to_delete.remove(segment_id) {
+            Segment::new(*segment_id, vec![], SegmentState::Dirty)
         } else {
             Segment::load(&self.segments_dir, *segment_id).await?
         };
@@ -359,15 +363,19 @@ impl<I: Persistable> SegmentCache<I> {
         let boundary_offset = target_height % items_per_segment;
         let max_segment_id = tip / items_per_segment;
 
+        // Load the boundary segment first so any disk I/O error is surfaced
+        // before mutating cache state. After this point only infallible
+        // in-memory operations run, so the function cannot leave the cache
+        // in a half-truncated state.
+        if boundary_offset + 1 < items_per_segment {
+            let segment = self.get_segment_mut(&boundary_segment_id).await?;
+            segment.reset_above(boundary_offset);
+        }
+
         for segment_id in (boundary_segment_id + 1)..=max_segment_id {
             self.segments.remove(&segment_id);
             self.evicted.remove(&segment_id);
             self.to_delete.insert(segment_id);
-        }
-
-        if boundary_offset + 1 < items_per_segment {
-            let segment = self.get_segment_mut(&boundary_segment_id).await?;
-            segment.reset_above(boundary_offset);
         }
 
         self.tip_height = Some(target_height);
@@ -803,6 +811,38 @@ mod tests {
         assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
         let reread = reloaded.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await.unwrap();
         assert_eq!(reread, new_items);
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_then_store_into_dropped_segment_without_persist() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.truncate_above(ITEMS_PER_SEGMENT - 1).await.unwrap();
+
+        // Re-store into the dropped segment BEFORE persist runs. Without the
+        // to_delete check in get_segment_mut, the stale on-disk file would be
+        // loaded and the insert would hit the sentinel debug_assert.
+        let replacement = FilterHeader::dummy_batch(500..505);
+        cache.store_items_at_height(&replacement, ITEMS_PER_SEGMENT).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
+
+        let reread = cache.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await.unwrap();
+        assert_eq!(reread, replacement);
+
+        cache.persist(tmp_dir.path()).await;
+        let mut reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
+        let reread = reloaded.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await.unwrap();
+        assert_eq!(reread, replacement);
     }
 
     #[tokio::test]
