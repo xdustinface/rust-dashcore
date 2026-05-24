@@ -788,6 +788,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_truncate_within_segment_persist_reload() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let items = FilterHeader::dummy_batch(0..20);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.truncate_above(9).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        // Reopen without re-storing to verify the boundary segment was rewritten
+        // with sentinel slots above the cut. If `reset_above`'s dirty flag were
+        // skipped, the stale on-disk slots would survive and `tip_height` would
+        // come back as 19.
+        let mut reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded.tip_height(), Some(9));
+        assert_eq!(reloaded.get_items(0..10).await.unwrap(), items[0..10]);
+        for height in 10..20u32 {
+            assert_eq!(reloaded.get_item(height).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn test_truncate_above_segment_boundary() {
         let tmp_dir = TempDir::new().unwrap();
 
