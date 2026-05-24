@@ -352,7 +352,7 @@ impl<I: Persistable> SegmentCache<I> {
 
         if let Some(start) = self.start_height {
             if target_height < start {
-                return Err(StorageError::WriteFailed(format!(
+                return Err(StorageError::InvalidArgument(format!(
                     "truncate_above({target_height}) below start_height ({start})"
                 )));
             }
