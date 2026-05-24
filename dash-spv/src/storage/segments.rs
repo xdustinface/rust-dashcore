@@ -367,16 +367,15 @@ impl<I: Persistable> SegmentCache<I> {
             }
         }
 
-        let items_per_segment = Segment::<I>::ITEMS_PER_SEGMENT;
-        let boundary_segment_id = target_height / items_per_segment;
-        let boundary_offset = target_height % items_per_segment;
-        let max_segment_id = tip / items_per_segment;
+        let boundary_segment_id = Self::height_to_segment_id(target_height);
+        let boundary_offset = Self::height_to_offset(target_height);
+        let max_segment_id = Self::height_to_segment_id(tip);
 
         // Load the boundary segment first so any disk I/O error is surfaced
         // before mutating cache state. After this point only infallible
         // in-memory operations run, so the function cannot leave the cache
         // in a half-truncated state.
-        if boundary_offset + 1 < items_per_segment {
+        if boundary_offset + 1 < Segment::<I>::ITEMS_PER_SEGMENT {
             let segment = self.get_segment_mut(&boundary_segment_id).await?;
             segment.reset_above(boundary_offset);
         }
