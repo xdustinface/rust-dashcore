@@ -223,6 +223,16 @@ impl<I: Persistable> SegmentCache<I> {
         let end_segment = Self::height_to_segment_id(end - 1);
 
         for segment_id in start_segment..=end_segment {
+            // Same guard as `get_item`: a segment queued for deletion holds
+            // nothing but sentinels by construction. Loading it via
+            // `get_segment_mut` would consume the deletion intent and queue
+            // an all-sentinel rewrite, so refuse the read instead.
+            if self.to_delete.contains(&segment_id) {
+                return Err(StorageError::InvalidArgument(format!(
+                    "get_items range {height_range:?} extends into segment {segment_id} queued for deletion"
+                )));
+            }
+
             let segment = self.get_segment_mut(&segment_id).await?;
 
             let seg_start = if segment_id == start_segment {
@@ -902,6 +912,36 @@ mod tests {
         // remove the entry from to_delete and queue an all-sentinel rewrite.
         assert_eq!(cache.get_item(ITEMS_PER_SEGMENT + 2).await.unwrap(), None);
         assert_eq!(cache.get_item(ITEMS_PER_SEGMENT).await.unwrap(), None);
+
+        cache.persist(tmp_dir.path()).await;
+        assert!(!dropped_segment_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_get_items_above_truncated_tip_preserves_deletion() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let dropped_segment_file = tmp_dir.path().join(FilterHeader::segment_file_name(1));
+        assert!(dropped_segment_file.exists());
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.truncate_above(ITEMS_PER_SEGMENT - 1).await.unwrap();
+
+        // A range read that spans into a segment queued for deletion must
+        // error rather than consuming the deletion intent and handing back
+        // sentinels.
+        assert!(matches!(
+            cache.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await,
+            Err(StorageError::InvalidArgument(_))
+        ));
 
         cache.persist(tmp_dir.path()).await;
         assert!(!dropped_segment_file.exists());
