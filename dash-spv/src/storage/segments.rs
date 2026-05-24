@@ -203,6 +203,13 @@ impl<I: Persistable> SegmentCache<I> {
         Ok(segment)
     }
 
+    /// Load a contiguous range of items by height.
+    ///
+    /// Returns `StorageError::InvalidArgument` when the requested range extends
+    /// into a segment queued for deletion by a prior `truncate_above` (before
+    /// the next `persist`). Callers reading across a truncation boundary must
+    /// clamp their range to `tip_height` first, or fall back to per-item reads
+    /// via `get_item`, which returns `Ok(None)` for those slots.
     pub async fn get_items(&mut self, height_range: Range<u32>) -> StorageResult<Vec<I>> {
         debug_assert!(height_range.start < height_range.end);
 
@@ -280,6 +287,12 @@ impl<I: Persistable> SegmentCache<I> {
 
     /// Get a single item by height. Returns `None` for sentinel (empty) slots.
     /// Unlike `get_items()`, this does not assert dense storage, safe for sparse data.
+    ///
+    /// For heights in a segment queued for deletion by a prior `truncate_above`
+    /// (before the next `persist`), this returns `Ok(None)` rather than the
+    /// `StorageError::InvalidArgument` that `get_items` returns. Callers must
+    /// not interpret `Ok(None)` here as a fallback for an error from `get_items`.
+    /// The two APIs report truncated slots differently by design.
     pub async fn get_item(&mut self, height: u32) -> StorageResult<Option<I>> {
         let segment_id = Self::height_to_segment_id(height);
 
@@ -359,6 +372,11 @@ impl<I: Persistable> SegmentCache<I> {
     /// Returns an error if `target_height` is below `start_height`, since the
     /// resulting cache would have a hole below its origin. Callers must guard
     /// against truncating an empty cache except as a no-op (no error).
+    ///
+    /// The truncation is not durable until the next successful `persist` call.
+    /// A crash between `truncate_above` and `persist` may leave orphaned segment
+    /// files on disk, causing `tip_height` to be recomputed from stale data on
+    /// restart and the cache to reopen at the pre-truncation tip.
     pub async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
         let tip = match self.tip_height {
             Some(tip) => tip,

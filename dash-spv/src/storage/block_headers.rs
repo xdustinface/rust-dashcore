@@ -61,6 +61,11 @@ pub trait BlockHeaderStorage: Send + Sync + 'static {
         height: u32,
     ) -> StorageResult<()>;
 
+    /// Load a contiguous range of headers by height.
+    ///
+    /// Returns `StorageError::InvalidArgument` when the range extends into a
+    /// segment queued for deletion by a prior `truncate_above` (before the next
+    /// `persist`). Callers must clamp the range to at most `get_tip_height`.
     async fn load_headers(&self, range: Range<u32>) -> StorageResult<Vec<BlockHeader>>;
 
     async fn get_header(&self, height: u32) -> StorageResult<Option<BlockHeader>> {
@@ -98,9 +103,13 @@ pub trait BlockHeaderStorage: Send + Sync + 'static {
 
     /// Drop all headers with `height > target_height`.
     ///
-    /// Truncating above the current tip is a no-op; truncating below
+    /// Truncating above the current tip is a no-op, truncating below
     /// `start_height` returns an error. Changes are applied in-memory and
     /// flushed on the next `persist`.
+    ///
+    /// The truncation is not durable until the next successful `persist` call.
+    /// A crash between `truncate_above` and `persist` may leave orphaned segment
+    /// files on disk and cause the storage to reopen at the pre-truncation tip.
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()>;
 }
 

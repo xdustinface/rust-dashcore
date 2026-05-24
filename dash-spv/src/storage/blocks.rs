@@ -25,9 +25,13 @@ pub trait BlockStorage: Send + Sync + 'static {
 
     /// Drop all blocks with `height > target_height`.
     ///
-    /// Truncating above the current tip is a no-op; truncating below
+    /// Truncating above the current tip is a no-op, truncating below
     /// `start_height` returns an error. Changes are applied in-memory and
     /// flushed on the next `persist`.
+    ///
+    /// The truncation is not durable until the next successful `persist` call.
+    /// A crash between `truncate_above` and `persist` may leave orphaned segment
+    /// files on disk and cause the storage to reopen at the pre-truncation tip.
     async fn truncate_above(&mut self, target_height: CoreBlockHeight) -> StorageResult<()>;
 }
 

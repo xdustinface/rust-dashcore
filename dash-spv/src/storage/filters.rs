@@ -12,15 +12,24 @@ use crate::{
 pub trait FilterStorage: Send + Sync + 'static {
     async fn store_filter(&mut self, height: u32, filter: &[u8]) -> StorageResult<()>;
 
+    /// Load a contiguous range of filters by height.
+    ///
+    /// Returns `StorageError::InvalidArgument` when the range extends into a
+    /// segment queued for deletion by a prior `truncate_above` (before the next
+    /// `persist`). Callers must clamp the range to at most `filter_tip_height`.
     async fn load_filters(&self, range: Range<u32>) -> StorageResult<Vec<Vec<u8>>>;
 
     async fn filter_tip_height(&self) -> StorageResult<u32>;
 
     /// Drop all filters with `height > target_height`.
     ///
-    /// Truncating above the current tip is a no-op; truncating below
+    /// Truncating above the current tip is a no-op, truncating below
     /// `start_height` returns an error. Changes are applied in-memory and
     /// flushed on the next `persist`.
+    ///
+    /// The truncation is not durable until the next successful `persist` call.
+    /// A crash between `truncate_above` and `persist` may leave orphaned segment
+    /// files on disk and cause the storage to reopen at the pre-truncation tip.
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()>;
 }
 
