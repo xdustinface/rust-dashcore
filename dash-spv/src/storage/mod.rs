@@ -585,6 +585,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disk_storage_manager_truncate_above_block_headers() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ClientConfig::regtest().with_storage_path(temp_dir.path());
+        let mut mgr = DiskStorageManager::new(&config).await.unwrap();
+
+        let headers = BlockHeader::dummy_batch(0..10);
+        mgr.store_headers(&headers).await.unwrap();
+
+        let orphaned_hash = headers[7].block_hash();
+        assert_eq!(mgr.get_header_height_by_hash(&orphaned_hash).await.unwrap(), Some(7));
+
+        <DiskStorageManager as BlockHeaderStorage>::truncate_above(&mut mgr, 5).await.unwrap();
+
+        assert_eq!(mgr.get_tip_height().await, Some(5));
+        assert_eq!(mgr.get_header_height_by_hash(&orphaned_hash).await.unwrap(), None);
+
+        let kept_hash = headers[3].block_hash();
+        assert_eq!(mgr.get_header_height_by_hash(&kept_hash).await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
     async fn test_lock_lifecycle() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let path = temp_dir.path().to_path_buf();
