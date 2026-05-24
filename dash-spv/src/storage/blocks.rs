@@ -81,8 +81,12 @@ impl BlockStorage for PersistentBlockStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use tempfile::TempDir;
+    use tokio::sync::Barrier;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_store_and_load_block() {
@@ -155,21 +159,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_concurrent_truncate_and_read() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-
+    async fn test_truncate_and_read_under_contention() {
         let temp_dir = TempDir::new().unwrap();
         let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
         for height in 0..20 {
             storage.store_block(height, HashedBlock::dummy(height, vec![])).await.unwrap();
         }
 
+        // The outer `RwLock` is required because `truncate_above` takes `&mut self`
+        // and so the writer and reader cannot literally execute in parallel, but a
+        // `Barrier` guarantees both tasks are scheduled and racing for the lock
+        // before either acquires it. Under the multi-thread runtime this exercises
+        // the read/write contention path while keeping the post-state assertions
+        // deterministic.
         let shared = Arc::new(RwLock::new(storage));
+        let barrier = Arc::new(Barrier::new(2));
 
         let reader = {
             let shared = Arc::clone(&shared);
+            let barrier = Arc::clone(&barrier);
             tokio::spawn(async move {
+                barrier.wait().await;
                 for _ in 0..50 {
                     let _ = shared.read().await.load_block(5).await.unwrap();
                 }
@@ -178,7 +188,9 @@ mod tests {
 
         let writer = {
             let shared = Arc::clone(&shared);
+            let barrier = Arc::clone(&barrier);
             tokio::spawn(async move {
+                barrier.wait().await;
                 shared.write().await.truncate_above(10).await.unwrap();
             })
         };
