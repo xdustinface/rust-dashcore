@@ -151,6 +151,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_truncate_above_persist_reopen_filter_headers() {
+        let tmp_dir = TempDir::new().unwrap();
+        {
+            let mut storage = PersistentFilterHeaderStorage::open(tmp_dir.path()).await.unwrap();
+            let headers = FilterHeader::dummy_batch(0..10);
+            storage.store_filter_headers(&headers).await.unwrap();
+            storage.truncate_above(4).await.unwrap();
+            storage.persist(tmp_dir.path()).await.unwrap();
+        }
+
+        let storage = PersistentFilterHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        assert_eq!(storage.get_filter_tip_height().await.unwrap(), Some(4));
+        let kept = storage.load_filter_headers(0..5).await.unwrap();
+        assert_eq!(kept, FilterHeader::dummy_batch(0..5));
+        for h in 5..10 {
+            assert_eq!(storage.get_filter_header(h).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
     async fn test_truncate_above_tip_noop() {
         let tmp_dir = TempDir::new().unwrap();
         let mut storage = PersistentFilterHeaderStorage::open(tmp_dir.path()).await.unwrap();
