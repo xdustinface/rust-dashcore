@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(storage.load_block(50).await.unwrap(), Some(HashedBlock::dummy(50, vec![])));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_concurrent_truncate_and_read() {
         use std::sync::Arc;
         use tokio::sync::RwLock;
