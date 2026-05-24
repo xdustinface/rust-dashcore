@@ -269,9 +269,18 @@ impl<I: Persistable> SegmentCache<I> {
     }
 
     /// Get a single item by height. Returns `None` for sentinel (empty) slots.
-    /// Unlike `get_items()`, this does not assert dense storage — safe for sparse data.
+    /// Unlike `get_items()`, this does not assert dense storage, safe for sparse data.
     pub async fn get_item(&mut self, height: u32) -> StorageResult<Option<I>> {
         let segment_id = Self::height_to_segment_id(height);
+
+        // A segment queued for deletion holds nothing but sentinels by
+        // construction. Short-circuit so a read above the truncated tip does
+        // not consume the deletion intent in `get_segment_mut` and replace
+        // the stale on-disk file with a fresh all-sentinel blob.
+        if self.to_delete.contains(&segment_id) {
+            return Ok(None);
+        }
+
         let offset = Self::height_to_offset(height);
         let segment = self.get_segment_mut(&segment_id).await?;
         let item = segment.get_single(offset);
@@ -843,6 +852,34 @@ mod tests {
         assert_eq!(reloaded.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
         let reread = reloaded.get_items(ITEMS_PER_SEGMENT..ITEMS_PER_SEGMENT + 5).await.unwrap();
         assert_eq!(reread, replacement);
+    }
+
+    #[tokio::test]
+    async fn test_read_above_truncated_tip_preserves_deletion() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let dropped_segment_file = tmp_dir.path().join(FilterHeader::segment_file_name(1));
+        assert!(dropped_segment_file.exists());
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.truncate_above(ITEMS_PER_SEGMENT - 1).await.unwrap();
+
+        // Reading above the truncated tip must not cancel the pending deletion.
+        // Without the to_delete short-circuit in get_item, this read would
+        // remove the entry from to_delete and queue an all-sentinel rewrite.
+        assert_eq!(cache.get_item(ITEMS_PER_SEGMENT + 2).await.unwrap(), None);
+        assert_eq!(cache.get_item(ITEMS_PER_SEGMENT).await.unwrap(), None);
+
+        cache.persist(tmp_dir.path()).await;
+        assert!(!dropped_segment_file.exists());
     }
 
     #[tokio::test]
