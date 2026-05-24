@@ -852,15 +852,19 @@ mod tests {
         cache.store_items_at_height(&items, 0).await.unwrap();
         assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT + 4));
 
+        // Persist first so segment 1's file is actually on disk, otherwise the
+        // post-truncate `!exists()` check below would be trivially true.
+        cache.persist(tmp_dir.path()).await;
+        let dropped_segment_file = tmp_dir.path().join(FilterHeader::segment_file_name(1));
+        assert!(dropped_segment_file.exists());
+
         cache.truncate_above(ITEMS_PER_SEGMENT - 1).await.unwrap();
         assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT - 1));
 
         let kept = cache.get_items(0..ITEMS_PER_SEGMENT).await.unwrap();
         assert_eq!(kept.len(), ITEMS_PER_SEGMENT as usize);
 
-        // The dropped segment file should not be on disk after persist.
         cache.persist(tmp_dir.path()).await;
-        let dropped_segment_file = tmp_dir.path().join(FilterHeader::segment_file_name(1));
         assert!(!dropped_segment_file.exists());
 
         // Reload and verify the truncation is durable.
