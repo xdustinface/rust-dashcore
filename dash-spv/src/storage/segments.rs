@@ -425,7 +425,7 @@ impl<I: Persistable> SegmentCache<I> {
         let mut failed = HashSet::new();
         for id in self.to_delete.drain() {
             let path = segments_dir.join(I::segment_file_name(id));
-            match fs::remove_file(&path) {
+            match tokio::fs::remove_file(&path).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
