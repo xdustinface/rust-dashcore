@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT - 1));
 
         let kept = cache.get_items(0..ITEMS_PER_SEGMENT).await.unwrap();
-        assert_eq!(kept.len(), ITEMS_PER_SEGMENT as usize);
+        assert_eq!(kept, items[0..ITEMS_PER_SEGMENT as usize]);
 
         cache.persist(tmp_dir.path()).await;
         assert!(!dropped_segment_file.exists());
