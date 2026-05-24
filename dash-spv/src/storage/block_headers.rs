@@ -303,6 +303,17 @@ mod tests {
 
         let new_hash = replacement[0].block_hash();
         assert_eq!(storage.get_header_height_by_hash(&new_hash).await.unwrap(), Some(6));
+
+        // Exercise the durability contract: persist, drop, reopen, and verify
+        // the rebuilt index does not resurrect orphaned hashes from stale files.
+        storage.persist(tmp_dir.path()).await.unwrap();
+        drop(storage);
+
+        let reopened = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        assert_eq!(reopened.get_tip_height().await, Some(10));
+        assert_eq!(reopened.get_header_height_by_hash(&orphaned_hash).await.unwrap(), None);
+        assert_eq!(reopened.get_header_height_by_hash(&kept_hash).await.unwrap(), Some(3));
+        assert_eq!(reopened.get_header_height_by_hash(&new_hash).await.unwrap(), Some(6));
     }
 
     #[tokio::test]
