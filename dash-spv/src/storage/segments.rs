@@ -378,14 +378,19 @@ impl<I: Persistable> SegmentCache<I> {
     pub async fn persist(&mut self, segments_dir: impl Into<PathBuf>) {
         let segments_dir = segments_dir.into();
 
+        let mut failed = HashSet::new();
         for id in self.to_delete.drain() {
             let path = segments_dir.join(I::segment_file_name(id));
-            if path.exists() {
-                if let Err(e) = fs::remove_file(&path) {
+            match fs::remove_file(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
                     tracing::error!("Failed to delete segment file {:?}: {}", path, e);
+                    failed.insert(id);
                 }
             }
         }
+        self.to_delete.extend(failed);
 
         for (id, segments) in self.evicted.iter_mut() {
             if let Err(e) = segments.persist(&segments_dir).await {
