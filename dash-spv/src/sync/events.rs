@@ -176,6 +176,37 @@ pub enum SyncEvent {
         /// Sync cycle (0 = initial, 1+ = incremental)
         cycle: u32,
     },
+
+    /// A reorg cascade has truncated downstream storages and bumped the
+    /// generation counter. Downstream managers (`FilterHeadersManager`,
+    /// `FiltersManager`, `BlocksManager`) listen for this and reset their
+    /// pipelines at `fork_height`.
+    ///
+    /// Emitted by: `BlockHeadersManager`
+    /// Consumed by: `FilterHeadersManager`, `FiltersManager`, `BlocksManager`
+    ChainReorg {
+        /// Common-ancestor height in the active chain prior to truncation.
+        fork_height: u32,
+        /// Previous chain tip hash before truncation.
+        old_tip: BlockHash,
+        /// New tip hash of the promoted fork branch.
+        new_tip: BlockHash,
+        /// Generation counter value after the cascade. Used by managers
+        /// to discard stale in-flight responses tagged with prior values.
+        generation: u64,
+    },
+
+    /// A fork branch deeper than the depth cap was detected and denied.
+    /// No truncation occurs.
+    ///
+    /// Emitted by: `BlockHeadersManager`
+    /// Consumed by: External listeners (monitoring only)
+    DeepReorgDetected {
+        /// Common-ancestor height that the fork claims.
+        fork_height: u32,
+        /// Depth of the proposed reorg (active_tip_height - fork_height).
+        depth: u32,
+    },
 }
 
 impl fmt::Display for SyncEvent {
@@ -260,6 +291,20 @@ impl fmt::Display for SyncEvent {
                 header_tip,
                 cycle,
             } => write!(f, "SyncComplete(tip={}, cycle={})", header_tip, cycle),
+            SyncEvent::ChainReorg {
+                fork_height,
+                old_tip,
+                new_tip,
+                generation,
+            } => write!(
+                f,
+                "ChainReorg(fork_height={}, old_tip={}, new_tip={}, generation={})",
+                fork_height, old_tip, new_tip, generation
+            ),
+            SyncEvent::DeepReorgDetected {
+                fork_height,
+                depth,
+            } => write!(f, "DeepReorgDetected(fork_height={}, depth={})", fork_height, depth),
         }
     }
 }

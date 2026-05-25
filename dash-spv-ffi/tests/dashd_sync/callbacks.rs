@@ -593,6 +593,8 @@ pub(super) fn create_sync_callbacks(tracker: &Arc<CallbackTracker>) -> FFISyncEv
         on_instantlock_received: Some(on_instantlock_received),
         on_manager_error: Some(on_manager_error),
         on_sync_complete: Some(on_sync_complete),
+        on_chain_reorg: None,
+        on_deep_reorg_detected: None,
         user_data: Arc::as_ptr(tracker) as *mut c_void,
     }
 }

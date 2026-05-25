@@ -133,6 +133,20 @@ extern "C" fn on_sync_complete(header_tip: u32, cycle: u32, _user_data: *mut c_v
     println!("[Sync] Sync complete at height: {} (cycle {})", header_tip, cycle);
 }
 
+extern "C" fn on_chain_reorg(
+    fork_height: u32,
+    _old_tip: *const [u8; 32],
+    _new_tip: *const [u8; 32],
+    generation: u64,
+    _user_data: *mut c_void,
+) {
+    println!("[Sync] Chain reorg at fork_height={} generation={}", fork_height, generation);
+}
+
+extern "C" fn on_deep_reorg_detected(fork_height: u32, depth: u32, _user_data: *mut c_void) {
+    println!("[Sync] Deep reorg detected at fork_height={} depth={}", fork_height, depth);
+}
+
 // ============================================================================
 // Network Event Callbacks
 // ============================================================================
@@ -511,6 +525,8 @@ fn main() {
                 on_instantlock_received: Some(on_instantlock_received),
                 on_manager_error: Some(on_manager_error),
                 on_sync_complete: Some(on_sync_complete),
+                on_chain_reorg: Some(on_chain_reorg),
+                on_deep_reorg_detected: Some(on_deep_reorg_detected),
                 user_data: ptr::null_mut(),
             },
             network: FFINetworkEventCallbacks {
