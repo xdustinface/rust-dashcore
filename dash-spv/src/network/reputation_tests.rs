@@ -494,7 +494,6 @@ mod tests {
 
         manager.update_reputation(mild, 20, "mild").await;
         manager.update_reputation(bad, 80, "bad").await;
-        // neutral stays at score 0
 
         let peers = vec![(mild, ()), (bad, ()), (neutral, ())];
         let victim = manager.pick_worst(&peers).await.expect("non-empty input");

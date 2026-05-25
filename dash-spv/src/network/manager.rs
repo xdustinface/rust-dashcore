@@ -1282,12 +1282,6 @@ impl PeerNetworkManager {
         self.send_message_to_peer(&addr, &peer, message).await
     }
 
-    /// Pick a peer from `peers` weighted by reputation. Weights come from
-    /// `PeerReputationManager::selection_weights` and use `max(1, score + 51)`
-    /// so the worst non-banned peer still has weight 1 and the best
-    /// `MAX_MISBEHAVIOR_SCORE = 100` peer has weight 151. Falls back to a
-    /// uniform random choice if all weights are zero (e.g. every candidate is
-    /// banned), which keeps the caller from blocking on selection.
     async fn next_peer(
         &self,
         peers: &[(SocketAddr, Arc<RwLock<Peer>>)],

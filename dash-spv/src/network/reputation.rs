@@ -220,7 +220,7 @@ pub struct PeerReputation {
     /// Cause of the most recent disconnect, if any. Defaulted on load so older
     /// reputation files without this field continue to deserialize.
     #[serde(default)]
-    pub last_disconnect_reason: Option<DisconnectReason>,
+    pub(crate) last_disconnect_reason: Option<DisconnectReason>,
 }
 
 impl Default for PeerReputation {
@@ -360,7 +360,7 @@ pub enum DisconnectReason {
 
 impl DisconnectReason {
     /// Short stable string used in logs and reputation event reasons.
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             DisconnectReason::Timeout => "timeout",
             DisconnectReason::HandshakeFailure => "handshake failure",
@@ -382,7 +382,7 @@ pub struct ReputationEvent {
     pub change: i32,
     pub reason: String,
     pub timestamp: Instant,
-    pub disconnect_reason: Option<DisconnectReason>,
+    pub(crate) disconnect_reason: Option<DisconnectReason>,
 }
 
 /// Peer reputation manager
@@ -457,7 +457,7 @@ impl PeerReputationManager {
     /// Ties at the worst score are broken by selecting the peer with the most
     /// recent negative reputation event so chronic offenders are preferred over
     /// quiet peers. Returns `None` if `peers` is empty.
-    pub async fn pick_worst<T>(&self, peers: &[(SocketAddr, T)]) -> Option<SocketAddr> {
+    pub(crate) async fn pick_worst<T>(&self, peers: &[(SocketAddr, T)]) -> Option<SocketAddr> {
         if peers.is_empty() {
             return None;
         }
@@ -513,7 +513,7 @@ impl PeerReputationManager {
     /// range `-50..100` maps to weights `1..151`. A floor of 1 keeps zero-rep
     /// and never-seen peers eligible but rare. Banned peers receive weight 0
     /// and are effectively excluded.
-    pub async fn selection_weights<T>(&self, peers: &[(SocketAddr, T)]) -> Vec<u32> {
+    pub(crate) async fn selection_weights<T>(&self, peers: &[(SocketAddr, T)]) -> Vec<u32> {
         let mut reputations = self.reputations.write().await;
         peers
             .iter()
@@ -534,7 +534,10 @@ impl PeerReputationManager {
     /// Remove banned peers from `peers`. Applies decay so a ban that has just
     /// expired is no longer enforced. Returns the surviving subset preserving
     /// the input order.
-    pub async fn filter_unbanned<T>(&self, peers: Vec<(SocketAddr, T)>) -> Vec<(SocketAddr, T)> {
+    pub(crate) async fn filter_unbanned<T>(
+        &self,
+        peers: Vec<(SocketAddr, T)>,
+    ) -> Vec<(SocketAddr, T)> {
         let mut reputations = self.reputations.write().await;
         peers
             .into_iter()
@@ -649,7 +652,7 @@ impl PeerReputationManager {
     /// Record a peer disconnect with its cause. Updates `last_disconnect_reason`
     /// on the peer's reputation entry and appends a `ReputationEvent` so the
     /// event log retains the cause for monitoring.
-    pub async fn record_disconnect(&self, peer: SocketAddr, reason: DisconnectReason) {
+    pub(crate) async fn record_disconnect(&self, peer: SocketAddr, reason: DisconnectReason) {
         {
             let mut reputations = self.reputations.write().await;
             let reputation = reputations.entry(peer).or_default();
