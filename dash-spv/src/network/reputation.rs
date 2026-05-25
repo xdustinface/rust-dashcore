@@ -83,10 +83,8 @@ const MAX_MISBEHAVIOR_SCORE: i32 = 100;
 /// Minimum score (most positive reputation)
 const MIN_MISBEHAVIOR_SCORE: i32 = -50;
 
-/// Offset applied to a peer's score when computing a selection weight: shifts
-/// the `MIN_MISBEHAVIOR_SCORE..MAX_MISBEHAVIOR_SCORE` range so the worst
-/// non-banned peer still receives weight 1 (`-50 + 51 = 1`).
-const REPUTATION_WEIGHT_OFFSET: i32 = 51;
+/// Minimum weight a non-banned peer can receive during weighted peer selection.
+const MIN_SELECTION_WEIGHT: u32 = 1;
 
 const MAX_BAN_COUNT: u32 = 1000;
 
@@ -256,7 +254,8 @@ impl PeerReputation {
 
     /// Check if the peer is currently banned
     pub fn is_banned(&self) -> bool {
-        self.banned_until.is_some_and(|until| Instant::now() < until)
+        self.score >= MAX_MISBEHAVIOR_SCORE
+            || self.banned_until.is_some_and(|until| Instant::now() < until)
     }
 
     /// Get remaining ban time
@@ -292,7 +291,7 @@ impl PeerReputation {
             self.positive_actions += 1;
         }
 
-        let should_ban = self.score >= MAX_MISBEHAVIOR_SCORE && !self.is_banned();
+        let should_ban = self.score >= MAX_MISBEHAVIOR_SCORE && self.banned_until.is_none();
         if should_ban {
             self.banned_until = Some(Instant::now() + BAN_DURATION);
             self.ban_count += 1;
@@ -335,8 +334,8 @@ impl PeerReputation {
             self.last_update = now;
         }
 
-        // Check if ban has expired
-        if self.is_banned() && self.ban_time_remaining().is_none() {
+        // Check if a time-based ban has expired.
+        if self.banned_until.is_some() && self.ban_time_remaining().is_none() {
             self.banned_until = None;
         }
     }
@@ -356,6 +355,7 @@ pub enum DisconnectReason {
     Manual,
     PoolFull,
     Shutdown,
+    RemoteDisconnect,
 }
 
 impl DisconnectReason {
@@ -371,6 +371,7 @@ impl DisconnectReason {
             DisconnectReason::Manual => "manual",
             DisconnectReason::PoolFull => "pool full",
             DisconnectReason::Shutdown => "shutdown",
+            DisconnectReason::RemoteDisconnect => "remote disconnect",
         }
     }
 }
@@ -507,23 +508,23 @@ impl PeerReputationManager {
         tied.into_iter().max_by_key(|addr| latest_negative.get(addr).copied()).or(Some(peers[0].0))
     }
 
-    /// Compute weights for `peers` using `max(1, score + 51)` so the score
-    /// range `-50..100` maps to weights `1..151`. A floor of 1 keeps zero-rep
-    /// and never-seen peers eligible but rare. Banned peers receive weight 0
-    /// and are effectively excluded.
+    /// Compute weights for `peers` so that lower (better) scores yield higher weights.
+    /// Score range `-50..100` maps to weights `150..1`. Unknown peers receive the
+    /// neutral weight (`MAX_MISBEHAVIOR_SCORE - 0 = 100`). Banned peers receive
+    /// weight 0 and are effectively excluded.
     pub(crate) async fn selection_weights<T>(&self, peers: &[(SocketAddr, T)]) -> Vec<u32> {
         let mut reputations = self.reputations.write().await;
         peers
             .iter()
             .map(|(addr, _)| {
                 let Some(rep) = reputations.get_mut(addr) else {
-                    return REPUTATION_WEIGHT_OFFSET.max(1) as u32;
+                    return MAX_MISBEHAVIOR_SCORE as u32;
                 };
                 rep.apply_decay();
                 if rep.is_banned() {
                     0
                 } else {
-                    (rep.score + REPUTATION_WEIGHT_OFFSET).max(1) as u32
+                    (MAX_MISBEHAVIOR_SCORE - rep.score).max(MIN_SELECTION_WEIGHT as i32) as u32
                 }
             })
             .collect()

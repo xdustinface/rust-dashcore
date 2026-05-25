@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::distributions::{Distribution, WeightedIndex};
-use rand::{thread_rng, Rng};
+use rand::thread_rng;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -744,7 +744,7 @@ impl PeerNetworkManager {
                         match e {
                             NetworkError::PeerDisconnected => {
                                 tracing::info!("Peer {} disconnected", addr);
-                                disconnect_reason = Some(DisconnectReason::Timeout);
+                                disconnect_reason = Some(DisconnectReason::RemoteDisconnect);
                                 break;
                             }
                             NetworkError::Timeout => {
@@ -1197,21 +1197,19 @@ impl PeerNetworkManager {
                 .reputation_manager
                 .filter_unbanned(self.pool.peers_with_service(flags).await)
                 .await;
-            match capable.first() {
-                Some((address, peer)) => {
-                    tracing::debug!(
-                        "Selected peer {} with {} for {}",
-                        address,
-                        flags,
-                        message.cmd()
-                    );
-                    (*address, peer.clone())
-                }
-                None if required => {
+            if capable.is_empty() {
+                if required {
                     tracing::warn!("No peers support {}, cannot send {}", flags, message.cmd());
                     return Err(NetworkError::ProtocolError(format!("No peers support {}", flags)));
                 }
-                None => self.next_peer(&peers).await,
+                self.next_peer(&peers).await
+            } else {
+                tracing::debug!(
+                    "Selecting peer with {} for {} (reputation-weighted)",
+                    flags,
+                    message.cmd()
+                );
+                self.next_peer(&capable).await
             }
         } else {
             self.next_peer(&peers).await
@@ -1290,7 +1288,10 @@ impl PeerNetworkManager {
         let mut rng = thread_rng();
         let idx = match WeightedIndex::new(&weights) {
             Ok(dist) => dist.sample(&mut rng),
-            Err(_) => rng.gen_range(0..peers.len()),
+            Err(e) => unreachable!(
+                "selection_weights returned all-zero weights; `filter_unbanned` must be called before `next_peer`: {}",
+                e
+            ),
         };
         (peers[idx].0, peers[idx].1.clone())
     }
@@ -1667,6 +1668,10 @@ impl PeerNetworkManager {
     /// exercising selection paths.
     pub(crate) fn test_reputation_manager(&self) -> &PeerReputationManager {
         &self.reputation_manager
+    }
+
+    pub(crate) async fn test_get_all_peers(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
+        self.pool.get_all_peers().await
     }
 
     /// Test-only wrapper that filters banned peers from the pool then samples
