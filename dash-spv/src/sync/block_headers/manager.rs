@@ -170,8 +170,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
 
     /// Remove `fork_tip_index` entries whose branch no longer exists in the buffer.
     pub(super) fn prune_fork_tip_index(&mut self) {
-        let live_tips: HashSet<BlockHash> =
-            self.fork_buffer.branch_tip_hashes().copied().collect();
+        let live_tips: HashSet<BlockHash> = self.fork_buffer.branch_tip_hashes().copied().collect();
         self.fork_tip_index.retain(|tip, _| live_tips.contains(tip));
     }
 
@@ -265,9 +264,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                     self.ingest_fork(peer, headers, prev_h).await?;
                     return Ok(Vec::new());
                 }
-            } else if let Some(&ancestor_height) =
-                self.fork_tip_index.get(&first.prev_blockhash)
-            {
+            } else if let Some(&ancestor_height) = self.fork_tip_index.get(&first.prev_blockhash) {
                 // prev_blockhash is a fork tip, not on the active chain.
                 // Route continuation batches to the fork buffer using the
                 // same ancestor_height as the first batch.
