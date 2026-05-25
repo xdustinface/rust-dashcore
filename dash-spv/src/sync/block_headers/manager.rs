@@ -23,7 +23,7 @@ use crate::storage::{
 };
 use crate::sync::block_headers::fork_buffer::ForkBuffer;
 use crate::sync::block_headers::HeadersPipeline;
-use crate::sync::reorg::{handle_reorg, ReorgState, ReorgStorages};
+use crate::sync::reorg::{handle_reorg, is_below_chainlock_floor, ReorgState, ReorgStorages};
 use crate::sync::{BlockHeadersProgress, ProgressPercentage, SyncEvent, SyncManager, SyncState};
 use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
@@ -241,7 +241,7 @@ impl<
         // finalized block, so it is still eligible for the normal fork path.
         // The peer is not banned, just observed.
         if let Some(cl_height) = self.best_chainlock_height() {
-            if ancestor_height < cl_height {
+            if is_below_chainlock_floor(ancestor_height, cl_height) {
                 tracing::warn!(
                     "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
                     peer,
@@ -1385,6 +1385,63 @@ mod tests {
             manager.reorg_generation.load(Ordering::Acquire),
             initial_gen,
             "generation must not change on guard rejection"
+        );
+    }
+
+    /// A fork whose ancestor is exactly at the chainlocked height must pass
+    /// the chainlock floor guard (`ancestor_height < cl_height` is false when
+    /// equal) and drive a successful reorg cascade.
+    #[tokio::test]
+    async fn drive_reorg_accepts_candidate_anchored_at_chainlock_height() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+
+        // Chainlock at height 4 — a fork anchored exactly at 4 must be accepted
+        // because it only diverges at height 5 and does not rewrite block 4.
+        manager.chainlock_height.store(4, Ordering::Release);
+
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<crate::types::HashedBlockHeader> = Vec::new();
+        for i in 0..3u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = dashcore::block::Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(crate::types::HashedBlockHeader::from(&h));
+        }
+
+        let candidate = ForkCandidate {
+            ancestor_height: 4,
+            headers: fork_headers,
+            total_work: crate::chain::ChainWork::zero(),
+        };
+
+        let result = manager.drive_reorg(candidate).await.unwrap();
+        assert!(
+            result.is_some(),
+            "fork anchored at chainlocked height must not be rejected by the chainlock floor guard"
+        );
+        assert_eq!(
+            manager.reorg_generation.load(Ordering::Acquire),
+            initial_gen + 1,
+            "generation must be bumped on successful reorg"
         );
     }
 }
