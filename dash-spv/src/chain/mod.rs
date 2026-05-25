@@ -13,6 +13,6 @@ pub mod checkpoints;
 #[cfg(test)]
 mod checkpoint_test;
 
-pub use chain_tip::{ChainTip, ChainTipManager};
+pub use chain_tip::ChainTip;
 pub use chain_work::ChainWork;
 pub use checkpoints::{Checkpoint, CheckpointManager};
