@@ -318,6 +318,45 @@ impl PeerNetworkManager {
                             // Record successful connection
                             reputation_manager.record_successful_connection(addr).await;
 
+                            // If the pool is at capacity, evict the worst-scored peer
+                            // before adding so a fresh candidate with reputation 0 can
+                            // displace a peer whose score has drifted into negative territory.
+                            if pool.peer_count().await >= TARGET_PEERS {
+                                let candidates = pool.get_all_peers().await;
+                                let new_peer_score =
+                                    reputation_manager.get_score(&addr).await;
+                                if let Some(victim) =
+                                    reputation_manager.pick_worst(&candidates).await
+                                {
+                                    let victim_score =
+                                        reputation_manager.get_score(&victim).await;
+                                    if victim_score > new_peer_score {
+                                        tracing::info!(
+                                            "Pool at capacity, evicting peer {} (score {}) for incoming peer {} (score {})",
+                                            victim,
+                                            victim_score,
+                                            addr,
+                                            new_peer_score
+                                        );
+                                        if pool.remove_peer(&victim).await.is_some() {
+                                            Self::notify_peer_removed(
+                                                &pool,
+                                                &victim,
+                                                &connected_peer_count,
+                                                &network_event_sender,
+                                            )
+                                            .await;
+                                            reputation_manager
+                                                .record_disconnect(
+                                                    victim,
+                                                    DisconnectReason::PoolFull,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+
                             // Add to pool
                             if let Err(e) = pool.add_peer(addr, peer).await {
                                 tracing::error!("Failed to add peer to pool: {}", e);

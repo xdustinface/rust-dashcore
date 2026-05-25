@@ -452,6 +452,63 @@ impl PeerReputationManager {
         }
     }
 
+    /// Pick the eviction candidate from `peers`. The codebase scores misbehavior
+    /// upward (higher = worse), so the worst reputation has the highest score.
+    /// Ties at the worst score are broken by selecting the peer with the most
+    /// recent negative reputation event so chronic offenders are preferred over
+    /// quiet peers. Returns `None` if `peers` is empty.
+    pub async fn pick_worst<T>(&self, peers: &[(SocketAddr, T)]) -> Option<SocketAddr> {
+        if peers.is_empty() {
+            return None;
+        }
+
+        let scores: HashMap<SocketAddr, i32> = {
+            let mut reputations = self.reputations.write().await;
+            peers
+                .iter()
+                .map(|(addr, _)| {
+                    let score = reputations
+                        .get_mut(addr)
+                        .map(|rep| {
+                            rep.apply_decay();
+                            rep.score
+                        })
+                        .unwrap_or(0);
+                    (*addr, score)
+                })
+                .collect()
+        };
+
+        let worst_score = *scores.values().max().expect("peers is non-empty");
+        let tied: Vec<SocketAddr> = peers
+            .iter()
+            .filter(|(addr, _)| scores.get(addr).copied().unwrap_or(0) == worst_score)
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        if tied.len() == 1 {
+            return Some(tied[0]);
+        }
+
+        let mut latest_negative: HashMap<SocketAddr, Instant> = HashMap::new();
+        let events = self.recent_events.read().await;
+        for ev in events.iter() {
+            if ev.change > 0 && tied.contains(&ev.peer) {
+                latest_negative
+                    .entry(ev.peer)
+                    .and_modify(|t| {
+                        if ev.timestamp > *t {
+                            *t = ev.timestamp;
+                        }
+                    })
+                    .or_insert(ev.timestamp);
+            }
+        }
+        drop(events);
+
+        tied.into_iter().max_by_key(|addr| latest_negative.get(addr).copied()).or(Some(peers[0].0))
+    }
+
     /// Compute weights for `peers` using `max(1, score + 51)` so the score
     /// range `-50..100` maps to weights `1..151`. A floor of 1 keeps zero-rep
     /// and never-seen peers eligible but rare. Banned peers receive weight 0
