@@ -420,6 +420,7 @@ mod tests {
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
     };
+    use crate::sync::block_headers::fork_buffer::MAX_FORK_HEADERS_PER_PEER;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::network::message::NetworkMessage;
     use dashcore_hashes::Hash;
@@ -940,7 +941,7 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207fffff),
             nonce: 0,
         };
-        let oversized_batch = vec![oversized_header; 4097];
+        let oversized_batch = vec![oversized_header; MAX_FORK_HEADERS_PER_PEER + 1];
 
         let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
         let (sender, _rx) = create_test_request_sender();

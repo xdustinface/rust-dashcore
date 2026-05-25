@@ -25,7 +25,7 @@ use crate::types::HashedBlockHeader;
 const MTP_WINDOW: usize = 11;
 
 /// Cap on simultaneous fork branches buffered per peer to keep memory bounded.
-const MAX_FORK_HEADERS_PER_PEER: usize = 4096;
+pub(super) const MAX_FORK_HEADERS_PER_PEER: usize = 4096;
 
 /// Maximum distinct fork branch tips a single peer may contribute.
 const MAX_BRANCHES_PER_PEER: usize = 16;
@@ -489,6 +489,31 @@ mod tests {
             err
         );
         assert_eq!(buf.len(), MAX_BRANCHES_PER_PEER, "buffer unchanged after rejection");
+    }
+
+    #[test]
+    fn ingest_rejects_chain_discontinuity_with_fork_chain_break() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        // Build a valid fork header but give it a wrong prev_blockhash so
+        // the chain-continuity check fires and returns ForkChainBreak.
+        let wrong_prev = BlockHash::from_slice(&[0xAB; 32]).unwrap();
+        let disconnected_header = easy_header(wrong_prev, 1_700_000_000 + 12 * 600, 0);
+
+        let err = buf
+            .ingest(peer, &[disconnected_header], ancestor_height, ancestor, &active)
+            .expect_err("disconnected chain must be rejected");
+        assert!(
+            matches!(&err, SyncError::ForkChainBreak(_)),
+            "expected ForkChainBreak, got: {:?}",
+            err
+        );
+        assert_eq!(buf.len(), 0);
     }
 
     #[test]
