@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 /// Timeout waiting for unsolicited header messages after a block announcement.
 pub(super) const UNSOLICITED_HEADERS_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum age of a staged fork branch before it is dropped from the buffer.
+pub(super) const FORK_BUFFER_TTL: Duration = Duration::from_secs(60);
+
 #[async_trait]
 impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersManager<H, M> {
     fn identifier(&self) -> ManagerIdentifier {
@@ -95,7 +98,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
         match msg.inner() {
             NetworkMessage::Headers(headers) => {
                 // Always route through pipeline when initialized
-                self.handle_headers_pipeline(headers, requests).await
+                let peer = msg.peer_address();
+                self.handle_headers_pipeline(headers, peer, requests).await
             }
 
             NetworkMessage::Inv(inv) => {
@@ -122,6 +126,22 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
         }
 
         self.pipeline.handle_timeouts();
+        let evicted = self.fork_buffer.expire_stale(FORK_BUFFER_TTL);
+        if evicted > 0 {
+            tracing::debug!("Expired {} stale fork branches", evicted);
+        }
+        if let Some(candidate) = self.take_pending_fork_candidate() {
+            // Phase 3 consumes pending candidates from the sync coordinator.
+            // Until that ships, log them here so an operator can confirm
+            // staged forks are being detected and validated end-to-end.
+            tracing::warn!(
+                "Fork candidate ready (ancestor={} headers={} work_bytes={:?}), \
+                 Phase 3 promotion not yet wired",
+                candidate.ancestor_height,
+                candidate.headers.len(),
+                candidate.total_work.as_bytes()
+            );
+        }
 
         // During initial sync, send more requests and log progress
         if self.state() == SyncState::Syncing {
@@ -195,6 +215,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
                 address,
             } => {
                 self.announced_peers.remove(address);
+                self.fork_buffer.remove_peer(*address);
             }
             NetworkEvent::PeersUpdated {
                 connected_count,

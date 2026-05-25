@@ -9,10 +9,12 @@
 pub mod chain_tip;
 pub mod chain_work;
 pub mod checkpoints;
+pub(crate) mod difficulty;
 
 #[cfg(test)]
 mod checkpoint_test;
 
 pub use chain_tip::ChainTip;
+pub(crate) use chain_tip::ForkCandidate;
 pub use chain_work::ChainWork;
 pub use checkpoints::{Checkpoint, CheckpointManager};

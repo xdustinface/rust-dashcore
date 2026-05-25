@@ -11,17 +11,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::chain::CheckpointManager;
+use crate::chain::{ChainWork, CheckpointManager, ForkCandidate};
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
 use crate::storage::{BlockHeaderStorage, BlockHeaderTip, MetadataStorage};
+use crate::sync::block_headers::fork_buffer::ForkBuffer;
 use crate::sync::block_headers::HeadersPipeline;
 use crate::sync::{BlockHeadersProgress, ProgressPercentage, SyncEvent, SyncManager, SyncState};
 use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
 use dashcore::block::Header;
+use dashcore::consensus::Params;
 use dashcore::network::message_blockdata::Inventory;
-use dashcore::BlockHash;
+use dashcore::{BlockHash, Network};
 use tokio::sync::RwLock;
 
 /// Headers manager for downloading and validating block headers.
@@ -45,6 +47,12 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Peers we've sent a GetHeaders to after sync, so Dash Core knows our tip
     /// and can send us header announcements instead of inv.
     pub(super) announced_peers: HashSet<SocketAddr>,
+    /// Per-peer buffer of fork branches awaiting promotion.
+    pub(super) fork_buffer: ForkBuffer,
+    /// Fork branch that has beaten the active chain on work and is ready for
+    /// Phase 3 to promote. Set inside `handle_headers_pipeline`, taken via
+    /// `take_pending_fork_candidate`.
+    pending_fork_candidate: Option<ForkCandidate>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
@@ -62,6 +70,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         header_storage: Arc<RwLock<H>>,
         metadata_storage: Arc<RwLock<M>>,
         checkpoint_manager: Arc<CheckpointManager>,
+        network: Network,
     ) -> SyncResult<Self> {
         let tip = header_storage
             .read()
@@ -88,7 +97,59 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             pipeline: HeadersPipeline::new(checkpoint_manager),
             pending_announcements: HashMap::new(),
             announced_peers: HashSet::new(),
+            fork_buffer: ForkBuffer::new(Params::new(network)),
+            pending_fork_candidate: None,
         })
+    }
+
+    /// Number of ancestor headers DGW v3 requires to compute next bits.
+    const DGW_HISTORY: u32 = 24;
+
+    /// Consume the fork candidate set by `handle_headers_pipeline` when a
+    /// buffered branch overtook the active chain. Phase 3 (`#140`) calls this
+    /// from the sync coordinator to perform the actual reorg.
+    pub(crate) fn take_pending_fork_candidate(&mut self) -> Option<ForkCandidate> {
+        self.pending_fork_candidate.take()
+    }
+
+    /// Buffer a fork extension whose ancestor is on the active chain at a
+    /// height strictly below the current tip. Sets
+    /// `pending_fork_candidate` when the branch's work overtakes the active
+    /// extension past the ancestor.
+    async fn ingest_fork(
+        &mut self,
+        peer: SocketAddr,
+        headers: &[Header],
+        ancestor_height: u32,
+    ) -> SyncResult<()> {
+        let storage = self.header_storage.read().await;
+        let history_start = ancestor_height.saturating_sub(Self::DGW_HISTORY);
+        let history = storage.load_headers(history_start..ancestor_height + 1).await?;
+        let ancestor = *history.last().ok_or_else(|| {
+            SyncError::Validation(format!("missing ancestor header at height {}", ancestor_height))
+        })?;
+        let tip_height = storage
+            .get_tip_height()
+            .await
+            .ok_or_else(|| SyncError::MissingDependency("no tip height".to_string()))?;
+        let active_extension =
+            storage.load_headers(ancestor_height + 1..tip_height + 1).await?;
+        drop(storage);
+
+        self.fork_buffer.ingest(peer, headers, ancestor_height, ancestor, &history)?;
+
+        let active_extension_work =
+            ChainWork::accumulate(ChainWork::zero(), &active_extension);
+        if let Some(candidate) = self.fork_buffer.take_winning_candidate(active_extension_work) {
+            tracing::info!(
+                "Fork candidate ready for promotion: ancestor={} headers={} (peer {})",
+                candidate.ancestor_height,
+                candidate.headers.len(),
+                peer
+            );
+            self.pending_fork_candidate = Some(candidate);
+        }
+        Ok(())
     }
 
     pub(super) async fn tip(&self) -> SyncResult<BlockHeaderTip> {
@@ -153,12 +214,34 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
     pub(super) async fn handle_headers_pipeline(
         &mut self,
         headers: &[Header],
+        peer: SocketAddr,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
         if !self.pipeline.is_initialized() {
             // Pipeline not initialized (shouldn't happen in normal flow)
             tracing::warn!("Received headers but pipeline not initialized");
             return Ok(vec![]);
+        }
+
+        // Check whether the batch is a fork extension before the pipeline
+        // sees it. A fork extension's `prev_blockhash` is a known active
+        // header whose height is strictly less than our tip.
+        if let Some(first) = headers.first() {
+            let storage = self.header_storage.read().await;
+            let prev_height =
+                storage.get_header_height_by_hash(&first.prev_blockhash).await?;
+            let tip_height = storage
+                .get_tip_height()
+                .await
+                .ok_or_else(|| SyncError::MissingDependency("no tip height".to_string()))?;
+            drop(storage);
+
+            if let Some(prev_h) = prev_height {
+                if prev_h < tip_height {
+                    self.ingest_fork(peer, headers, prev_h).await?;
+                    return Ok(Vec::new());
+                }
+            }
         }
 
         let was_syncing = self.state() == SyncState::Syncing;
@@ -313,9 +396,14 @@ mod tests {
         let genesis = Header::dummy_batch(0..1);
         storage.store_headers(&genesis).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        BlockHeadersManager::new(storage.block_headers(), storage.metadata(), checkpoint_manager)
-            .await
-            .expect("Failed to create BlockHeadersManager")
+        BlockHeadersManager::new(
+            storage.block_headers(),
+            storage.metadata(),
+            checkpoint_manager,
+            Network::Testnet,
+        )
+        .await
+        .expect("Failed to create BlockHeadersManager")
     }
 
     /// Create a manager in synced state with an initialized pipeline.
@@ -381,8 +469,9 @@ mod tests {
         let (sender, mut rx) = create_test_request_sender();
 
         let header = Header::dummy_chain(1, tip_hash).remove(0);
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
 
-        let events = manager.handle_headers_pipeline(&[header], &sender).await.unwrap();
+        let events = manager.handle_headers_pipeline(&[header], peer, &sender).await.unwrap();
 
         // Header should have been stored
         assert_eq!(events.len(), 1);
@@ -492,7 +581,8 @@ mod tests {
         // segment's current_tip_hash to advanced_hash.
         let header = Header::dummy_chain(1, initial_locator).remove(0);
         let advanced_hash = header.block_hash();
-        manager.handle_headers_pipeline(&[header], &requests).await.unwrap();
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        manager.handle_headers_pipeline(&[header], peer, &requests).await.unwrap();
 
         // Drain the follow-up GetHeaders that send_pending issued.
         match rx.try_recv().expect("follow-up GetHeaders not sent") {
@@ -570,6 +660,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lagging_peer_sending_tip_extension_is_not_classified_as_fork() {
+        // A header whose prev_blockhash IS our tip (equal height, not strictly
+        // less) must flow through the normal pipeline path, never the fork
+        // buffer. This guards against treating slow peers (or our own next
+        // block arriving after a catch-up) as a reorg.
+        let mut manager = create_test_manager().await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+
+        manager.pipeline.init(0, tip_hash, 0);
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        let (sender, _rx) = create_test_request_sender();
+        let header = Header::dummy_chain(1, tip_hash).remove(0);
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+
+        let events = manager.handle_headers_pipeline(&[header], peer, &sender).await.unwrap();
+
+        // Extension stored, no fork candidate generated.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SyncEvent::BlockHeadersStored { .. }));
+        assert!(manager.take_pending_fork_candidate().is_none());
+    }
+
+    #[tokio::test]
     async fn test_build_locator_shape_matches_dashd_algorithm() {
         // Build a 10K-block chain in storage and verify the locator follows
         // the dashd algorithm: first 10 entries step back by 1, then the step
@@ -579,10 +695,14 @@ mod tests {
         // First header in dummy_chain has prev = all_zeros (treat as genesis).
         storage.store_headers(&chain).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        let manager =
-            BlockHeadersManager::new(storage.block_headers(), storage.metadata(), checkpoint_manager)
-                .await
-                .unwrap();
+        let manager = BlockHeadersManager::new(
+            storage.block_headers(),
+            storage.metadata(),
+            checkpoint_manager,
+            Network::Testnet,
+        )
+        .await
+        .unwrap();
 
         let locator = manager.build_locator().await.unwrap();
         let tip_height = (chain.len() - 1) as u32;
@@ -638,7 +758,7 @@ mod tests {
         rx.try_recv().unwrap(); // drain the GetHeaders request
 
         // Peer responds with empty headers (same height as us)
-        let events = manager.handle_headers_pipeline(&[], &requests).await.unwrap();
+        let events = manager.handle_headers_pipeline(&[], addr, &requests).await.unwrap();
 
         // No events emitted, no requests sent, tip segment stays complete
         assert!(events.is_empty());

@@ -38,6 +38,11 @@ impl ChainWork {
         }
     }
 
+    /// Sum the per-header work of `headers` onto `base`.
+    pub(crate) fn accumulate(base: ChainWork, headers: &[BlockHeader]) -> ChainWork {
+        headers.iter().fold(base, |acc, h| acc.combine(Self::from_header(h)))
+    }
+
     /// Add two ChainWork values
     pub fn combine(self, other: Self) -> Self {
         let mut result = [0u8; 32];
