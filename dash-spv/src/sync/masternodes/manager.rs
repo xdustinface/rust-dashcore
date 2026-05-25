@@ -1190,6 +1190,10 @@ mod tests {
                 !engine.masternode_lists.contains_key(&120),
                 "engine must be truncated above fork_height=50 even when send fails"
             );
+            assert!(
+                engine.masternode_lists.is_empty(),
+                "no entries survive when all seeded heights are above fork_height=50"
+            );
         }
     }
 }

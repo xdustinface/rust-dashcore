@@ -693,6 +693,43 @@ mod tests {
         assert_eq!(manager.progress.invalid(), 0);
     }
 
+    /// `reset_for_reorg` clears `pending_validation`, so a subsequent
+    /// `on_masternode_ready` cannot re-validate a chainlock that arrived on the
+    /// orphaned branch. This is the phase-ordering invariant documented on
+    /// `reset_for_disconnect`: `ChainReorg → reset_for_reorg` must fire before
+    /// `MasternodeStateUpdated → on_masternode_ready`.
+    #[tokio::test]
+    async fn test_reorg_prevents_stale_pending_validation_from_being_revalidated() {
+        let mut manager = create_test_manager().await;
+
+        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+
+        manager.reset_for_reorg();
+
+        assert!(
+            manager.pending_validation.is_none(),
+            "reset_for_reorg must drop pending_validation from the orphaned branch"
+        );
+        assert!(!manager.masternode_ready);
+
+        let returned = manager.on_masternode_ready().await;
+        assert!(
+            returned.is_none(),
+            "on_masternode_ready must not re-validate a stale chainlock cleared by reorg"
+        );
+        assert_eq!(
+            manager.progress.valid(),
+            0,
+            "no chainlock from the orphaned branch was validated"
+        );
+        assert_eq!(
+            manager.progress.invalid(),
+            0,
+            "dropped chainlock must not be counted as invalid"
+        );
+    }
+
     /// `pending_validation` must survive a disconnect so the cached chainlock
     /// can be re-evaluated after reconnect. `on_masternode_ready` must consume
     /// it on the next ready transition rather than silently discarding it.
@@ -712,13 +749,19 @@ mod tests {
         );
         assert!(!manager.masternode_ready, "masternode_ready must be cleared on disconnect");
 
-        let _ = manager.on_masternode_ready().await;
+        let returned = manager.on_masternode_ready().await;
 
         assert!(
             manager.pending_validation.is_none(),
             "on_masternode_ready must consume pending_validation"
         );
         assert!(manager.masternode_ready);
+        // The empty engine cannot validate the signature, so the chainlock is
+        // counted as invalid and best_chainlock stays None — returned is None.
+        // The invariant is that pending_validation was consumed (not silently
+        // dropped), which is covered by the is_none() assertion above.
+        assert!(returned.is_none());
+        assert_eq!(manager.progress.invalid(), 1);
     }
 
     #[tokio::test]
