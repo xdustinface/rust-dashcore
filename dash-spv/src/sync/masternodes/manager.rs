@@ -1184,5 +1184,12 @@ mod tests {
         assert!(result.is_err(), "expected error when the channel is closed");
         assert_eq!(manager.state(), SyncState::WaitForEvents);
         assert!(manager.sync_state.qrinfo_in_flight.is_none());
+        {
+            let engine = manager.engine.read().await;
+            assert!(
+                !engine.masternode_lists.contains_key(&120),
+                "engine must be truncated above fork_height=50 even when send fails"
+            );
+        }
     }
 }

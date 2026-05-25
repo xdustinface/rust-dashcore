@@ -136,6 +136,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     /// kept: a chainlock that arrived before `masternode_ready` remains valid on
     /// the same chain and must be re-evaluated when `on_masternode_ready` fires
     /// on the next reconnect.
+    ///
+    /// Safety invariant: correctness here relies on header sync always completing
+    /// (and emitting any `ChainReorg` → `reset_for_reorg`) before masternode sync
+    /// emits `MasternodeStateUpdated`. If those phases are ever parallelized, a
+    /// `ChainReorg` check must be added in this path.
     pub(super) fn reset_for_disconnect(&mut self) {
         self.masternode_ready = false;
     }
@@ -686,6 +691,34 @@ mod tests {
         assert!(manager.pending_validation.is_some());
         assert_eq!(manager.progress.valid(), 0);
         assert_eq!(manager.progress.invalid(), 0);
+    }
+
+    /// `pending_validation` must survive a disconnect so the cached chainlock
+    /// can be re-evaluated after reconnect. `on_masternode_ready` must consume
+    /// it on the next ready transition rather than silently discarding it.
+    #[tokio::test]
+    async fn test_pending_validation_survives_disconnect_and_consumed_on_reconnect() {
+        let mut manager = create_test_manager().await;
+
+        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+        assert!(!manager.masternode_ready);
+
+        manager.reset_for_disconnect();
+
+        assert!(
+            manager.pending_validation.is_some(),
+            "pending_validation must not be dropped on disconnect"
+        );
+        assert!(!manager.masternode_ready, "masternode_ready must be cleared on disconnect");
+
+        let _ = manager.on_masternode_ready().await;
+
+        assert!(
+            manager.pending_validation.is_none(),
+            "on_masternode_ready must consume pending_validation"
+        );
+        assert!(manager.masternode_ready);
     }
 
     #[tokio::test]
