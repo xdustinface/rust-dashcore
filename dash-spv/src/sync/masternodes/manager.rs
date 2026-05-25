@@ -605,13 +605,6 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         Ok(vec![])
     }
 
-    /// Returns `true` when the engine holds a masternode list at a height at
-    /// or above `h`. Used by the rewind path to detect whether the masternode
-    /// state has caught up to a target height after a reorg.
-    pub(super) fn is_synced_for_height(&self, h: u32) -> bool {
-        self.sync_state.known_mn_list_heights.iter().next_back().is_some_and(|tip| *tip >= h)
-    }
-
     /// Verify quorums and mark complete.
     ///
     /// For initial sync (state == Syncing), emits MasternodeStateUpdated and logs completion.
@@ -1119,30 +1112,6 @@ mod tests {
         assert_eq!(manager.state(), SyncState::Syncing);
         let queued = rx.try_recv().expect("rewind_to_height must queue a GetQRInfo");
         assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
-    }
-
-    /// `is_synced_for_height` mirrors the engine's notion of "the masternode
-    /// list has caught up to height h". Immediately after a rewind the engine
-    /// tip is below the requested fork height, so the predicate is false;
-    /// after simulating the response by re-inserting a list at the fork height
-    /// (the same effect `MasternodeStateUpdated` carries) it must flip to true.
-    #[tokio::test]
-    async fn test_is_synced_for_height_tracks_engine_state() {
-        let (mut manager, requests, _rx) = make_synced_incremental_manager(120).await;
-        manager.sync_state.known_mn_list_heights.insert(120);
-
-        manager
-            .rewind_to_height(80, BlockHash::from_byte_array([0xCC; 32]), &requests)
-            .await
-            .unwrap();
-        assert!(!manager.is_synced_for_height(80));
-
-        // Simulate the post-rewind QRInfo response settling: the manager's
-        // QRInfo handler is what normally records `known_mn_list_heights`,
-        // mirroring engine state. Re-populate to match.
-        manager.sync_state.known_mn_list_heights.insert(80);
-        assert!(manager.is_synced_for_height(80));
-        assert!(!manager.is_synced_for_height(81));
     }
 
     /// A `SyncEvent::ChainReorg` delivered to `handle_sync_event` must invoke
