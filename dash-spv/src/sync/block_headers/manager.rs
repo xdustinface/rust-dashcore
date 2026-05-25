@@ -214,6 +214,10 @@ impl<
     /// Number of ancestor headers DGW v3 requires to compute next bits.
     const DGW_HISTORY: u32 = 24;
 
+    /// Maximum number of entries kept in `side_headers`. Oldest entries are
+    /// evicted when the cap is reached to bound memory usage.
+    const MAX_SIDE_HEADERS: usize = 10_000;
+
     /// Consume the fork candidate set when a buffered branch overtook the
     /// active chain. The sync coordinator calls this to perform the actual reorg.
     pub(crate) fn take_pending_fork_candidate(&mut self) -> Option<ForkCandidate> {
@@ -228,18 +232,28 @@ impl<
         headers: &[Header],
         ancestor_height: u32,
     ) -> SyncResult<()> {
-        // Accept-and-flag: a fork whose ancestor is at or below the best
-        // chainlock height cannot become canonical, so route the headers to
-        // a side-list for monitoring instead of pulling them through the
-        // fork buffer. The peer is not banned, just observed.
+        // Accept-and-flag: a fork whose ancestor is strictly below the best
+        // chainlock height rewrites at least one finalised block and cannot
+        // become canonical, so route the headers to a side-list for monitoring
+        // instead of pulling them through the fork buffer. A fork that shares
+        // the chainlocked block as its last common ancestor (ancestor_height ==
+        // cl_height) diverges at cl_height+1 and does not rewrite any
+        // finalized block, so it is still eligible for the normal fork path.
+        // The peer is not banned, just observed.
         if let Some(cl_height) = self.best_chainlock_height() {
-            if ancestor_height <= cl_height {
+            if ancestor_height < cl_height {
                 tracing::warn!(
                     "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
                     peer,
                     ancestor_height,
                     cl_height
                 );
+                let incoming = headers.len();
+                let cap = Self::MAX_SIDE_HEADERS;
+                if self.side_headers.len() + incoming > cap {
+                    let excess = (self.side_headers.len() + incoming).saturating_sub(cap);
+                    self.side_headers.drain(..excess);
+                }
                 for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
                     self.side_headers.push((height, h.block_hash()));
                 }
@@ -1293,5 +1307,82 @@ mod tests {
         let new_tip = manager.tip().await.unwrap();
         assert_eq!(new_tip.height(), 7);
         assert_eq!(*new_tip.hash(), new_tip_hash);
+
+        // Verify the old-chain headers at the reorged heights are gone and the
+        // fork headers now occupy those slots.
+        let storage = manager.header_storage.read().await;
+        let old_hashes: Vec<BlockHash> = chain[5..].iter().map(|h| h.block_hash()).collect();
+        for old_hash in &old_hashes {
+            let height_opt = storage.get_header_height_by_hash(old_hash).await.unwrap();
+            assert!(
+                height_opt.is_none(),
+                "old-chain header {} should not be indexed after reorg",
+                old_hash
+            );
+        }
+        for (i, fork_h) in fork_headers.iter().enumerate() {
+            let stored = storage.get_header(5 + i as u32).await.unwrap();
+            assert!(stored.is_some(), "fork header at height {} must be stored", 5 + i as u32);
+            assert_eq!(
+                stored.unwrap().block_hash(),
+                fork_h.block_hash(),
+                "stored header at height {} must match fork header",
+                5 + i as u32
+            );
+        }
+    }
+
+    /// `drive_reorg` must return `Ok(None)` when a guard rejects the candidate
+    /// without panicking or looping. Uses the chainlock floor guard: ancestor
+    /// strictly below the best chainlock height is denied.
+    #[tokio::test]
+    async fn drive_reorg_returns_none_when_guard_rejects_candidate() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+
+        // Set chainlock at height 6 so a fork whose ancestor is at height 4 is
+        // below the floor and must be rejected.
+        manager.chainlock_height.store(6, Ordering::Release);
+
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<crate::types::HashedBlockHeader> = Vec::new();
+        for i in 0..2u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = dashcore::block::Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(crate::types::HashedBlockHeader::from(&h));
+        }
+
+        let candidate = ForkCandidate {
+            ancestor_height: 4,
+            headers: fork_headers,
+            total_work: crate::chain::ChainWork::zero(),
+        };
+
+        let result = manager.drive_reorg(candidate).await.unwrap();
+        assert!(result.is_none(), "guard-rejected candidate must return None");
+        assert_eq!(
+            manager.reorg_generation.load(Ordering::Acquire),
+            initial_gen,
+            "generation must not change on guard rejection"
+        );
     }
 }
