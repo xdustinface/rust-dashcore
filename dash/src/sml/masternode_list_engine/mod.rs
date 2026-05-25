@@ -257,6 +257,17 @@ impl MasternodeListEngineBlockContainer {
             MasternodeListEngineBlockContainer::BTreeMapContainer(map) => map.block_hashes.len(),
         }
     }
+
+    /// Drops every entry strictly above `height`. Both the height-keyed and
+    /// hash-keyed maps stay in sync.
+    pub(crate) fn truncate_above(&mut self, height: CoreBlockHeight) {
+        match self {
+            MasternodeListEngineBlockContainer::BTreeMapContainer(map) => {
+                map.block_hashes.retain(|h, _| *h <= height);
+                map.block_heights.retain(|_, h| *h <= height);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1446,6 +1457,36 @@ impl MasternodeListEngine {
 
         Ok(())
     }
+
+    /// Drops every piece of cached state whose anchor sits strictly above
+    /// `height`. Hash-keyed caches (`known_snapshots`, `rotated_quorums_per_cycle`)
+    /// resolve their anchor through `block_container`. A hash with no known
+    /// height is treated as orphaned and dropped: an entry whose anchor block
+    /// is gone cannot be verified or referenced safely after a reorg. The
+    /// height set inside each `quorum_statuses` entry is filtered in place and
+    /// the entry is dropped when no heights remain at or below `height`.
+    /// `block_container` is trimmed last so the hash lookups above still work.
+    pub fn truncate_above(&mut self, height: CoreBlockHeight) {
+        self.masternode_lists.retain(|h, _| *h <= height);
+
+        self.known_snapshots.retain(|block_hash, _| {
+            self.block_container.get_height(block_hash).is_some_and(|h| h <= height)
+        });
+
+        self.rotated_quorums_per_cycle.retain(|cycle_hash, _| {
+            self.block_container.get_height(cycle_hash).is_some_and(|h| h <= height)
+        });
+
+        for inner in self.quorum_statuses.values_mut() {
+            inner.retain(|_, (heights, _, _)| {
+                heights.retain(|h| *h <= height);
+                !heights.is_empty()
+            });
+        }
+        self.quorum_statuses.retain(|_, inner| !inner.is_empty());
+
+        self.block_container.truncate_above(height);
+    }
 }
 
 #[cfg(test)]
@@ -1473,7 +1514,7 @@ mod tests {
     };
     #[cfg(feature = "quorum_validation")]
     use crate::sml::quorum_validation_error::QuorumValidationError;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[cfg(feature = "quorum_validation")]
     use {
@@ -1482,6 +1523,7 @@ mod tests {
         crate::QuorumHash,
         crate::bls_sig_utils::{BLSPublicKey, BLSSignature},
         crate::hash_types::QuorumVVecHash,
+        crate::network::message_qrinfo::{MNSkipListMode, QuorumSnapshot},
         crate::transaction::special_transaction::quorum_commitment::QuorumEntry,
     };
 
@@ -2088,5 +2130,120 @@ mod tests {
             !engine.rotated_quorums_per_cycle.contains_key(&fresh_key),
             "gate must not write a degraded cycle"
         );
+    }
+
+    /// `truncate_above` is the engine's reorg rewind primitive: anything anchored
+    /// strictly above the fork height must be dropped, anything at or below must
+    /// be retained, and the second invocation with the same argument must be a
+    /// no-op. Without idempotence a coordinator that re-fires the cascade would
+    /// risk losing already-trimmed data.
+    #[cfg(feature = "quorum_validation")]
+    #[test]
+    fn truncate_above_drops_state_above_target_and_is_idempotent() {
+        let mut engine = MasternodeListEngine::default_for_network(Network::Regtest);
+
+        let h_low: CoreBlockHeight = 100;
+        let h_mid: CoreBlockHeight = 200;
+        let h_high: CoreBlockHeight = 300;
+
+        let hash_low = BlockHash::from_byte_array([0x01; 32]);
+        let hash_mid = BlockHash::from_byte_array([0x02; 32]);
+        let hash_high = BlockHash::from_byte_array([0x03; 32]);
+
+        engine.block_container.feed_block_height(h_low, hash_low);
+        engine.block_container.feed_block_height(h_mid, hash_mid);
+        engine.block_container.feed_block_height(h_high, hash_high);
+
+        engine.masternode_lists.insert(h_low, MasternodeList::empty(hash_low, h_low));
+        engine.masternode_lists.insert(h_mid, MasternodeList::empty(hash_mid, h_mid));
+        engine.masternode_lists.insert(h_high, MasternodeList::empty(hash_high, h_high));
+
+        // Rotation cycles keyed by block hash so the hash to height lookup is
+        // load-bearing for trimming. `LlmqtypeTest` has `active_quorum_count
+        // == 2`, so build a 2-entry cycle map matching what the engine would
+        // store for the test type.
+        let rotation_type = LLMQType::LlmqtypeTest;
+        engine
+            .rotated_quorums_per_cycle
+            .insert(hash_mid, build_cycle_quorum_map_for_test(rotation_type, 0..2));
+        engine
+            .rotated_quorums_per_cycle
+            .insert(hash_high, build_cycle_quorum_map_for_test(rotation_type, 0..2));
+
+        // An orphaned cycle hash (not in `block_container`) must be dropped
+        // conservatively: cannot reason about its height anymore.
+        let orphan_hash = BlockHash::from_byte_array([0xEE; 32]);
+        engine
+            .rotated_quorums_per_cycle
+            .insert(orphan_hash, build_cycle_quorum_map_for_test(rotation_type, 0..2));
+
+        let make_snapshot = || QuorumSnapshot {
+            skip_list_mode: MNSkipListMode::NoSkipping,
+            active_quorum_members: vec![],
+            skip_list: vec![],
+        };
+        engine.known_snapshots.insert(hash_mid, make_snapshot());
+        engine.known_snapshots.insert(hash_high, make_snapshot());
+
+        let q_hash = QuorumHash::from_byte_array([0xAA; 32]);
+        engine.quorum_statuses.entry(rotation_type).or_default().insert(
+            q_hash,
+            (
+                BTreeSet::from([h_low, h_mid, h_high]),
+                BLSPublicKey::from([0; 48]),
+                LLMQEntryVerificationStatus::Unknown,
+            ),
+        );
+
+        engine.truncate_above(h_mid);
+
+        assert!(engine.masternode_lists.contains_key(&h_low));
+        assert!(engine.masternode_lists.contains_key(&h_mid));
+        assert!(
+            !engine.masternode_lists.contains_key(&h_high),
+            "masternode_lists above target must be dropped"
+        );
+
+        assert!(engine.rotated_quorums_per_cycle.contains_key(&hash_mid));
+        assert!(
+            !engine.rotated_quorums_per_cycle.contains_key(&hash_high),
+            "rotated_quorums_per_cycle entries whose hash maps to height > target must be dropped"
+        );
+        assert!(
+            !engine.rotated_quorums_per_cycle.contains_key(&orphan_hash),
+            "orphaned cycle hashes (no known height) must be dropped"
+        );
+
+        assert!(engine.known_snapshots.contains_key(&hash_mid));
+        assert!(!engine.known_snapshots.contains_key(&hash_high));
+
+        let heights = &engine.quorum_statuses[&rotation_type][&q_hash].0;
+        assert_eq!(*heights, BTreeSet::from([h_low, h_mid]));
+
+        assert!(engine.block_container.contains_height(&h_mid));
+        assert!(!engine.block_container.contains_height(&h_high));
+        assert!(!engine.block_container.contains_hash(&hash_high));
+
+        let snapshot_after = (
+            engine.masternode_lists.clone(),
+            engine.rotated_quorums_per_cycle.clone(),
+            engine.known_snapshots.clone(),
+            engine.quorum_statuses.clone(),
+        );
+        engine.truncate_above(h_mid);
+        assert_eq!(engine.masternode_lists, snapshot_after.0);
+        assert_eq!(engine.rotated_quorums_per_cycle, snapshot_after.1);
+        assert_eq!(engine.known_snapshots, snapshot_after.2);
+        assert_eq!(engine.quorum_statuses, snapshot_after.3);
+    }
+
+    #[cfg(feature = "quorum_validation")]
+    fn build_cycle_quorum_map_for_test(
+        rotation_type: LLMQType,
+        indices: std::ops::Range<i16>,
+    ) -> BTreeMap<u16, QualifiedQuorumEntry> {
+        let entries: Vec<QualifiedQuorumEntry> =
+            indices.map(|i| make_qualified_quorum_entry(rotation_type, Some(i))).collect();
+        build_cycle_quorum_map(entries, rotation_type).expect("build cycle map")
     }
 }
