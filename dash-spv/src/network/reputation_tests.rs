@@ -528,7 +528,7 @@ mod tests {
 
         let events = manager.get_recent_events().await;
         let event = events.iter().rev().find(|e| e.peer == peer).expect("disconnect event present");
-        assert_eq!(event.disconnect_reason, Some(DisconnectReason::PingTimeout));
+        assert!(event.reason.contains("ping timeout"), "event reason must name the cause");
     }
 
     #[tokio::test]

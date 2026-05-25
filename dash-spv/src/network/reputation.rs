@@ -382,7 +382,6 @@ pub struct ReputationEvent {
     pub change: i32,
     pub reason: String,
     pub timestamp: Instant,
-    pub(crate) disconnect_reason: Option<DisconnectReason>,
 }
 
 /// Peer reputation manager
@@ -431,7 +430,6 @@ impl PeerReputationManager {
             change: score_change,
             reason: reason.to_string(),
             timestamp: Instant::now(),
-            disconnect_reason: None,
         };
 
         drop(reputations); // Release lock before recording event
@@ -642,7 +640,6 @@ impl PeerReputationManager {
             change: score_change,
             reason: reason.to_string(),
             timestamp: Instant::now(),
-            disconnect_reason: None,
         };
         self.record_event(event).await;
 
@@ -664,7 +661,6 @@ impl PeerReputationManager {
             change: 0,
             reason: format!("disconnect: {}", reason.as_str()),
             timestamp: Instant::now(),
-            disconnect_reason: Some(reason),
         };
         self.record_event(event).await;
     }
