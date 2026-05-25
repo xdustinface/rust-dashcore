@@ -78,6 +78,20 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         event: &SyncEvent,
         _requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                "ChainLockManager: cascading ChainReorg, hard-blocking validation"
+            );
+            self.masternode_ready = false;
+            self.pending_validation = None;
+            return Ok(vec![]);
+        }
+
         // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
         // update; the work below is strictly one-shot startup work, so
         // gate the entire branch on the not-ready transition. Also drop

@@ -48,7 +48,7 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// not-ready → ready transition (see [`Self::on_masternode_ready`])
     /// so we don't lose a chainlock that landed during the gap between
     /// the chainlock manager starting and masternode sync completing.
-    pending_validation: Option<ChainLock>,
+    pub(super) pending_validation: Option<ChainLock>,
     /// Shared snapshot of the best validated chainlock height. `0` means
     /// "no chainlock observed yet". Read by `BlockHeadersManager` as the
     /// floor for the reorg cascade.
@@ -639,6 +639,43 @@ mod tests {
             let restored = manager.best_chainlock().expect("chainlock should be restored");
             assert_eq!(restored.block_height, 200);
         }
+    }
+
+    /// `ChainReorg` hard-blocks CL validation by flipping `masternode_ready`
+    /// back to `false` and dropping any `pending_validation`. After the
+    /// cascade, an incoming chainlock must take the pre-ready path again
+    /// (cached in `pending_validation`, not validated), waiting for the next
+    /// `MasternodeStateUpdated` to retry.
+    #[tokio::test]
+    async fn test_chain_reorg_hard_blocks_chainlock_validation() {
+        use crate::network::RequestSender;
+        use crate::sync::SyncEvent;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let mut manager = create_test_manager().await;
+        let _ = manager.on_masternode_ready().await;
+        manager.pending_validation = Some(create_test_chainlock(123));
+        assert!(manager.masternode_ready);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::all_zeros(),
+            new_tip: BlockHash::all_zeros(),
+            generation: 1,
+        };
+        manager.handle_sync_event(&event, &requests).await.expect("handle_sync_event succeeds");
+
+        assert!(!manager.masternode_ready, "ChainReorg must flip masternode_ready back to false");
+        assert!(manager.pending_validation.is_none(), "ChainReorg must drop pending_validation");
+
+        // A new chainlock arriving while the cascade is active must be cached
+        // for validation once masternode sync catches up, not validated.
+        let _ = manager.process_chainlock(&create_test_chainlock(150)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+        assert_eq!(manager.progress.valid(), 0);
+        assert_eq!(manager.progress.invalid(), 0);
     }
 
     #[tokio::test]
