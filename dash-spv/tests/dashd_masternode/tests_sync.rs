@@ -577,7 +577,8 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
         create_mn_test_config(ctx.storage_path().to_path_buf(), ctx.mn_ctx.controller_addr);
     let mut client_handle = create_and_start_client(&config, Arc::clone(&wallet)).await;
 
-    let initial = wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    let initial =
+        wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
     assert_eq!(initial.state(), SyncState::Synced);
     let synced_height = initial.current_height();
     tracing::info!("Initial sync complete at height {}", synced_height);
@@ -585,9 +586,12 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
     // Mine a few blocks so the SPV records masternode lists above the
     // upcoming fork point, then orchestrate a reorg of depth 3.
     ctx.mn_ctx.move_blocks(5);
-    let mid =
-        wait_for_mn_state_event_above(&mut client_handle.sync_event_receiver, synced_height, SYNC_TIMEOUT)
-            .await;
+    let mid = wait_for_mn_state_event_above(
+        &mut client_handle.sync_event_receiver,
+        synced_height,
+        SYNC_TIMEOUT,
+    )
+    .await;
     tracing::info!("Pre-reorg masternode tip at height {}", mid);
 
     let reorg_depth = 3;
@@ -599,7 +603,10 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
 
     let (observed_fork, _new_tip) =
         wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, SYNC_TIMEOUT).await;
-    assert_eq!(observed_fork, fork_height, "ChainReorg fork height should match orchestrated reorg");
+    assert_eq!(
+        observed_fork, fork_height,
+        "ChainReorg fork height should match orchestrated reorg"
+    );
 
     // Confirm the engine actually dropped state above the fork before the
     // post-rewind QRInfo response refills it. This is the rewind primitive

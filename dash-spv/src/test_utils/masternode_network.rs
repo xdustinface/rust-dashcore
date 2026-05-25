@@ -304,7 +304,12 @@ impl MasternodeTestContext {
             .try_rpc_call("getblockcount", &[])
             .and_then(|v| v.as_u64())
             .expect("getblockcount on controller") as u32;
-        assert!(tip_height >= depth, "controller tip {} is below reorg depth {}", tip_height, depth);
+        assert!(
+            tip_height >= depth,
+            "controller tip {} is below reorg depth {}",
+            tip_height,
+            depth
+        );
 
         let first_invalidate_height = tip_height - depth + 1;
         let mut orphaned = Vec::with_capacity(depth as usize);
