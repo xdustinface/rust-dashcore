@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::{thread_rng, Rng};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -77,8 +80,6 @@ pub struct PeerNetworkManager {
     request_tx: UnboundedSender<NetworkRequest>,
     /// Request queue receiver (consumed by send loop).
     request_rx: Arc<Mutex<Option<UnboundedReceiver<NetworkRequest>>>>,
-    /// Round-robin counter for distributing requests across peers.
-    round_robin_counter: Arc<AtomicUsize>,
     /// Network event bus for notifying about network/peer related changes.
     network_event_sender: broadcast::Sender<NetworkEvent>,
 }
@@ -137,7 +138,6 @@ impl PeerNetworkManager {
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
             request_tx,
             request_rx: Arc::new(Mutex::new(Some(request_rx))),
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
             network_event_sender: broadcast::Sender::new(DEFAULT_NETWORK_EVENT_CAPACITY),
         })
     }
@@ -1243,12 +1243,22 @@ impl PeerNetworkManager {
         self.send_message_to_peer(&addr, &peer, message).await
     }
 
-    /// Pick the next peer from `peers` using round-robin rotation.
+    /// Pick a peer from `peers` weighted by reputation. Weights come from
+    /// `PeerReputationManager::selection_weights` and use `max(1, score + 51)`
+    /// so the worst non-banned peer still has weight 1 and the best
+    /// `MAX_MISBEHAVIOR_SCORE = 100` peer has weight 151. Falls back to a
+    /// uniform random choice if all weights are zero (e.g. every candidate is
+    /// banned), which keeps the caller from blocking on selection.
     async fn next_peer(
         &self,
         peers: &[(SocketAddr, Arc<RwLock<Peer>>)],
     ) -> (SocketAddr, Arc<RwLock<Peer>>) {
-        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % peers.len();
+        let weights = self.reputation_manager.selection_weights(peers).await;
+        let mut rng = thread_rng();
+        let idx = match WeightedIndex::new(&weights) {
+            Ok(dist) => dist.sample(&mut rng),
+            Err(_) => rng.gen_range(0..peers.len()),
+        };
         (peers[idx].0, peers[idx].1.clone())
     }
 
@@ -1459,7 +1469,6 @@ impl Clone for PeerNetworkManager {
             message_dispatcher: self.message_dispatcher.clone(),
             request_tx: self.request_tx.clone(),
             request_rx: self.request_rx.clone(),
-            round_robin_counter: self.round_robin_counter.clone(),
             network_event_sender: self.network_event_sender.clone(),
         }
     }
@@ -1583,7 +1592,6 @@ impl PeerNetworkManager {
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
             request_tx,
             request_rx: Arc::new(Mutex::new(Some(request_rx))),
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
             network_event_sender: broadcast::Sender::new(DEFAULT_NETWORK_EVENT_CAPACITY),
         }
     }

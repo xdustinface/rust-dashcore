@@ -83,6 +83,11 @@ const MAX_MISBEHAVIOR_SCORE: i32 = 100;
 /// Minimum score (most positive reputation)
 const MIN_MISBEHAVIOR_SCORE: i32 = -50;
 
+/// Offset applied to a peer's score when computing a selection weight: shifts
+/// the `MIN_MISBEHAVIOR_SCORE..MAX_MISBEHAVIOR_SCORE` range so the worst
+/// non-banned peer still receives weight 1 (`-50 + 51 = 1`).
+const REPUTATION_WEIGHT_OFFSET: i32 = 51;
+
 const MAX_BAN_COUNT: u32 = 1000;
 
 const MAX_ACTION_COUNT: u64 = 1_000_000;
@@ -445,6 +450,28 @@ impl PeerReputationManager {
             let drain_count = events.len() - self.max_events;
             events.drain(0..drain_count);
         }
+    }
+
+    /// Compute weights for `peers` using `max(1, score + 51)` so the score
+    /// range `-50..100` maps to weights `1..151`. A floor of 1 keeps zero-rep
+    /// and never-seen peers eligible but rare. Banned peers receive weight 0
+    /// and are effectively excluded.
+    pub async fn selection_weights<T>(&self, peers: &[(SocketAddr, T)]) -> Vec<u32> {
+        let mut reputations = self.reputations.write().await;
+        peers
+            .iter()
+            .map(|(addr, _)| {
+                let Some(rep) = reputations.get_mut(addr) else {
+                    return REPUTATION_WEIGHT_OFFSET.max(1) as u32;
+                };
+                rep.apply_decay();
+                if rep.is_banned() {
+                    0
+                } else {
+                    (rep.score + REPUTATION_WEIGHT_OFFSET).max(1) as u32
+                }
+            })
+            .collect()
     }
 
     /// Remove banned peers from `peers`. Applies decay so a ban that has just
