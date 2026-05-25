@@ -1165,4 +1165,25 @@ mod tests {
         let queued = rx.try_recv().expect("ChainReorg must queue a GetQRInfo");
         assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
     }
+
+    /// When `send_qrinfo_for_tip` fails inside `rewind_to_height` (e.g. the
+    /// channel receiver is dropped), the manager must transition to
+    /// `WaitForEvents` rather than staying in `Syncing`, and must leave no
+    /// in-flight marker so the next `BlockHeaderSyncComplete` can retry.
+    #[tokio::test]
+    async fn test_rewind_to_height_sets_wait_for_events_on_send_failure() {
+        let (mut manager, requests, rx) = make_synced_incremental_manager(120).await;
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+        drop(rx);
+
+        let result = manager
+            .rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests)
+            .await;
+        assert!(result.is_err(), "expected error when the channel is closed");
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+        assert!(manager.sync_state.qrinfo_in_flight.is_none());
+    }
 }
