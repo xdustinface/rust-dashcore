@@ -73,9 +73,7 @@ pub(crate) fn next_work_required_dgw_v3(
     let actual = (last.time as i64 - first.time as i64).max(0) as u64;
     let target_timespan = (DGW_PAST_BLOCKS as u64) * params.pow_target_spacing;
 
-    let actual_clamped = actual
-        .max(target_timespan / 3)
-        .min(target_timespan.saturating_mul(3));
+    let actual_clamped = actual.max(target_timespan / 3).min(target_timespan.saturating_mul(3));
 
     let scaled = past_target_avg.mul_u64(actual_clamped);
     let mut bn_new = scaled.div_u64(target_timespan);
@@ -210,7 +208,6 @@ impl U256 {
             limbs: out,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -245,9 +242,8 @@ mod tests {
     #[test]
     fn pow_limit_returned_for_regtest_no_retargeting() {
         let params = Params::new(Network::Regtest);
-        let window: Vec<Header> = (0..DGW_PAST_BLOCKS)
-            .map(|i| synthetic_header(0x1d00ffff, 100 + i * 150))
-            .collect();
+        let window: Vec<Header> =
+            (0..DGW_PAST_BLOCKS).map(|i| synthetic_header(0x1d00ffff, 100 + i * 150)).collect();
         let bits = next_work_required_dgw_v3(&window, 100, &params);
         assert_eq!(bits, pow_limit_compact(&params));
     }
@@ -275,8 +271,7 @@ mod tests {
         );
         // The expected factor is 23/24, so the new target should be at least 90% of the old.
         // We bound via a scaled comparison: in_target * 9 / 10 < next_target < in_target.
-        let scaled_floor =
-            U256::from_be_bytes(in_target.to_be_bytes()).mul_u64(9).div_u64(10);
+        let scaled_floor = U256::from_be_bytes(in_target.to_be_bytes()).mul_u64(9).div_u64(10);
         let next_u = U256::from_be_bytes(next_target.to_be_bytes());
         assert!(
             next_u > scaled_floor,

@@ -168,11 +168,7 @@ impl ForkBuffer {
         &mut self,
         active_extension_work: ChainWork,
     ) -> Option<ForkCandidate> {
-        let winner_key = self
-            .branches
-            .iter()
-            .max_by_key(|(_, b)| b.total_work)
-            .map(|(k, _)| *k)?;
+        let winner_key = self.branches.iter().max_by_key(|(_, b)| b.total_work).map(|(k, _)| *k)?;
         let branch = self.branches.remove(&winner_key)?;
         if branch.total_work <= active_extension_work {
             // Not a winner. Put it back to give future ingests a chance to

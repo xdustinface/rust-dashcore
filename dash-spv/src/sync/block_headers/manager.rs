@@ -128,14 +128,12 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             .get_tip_height()
             .await
             .ok_or_else(|| SyncError::MissingDependency("no tip height".to_string()))?;
-        let active_extension =
-            storage.load_headers(ancestor_height + 1..tip_height + 1).await?;
+        let active_extension = storage.load_headers(ancestor_height + 1..tip_height + 1).await?;
         drop(storage);
 
         self.fork_buffer.ingest(peer, headers, ancestor_height, ancestor, &history)?;
 
-        let active_extension_work =
-            ChainWork::accumulate(ChainWork::zero(), &active_extension);
+        let active_extension_work = ChainWork::accumulate(ChainWork::zero(), &active_extension);
         if let Some(candidate) = self.fork_buffer.take_winning_candidate(active_extension_work) {
             tracing::info!(
                 "Fork candidate ready for promotion: ancestor={} headers={} (peer {})",
@@ -224,8 +222,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         // header whose height is strictly less than our tip.
         if let Some(first) = headers.first() {
             let storage = self.header_storage.read().await;
-            let prev_height =
-                storage.get_header_height_by_hash(&first.prev_blockhash).await?;
+            let prev_height = storage.get_header_height_by_hash(&first.prev_blockhash).await?;
             let tip_height = storage
                 .get_tip_height()
                 .await
