@@ -718,6 +718,10 @@ mod tests {
             returned.is_none(),
             "on_masternode_ready must not re-validate a stale chainlock cleared by reorg"
         );
+        assert!(
+            manager.masternode_ready,
+            "on_masternode_ready must set masternode_ready=true even when pending_validation is None"
+        );
         assert_eq!(
             manager.progress.valid(),
             0,

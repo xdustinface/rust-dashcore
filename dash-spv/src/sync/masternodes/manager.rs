@@ -1175,6 +1175,7 @@ mod tests {
         let (mut manager, requests, rx) = make_synced_incremental_manager(120).await;
         {
             let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(30, MasternodeList::empty(anchor_hash(30), 30));
             engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
         }
         drop(rx);
@@ -1187,12 +1188,12 @@ mod tests {
         {
             let engine = manager.engine.read().await;
             assert!(
-                !engine.masternode_lists.contains_key(&120),
-                "engine must be truncated above fork_height=50 even when send fails"
+                engine.masternode_lists.contains_key(&30),
+                "entry below fork_height=50 must survive truncation even when send fails"
             );
             assert!(
-                engine.masternode_lists.is_empty(),
-                "no entries survive when all seeded heights are above fork_height=50"
+                !engine.masternode_lists.contains_key(&120),
+                "entry above fork_height=50 must be dropped even when send fails"
             );
         }
     }
