@@ -9,7 +9,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use dash_spv::client::{ClientConfig, DashSpvClient};
-use dash_spv::network::PeerNetworkManager;
+use dash_spv::network::{DisconnectReason, PeerNetworkManager};
 use dash_spv::storage::DiskStorageManager;
 use dash_spv::types::ValidationMode;
 use dashcore::Network;
@@ -168,7 +168,7 @@ async fn test_peer_disconnection() {
     let test_addr: SocketAddr = "127.0.0.1:19899".parse().unwrap();
 
     // Try to disconnect (will fail if not connected, but tests the API)
-    match client.disconnect_peer(&test_addr, "Test disconnection").await {
+    match client.disconnect_peer(&test_addr, DisconnectReason::Manual).await {
         Ok(_) => println!("Disconnected peer {}", test_addr),
         Err(e) => println!("Expected error disconnecting non-existent peer: {}", e),
     }

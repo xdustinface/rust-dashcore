@@ -17,7 +17,7 @@ use crate::network::constants::*;
 use crate::network::discovery::DnsDiscovery;
 use crate::network::pool::PeerPool;
 use crate::network::reputation::{
-    misbehavior_scores, positive_scores, PeerReputationManager, ReputationAware,
+    misbehavior_scores, positive_scores, DisconnectReason, PeerReputationManager, ReputationAware,
 };
 use crate::network::{
     HandshakeManager, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
@@ -299,6 +299,9 @@ impl PeerNetworkManager {
                                 )
                                 .await;
                                 pool.remove_peer(&addr).await;
+                                reputation_manager
+                                    .record_disconnect(addr, DisconnectReason::CapabilityMismatch)
+                                    .await;
                                 return;
                             }
                             tracing::info!("Successfully connected to {}", addr);
@@ -366,6 +369,9 @@ impl PeerNetworkManager {
                                     "Handshake failed",
                                 )
                                 .await;
+                            reputation_manager
+                                .record_disconnect(addr, DisconnectReason::HandshakeFailure)
+                                .await;
                             // For handshake failures, try again later
                             tokio::time::sleep(RECONNECT_DELAY).await;
                         }
@@ -381,6 +387,9 @@ impl PeerNetworkManager {
                             misbehavior_scores::TIMEOUT / 2,
                             "Connection failed",
                         )
+                        .await;
+                    reputation_manager
+                        .record_disconnect(addr, DisconnectReason::Timeout)
                         .await;
                 }
             }
@@ -443,6 +452,7 @@ impl PeerNetworkManager {
             tracing::debug!("Starting peer reader loop for {}", addr);
             let mut loop_iteration = 0;
             let mut headers2_state = CompressionState::default();
+            let mut disconnect_reason: Option<DisconnectReason> = None;
 
             loop {
                 loop_iteration += 1;
@@ -450,6 +460,7 @@ impl PeerNetworkManager {
                 // Check shutdown signal first with detailed logging
                 if shutdown_token.is_cancelled() {
                     tracing::info!("Breaking peer reader loop for {} - shutdown signal received (iteration {})", addr, loop_iteration);
+                    disconnect_reason = Some(DisconnectReason::Shutdown);
                     break;
                 }
 
@@ -469,6 +480,7 @@ impl PeerNetworkManager {
                     if !peer_guard.is_connected() {
                         tracing::warn!("Breaking peer reader loop for {} - peer no longer connected (iteration {})", addr, loop_iteration);
                         drop(peer_guard);
+                        disconnect_reason = Some(DisconnectReason::Timeout);
                         break;
                     }
                     drop(peer_guard);
@@ -484,6 +496,7 @@ impl PeerNetworkManager {
                         },
                         _ = shutdown_token.cancelled() => {
                             tracing::info!("Breaking peer reader loop for {} - shutdown signal received while reading (iteration {})", addr, loop_iteration);
+                            disconnect_reason = Some(DisconnectReason::Shutdown);
                             break;
                         }
                     }
@@ -540,6 +553,7 @@ impl PeerNetworkManager {
                                     // If we can't send pong, connection is likely broken
                                     if matches!(e, NetworkError::ConnectionFailed(_)) {
                                         tracing::warn!("Breaking peer reader loop for {} - failed to send pong response (iteration {})", addr, loop_iteration);
+                                        disconnect_reason = Some(DisconnectReason::Timeout);
                                         break;
                                     }
                                 }
@@ -691,6 +705,7 @@ impl PeerNetworkManager {
                         match e {
                             NetworkError::PeerDisconnected => {
                                 tracing::info!("Peer {} disconnected", addr);
+                                disconnect_reason = Some(DisconnectReason::Timeout);
                                 break;
                             }
                             NetworkError::Timeout => {
@@ -707,6 +722,11 @@ impl PeerNetworkManager {
                             }
                             _ => {
                                 tracing::error!("Fatal error reading from {}: {}", addr, e);
+
+                                disconnect_reason = Some(match &e {
+                                    NetworkError::Serialization(_) => DisconnectReason::DecodeError,
+                                    _ => DisconnectReason::ProtocolViolation,
+                                });
 
                                 // Check if this is a serialization error that might have context
                                 if let NetworkError::Serialization(ref decode_error) = e {
@@ -769,13 +789,19 @@ impl PeerNetworkManager {
 
             // Remove from pool and notify consumers
             tracing::warn!("Disconnecting from {} (peer reader loop ended)", addr);
-            Self::remove_peer_and_notify(
-                &pool,
-                &addr,
-                &connected_peer_count,
-                &network_event_sender,
-            )
-            .await;
+            let removed = pool.remove_peer(&addr).await.is_some();
+            if removed {
+                Self::notify_peer_removed(
+                    &pool,
+                    &addr,
+                    &connected_peer_count,
+                    &network_event_sender,
+                )
+                .await;
+                reputation_manager
+                    .record_disconnect(addr, disconnect_reason.unwrap_or(DisconnectReason::Timeout))
+                    .await;
+            }
 
             headers2_disabled.lock().await.remove(&addr);
 
@@ -935,12 +961,7 @@ impl PeerNetworkManager {
         );
         for addr in mismatched.into_iter().take(drop_count) {
             self.record_capability_rejection(addr).await;
-            let _ = self
-                .disconnect_peer(
-                    &addr,
-                    &format!("missing required services ({})", self.required_services),
-                )
-                .await;
+            let _ = self.disconnect_peer(&addr, DisconnectReason::CapabilityMismatch).await;
         }
     }
 
@@ -1020,7 +1041,7 @@ impl PeerNetworkManager {
             let has_expired = peer_guard.remove_expired_pings();
             drop(peer_guard);
             if has_expired {
-                let _ = self.disconnect_peer(&addr, "ping timeout").await;
+                let _ = self.disconnect_peer(&addr, DisconnectReason::PingTimeout).await;
             }
         }
 
@@ -1286,9 +1307,14 @@ impl PeerNetworkManager {
         results
     }
 
-    /// Disconnect a specific peer
-    pub async fn disconnect_peer(&self, addr: &SocketAddr, reason: &str) -> Result<(), Error> {
-        tracing::info!("Disconnecting peer {} - reason: {}", addr, reason);
+    /// Disconnect a specific peer. The `reason` is logged and recorded against
+    /// the peer's reputation entry so future selection can take it into account.
+    pub async fn disconnect_peer(
+        &self,
+        addr: &SocketAddr,
+        reason: DisconnectReason,
+    ) -> Result<(), Error> {
+        tracing::info!("Disconnecting peer {}, reason: {}", addr, reason.as_str());
 
         Self::remove_peer_and_notify(
             &self.pool,
@@ -1297,6 +1323,8 @@ impl PeerNetworkManager {
             &self.network_event_sender,
         )
         .await;
+
+        self.reputation_manager.record_disconnect(*addr, reason).await;
 
         Ok(())
     }
@@ -1309,10 +1337,9 @@ impl PeerNetworkManager {
 
     /// Ban a specific peer manually
     pub async fn ban_peer(&self, addr: &SocketAddr, reason: &str) -> Result<(), Error> {
-        tracing::info!("Manually banning peer {} - reason: {}", addr, reason);
+        tracing::info!("Manually banning peer {}, reason: {}", addr, reason);
 
-        // Disconnect the peer first
-        self.disconnect_peer(addr, reason).await?;
+        self.disconnect_peer(addr, DisconnectReason::Manual).await?;
 
         // Update reputation to trigger ban
         self.reputation_manager
@@ -1501,7 +1528,11 @@ impl NetworkManager for PeerNetworkManager {
         self.message_dispatcher.lock().await.dispatch(&msg);
     }
 
-    async fn disconnect_peer(&self, addr: &SocketAddr, reason: &str) -> NetworkResult<()> {
+    async fn disconnect_peer(
+        &self,
+        addr: &SocketAddr,
+        reason: DisconnectReason,
+    ) -> NetworkResult<()> {
         PeerNetworkManager::disconnect_peer(self, addr, reason)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))

@@ -7,7 +7,7 @@
 //! - Filter availability checks
 
 use crate::error::{Result, SpvError};
-use crate::network::NetworkManager;
+use crate::network::{DisconnectReason, NetworkManager};
 use crate::storage::StorageManager;
 use dashcore::sml::llmq_type::LLMQType;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
@@ -27,8 +27,13 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         self.network.lock().await.peer_count()
     }
 
-    /// Disconnect a specific peer.
-    pub async fn disconnect_peer(&self, addr: &std::net::SocketAddr, reason: &str) -> Result<()> {
+    /// Disconnect a specific peer. The `reason` is recorded against the peer's
+    /// reputation so future selection passes can use it.
+    pub async fn disconnect_peer(
+        &self,
+        addr: &std::net::SocketAddr,
+        reason: DisconnectReason,
+    ) -> Result<()> {
         Ok(self.network.lock().await.disconnect_peer(addr, reason).await?)
     }
 

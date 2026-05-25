@@ -211,6 +211,11 @@ pub struct PeerReputation {
     /// Failures since the last success. Resets to 0 on a successful handshake.
     #[serde(deserialize_with = "clamp_peer_consecutive_failures")]
     pub consecutive_failures: u32,
+
+    /// Cause of the most recent disconnect, if any. Defaulted on load so older
+    /// reputation files without this field continue to deserialize.
+    #[serde(default)]
+    pub last_disconnect_reason: Option<DisconnectReason>,
 }
 
 impl Default for PeerReputation {
@@ -228,6 +233,7 @@ impl Default for PeerReputation {
             last_success: None,
             last_tried: None,
             consecutive_failures: 0,
+            last_disconnect_reason: None,
         }
     }
 }
@@ -331,6 +337,39 @@ impl PeerReputation {
     }
 }
 
+/// Reason a peer connection was terminated. Recorded against the peer's
+/// reputation so future selection passes and operators can distinguish, for
+/// example, a single decode error from a peer that fails every handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisconnectReason {
+    Timeout,
+    HandshakeFailure,
+    ProtocolViolation,
+    DecodeError,
+    PingTimeout,
+    CapabilityMismatch,
+    Manual,
+    PoolFull,
+    Shutdown,
+}
+
+impl DisconnectReason {
+    /// Short stable string used in logs and reputation event reasons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisconnectReason::Timeout => "timeout",
+            DisconnectReason::HandshakeFailure => "handshake failure",
+            DisconnectReason::ProtocolViolation => "protocol violation",
+            DisconnectReason::DecodeError => "decode error",
+            DisconnectReason::PingTimeout => "ping timeout",
+            DisconnectReason::CapabilityMismatch => "capability mismatch",
+            DisconnectReason::Manual => "manual",
+            DisconnectReason::PoolFull => "pool full",
+            DisconnectReason::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// Reputation change event
 #[derive(Debug, Clone)]
 pub struct ReputationEvent {
@@ -338,6 +377,7 @@ pub struct ReputationEvent {
     pub change: i32,
     pub reason: String,
     pub timestamp: Instant,
+    pub disconnect_reason: Option<DisconnectReason>,
 }
 
 /// Peer reputation manager
@@ -386,6 +426,7 @@ impl PeerReputationManager {
             change: score_change,
             reason: reason.to_string(),
             timestamp: Instant::now(),
+            disconnect_reason: None,
         };
 
         drop(reputations); // Release lock before recording event
@@ -497,10 +538,31 @@ impl PeerReputationManager {
             change: score_change,
             reason: reason.to_string(),
             timestamp: Instant::now(),
+            disconnect_reason: None,
         };
         self.record_event(event).await;
 
         should_ban
+    }
+
+    /// Record a peer disconnect with its cause. Updates `last_disconnect_reason`
+    /// on the peer's reputation entry and appends a `ReputationEvent` so the
+    /// event log retains the cause for monitoring.
+    pub async fn record_disconnect(&self, peer: SocketAddr, reason: DisconnectReason) {
+        {
+            let mut reputations = self.reputations.write().await;
+            let reputation = reputations.entry(peer).or_default();
+            reputation.last_disconnect_reason = Some(reason);
+        }
+
+        let event = ReputationEvent {
+            peer,
+            change: 0,
+            reason: format!("disconnect: {}", reason.as_str()),
+            timestamp: Instant::now(),
+            disconnect_reason: Some(reason),
+        };
+        self.record_event(event).await;
     }
 
     /// Get all peer reputations
