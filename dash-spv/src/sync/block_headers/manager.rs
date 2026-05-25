@@ -231,7 +231,7 @@ impl<
         // Accept-and-flag: a fork whose ancestor is at or below the best
         // chainlock height cannot become canonical, so route the headers to
         // a side-list for monitoring instead of pulling them through the
-        // fork buffer. The peer is NOT banned, just observed.
+        // fork buffer. The peer is not banned, just observed.
         if let Some(cl_height) = self.best_chainlock_height() {
             if ancestor_height <= cl_height {
                 tracing::warn!(
@@ -548,7 +548,9 @@ mod tests {
     };
     use crate::sync::block_headers::fork_buffer::MAX_FORK_HEADERS_PER_PEER;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
+    use dashcore::block::Version;
     use dashcore::network::message::NetworkMessage;
+    use dashcore::{CompactTarget, TxMerkleNode};
     use dashcore_hashes::Hash;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -1177,7 +1179,6 @@ mod tests {
     /// is observed, not banned.
     #[tokio::test]
     async fn chainlock_conflicting_fork_is_flagged_without_banning_peer() {
-        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
         let easy_bits = CompactTarget::from_consensus(0x207fffff);
 
         let (mut manager, chain) = create_regtest_manager_with_chain(5).await;
@@ -1233,7 +1234,6 @@ mod tests {
         // Build a 3-header fork extending chain[4]. Use `ingest_fork` so the
         // candidate flows through the normal path and ends up in
         // `pending_fork_candidate`.
-        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
         let easy_bits = CompactTarget::from_consensus(0x207fffff);
         let ancestor = chain[4];
         let mut prev = ancestor.block_hash();
