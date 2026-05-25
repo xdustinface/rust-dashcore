@@ -383,6 +383,44 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         }
     }
 
+    /// Re-evaluate every queued CLSig against the current header chain.
+    ///
+    /// Called when new headers land (`BlockHeadersStored`). Each entry's
+    /// claimed block hash is re-checked:
+    ///
+    /// - `Match`: the entry is removed and the CLSig is fed back through
+    ///   `process_chainlock`, which validates the signature and promotes
+    ///   it to `best_chainlock` on success.
+    /// - `Mismatch`: the entry is removed and rejected. The forced-reorg
+    ///   dispatch lives in a follow-up commit, where this branch will fire
+    ///   `ChainLockForcedReorg` after validating the signature.
+    /// - `Unknown`: the entry stays queued for a later `BlockHeadersStored`,
+    ///   subject to TTL eviction in `tick`.
+    pub(super) async fn retry_pending_unknown_hash(&mut self) -> SyncResult<Vec<SyncEvent>> {
+        if self.pending_unknown_hash.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut events = Vec::new();
+        let mut to_retry: Vec<(BlockHash, ChainLock, Option<SocketAddr>)> = Vec::new();
+        for (hash, (cl, peer, _)) in &self.pending_unknown_hash {
+            match self.verify_block_hash(cl).await {
+                BlockHashVerification::Match | BlockHashVerification::Mismatch { .. } => {
+                    to_retry.push((*hash, cl.clone(), *peer));
+                }
+                BlockHashVerification::Unknown => {}
+            }
+        }
+        for (hash, cl, peer) in to_retry {
+            self.pending_unknown_hash.remove(&hash);
+            // Re-run process_chainlock so the resolved branch is handled
+            // through the canonical path (Match → validate, Mismatch →
+            // reject for now / forced reorg in the follow-up commit).
+            let mut produced = self.process_chainlock(&cl, peer).await?;
+            events.append(&mut produced);
+        }
+        Ok(events)
+    }
+
     /// Drop entries from `pending_unknown_hash` whose age exceeds
     /// [`PENDING_UNKNOWN_HASH_TTL`]. Returns the number of evicted entries.
     pub(super) fn drain_expired_pending(&mut self) -> usize {
@@ -1042,5 +1080,88 @@ mod tests {
         assert_eq!(evicted, 1);
         assert!(manager.pending_unknown_hash.contains_key(&fresh_hash));
         assert!(!manager.pending_unknown_hash.contains_key(&stale_hash));
+    }
+
+    /// `retry_pending_unknown_hash` promotes a queued CLSig whose claimed
+    /// hash now matches a freshly-arrived header. The entry is removed from
+    /// the queue and the signature path runs (empty engine fails the
+    /// signature, so it is counted invalid).
+    #[tokio::test]
+    async fn test_retry_pending_unknown_hash_promotes_match_branch() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let mut manager = create_test_manager_with_storage(&storage).await;
+        manager.masternode_ready = true;
+
+        let header = dashcore::block::Header::dummy(123);
+        let header_hash = header.block_hash();
+        let chainlock = ChainLock {
+            block_height: 123,
+            block_hash: header_hash,
+            signature: BLSSignature::from([0u8; 96]),
+        };
+
+        // Queue the chainlock first (header not stored yet → Unknown branch).
+        let events = manager.process_chainlock(&chainlock, None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SyncEvent::PendingChainLockQueued { .. }));
+        assert_eq!(manager.pending_unknown_hash.len(), 1);
+
+        // Store the matching header and retry.
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 123)
+            .await
+            .expect("store header at 123");
+
+        let retry_events = manager.retry_pending_unknown_hash().await.unwrap();
+        // process_chainlock returned the `ChainLockReceived` event for the
+        // signature-validation outcome (empty engine fails, validated=false).
+        assert_eq!(retry_events.len(), 1);
+        assert!(matches!(
+            retry_events[0],
+            SyncEvent::ChainLockReceived {
+                validated: false,
+                ..
+            }
+        ));
+        assert!(manager.pending_unknown_hash.is_empty(), "matched entry must be removed");
+        assert_eq!(manager.progress.invalid(), 1);
+    }
+
+    /// `retry_pending_unknown_hash` removes a queued CLSig that now resolves
+    /// to a `Mismatch`. In the current commit the chainlock is rejected;
+    /// the forced-reorg dispatch arrives in the follow-up commit.
+    #[tokio::test]
+    async fn test_retry_pending_unknown_hash_drops_mismatch_branch() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let mut manager = create_test_manager_with_storage(&storage).await;
+        manager.masternode_ready = true;
+
+        let header = dashcore::block::Header::dummy(200);
+        let chainlock_hash = BlockHash::from_byte_array([0xDE; 32]);
+        let chainlock = ChainLock {
+            block_height: 200,
+            block_hash: chainlock_hash,
+            signature: BLSSignature::from([0u8; 96]),
+        };
+
+        let _ = manager.process_chainlock(&chainlock, None).await.unwrap();
+        assert_eq!(manager.pending_unknown_hash.len(), 1);
+
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 200)
+            .await
+            .expect("store header at 200");
+
+        let _ = manager.retry_pending_unknown_hash().await.unwrap();
+        assert!(
+            manager.pending_unknown_hash.is_empty(),
+            "mismatched entry must be removed from the queue"
+        );
     }
 }

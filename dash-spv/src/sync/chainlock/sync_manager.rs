@@ -92,6 +92,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
             return Ok(vec![]);
         }
 
+        if matches!(event, SyncEvent::BlockHeadersStored { .. }) {
+            return self.retry_pending_unknown_hash().await;
+        }
+
         // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
         // update; the work below is strictly one-shot startup work, so
         // gate the entire branch on the not-ready transition. Also drop
