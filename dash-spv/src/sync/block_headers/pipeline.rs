@@ -119,9 +119,12 @@ impl HeadersPipeline {
 
     /// Send pending requests for active segments.
     ///
-    /// `tip_locator` is used for the tip segment (target_height = None) so the
-    /// peer can find a common ancestor when its chain has forked. Checkpoint
-    /// segments use a single-entry locator anchored at their current tip hash.
+    /// `tip_locator` is used for the tip segment (target_height = None) when
+    /// its first entry matches the segment's current tip hash, so the peer can
+    /// find a common ancestor when its chain has forked. Mid-sync, the segment
+    /// advances in memory ahead of storage so the storage-derived locator
+    /// would not match. In that case, and for checkpoint segments, fall back
+    /// to a single-entry locator anchored at the segment's current tip hash.
     /// Returns the number of requests sent.
     pub fn send_pending(
         &mut self,
@@ -134,7 +137,9 @@ impl HeadersPipeline {
                 continue;
             }
             while segment.can_send() {
-                let locator = if segment.target_height.is_none() && !tip_locator.is_empty() {
+                let locator = if segment.target_height.is_none()
+                    && tip_locator.first() == Some(&segment.current_tip_hash)
+                {
                     tip_locator.to_vec()
                 } else {
                     vec![segment.current_tip_hash]

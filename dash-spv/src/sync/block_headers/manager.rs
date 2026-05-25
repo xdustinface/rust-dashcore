@@ -253,8 +253,21 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             );
         }
 
-        // Process ready-to-store segments first so the storage tip is
-        // up-to-date when we build the locator for follow-up requests.
+        // Send more requests during initial sync or active post-sync catch-up
+        // before processing ready batches so network and storage work overlap.
+        // The storage-derived locator only takes effect when the segment is
+        // caught up to storage; mid-sync, `send_pending` falls back to a
+        // single-entry locator so the next batch can ship without waiting for
+        // disk writes.
+        if was_syncing || !tip_was_complete {
+            let locator = self.build_locator().await?;
+            let sent = self.pipeline.send_pending(requests, &locator)?;
+            if sent > 0 {
+                tracing::debug!("Pipeline sent {} more requests", sent);
+            }
+        }
+
+        // Process ready-to-store segments
         let mut events = Vec::new();
         let ready_batches = self.pipeline.take_ready_to_store();
 
@@ -283,16 +296,6 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                 events.push(SyncEvent::BlockHeadersStored {
                     tip_height: new_tip.height(),
                 });
-            }
-        }
-
-        // Send more requests during initial sync or active post-sync catch-up.
-        // Skip for unsolicited headers.
-        if was_syncing || !tip_was_complete {
-            let locator = self.build_locator().await?;
-            let sent = self.pipeline.send_pending(requests, &locator)?;
-            if sent > 0 {
-                tracing::debug!("Pipeline sent {} more requests", sent);
             }
         }
 
