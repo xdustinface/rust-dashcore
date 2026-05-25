@@ -24,7 +24,7 @@ use dashcore::network::constants::NetworkExt;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
 use dashcore_hashes::Hash;
 use key_wallet_manager::WalletInterface;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, RwLock};
 
@@ -72,13 +72,24 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         };
         let checkpoint_manager = Arc::new(CheckpointManager::new(checkpoints));
         let reorg_generation = Arc::new(AtomicU64::new(0));
+        let chainlock_height = Arc::new(AtomicU32::new(0));
+        let (filter_header_storage_arg, filter_storage_arg, block_storage_arg) =
+            if config.enable_filters {
+                (Some(storage.filter_headers()), Some(storage.filters()), Some(storage.blocks()))
+            } else {
+                (None, None, None)
+            };
         managers.block_headers = Some(
             BlockHeadersManager::new(
                 storage.block_headers(),
                 storage.metadata(),
+                filter_header_storage_arg,
+                filter_storage_arg,
+                block_storage_arg,
                 checkpoint_manager,
                 config.network,
                 reorg_generation.clone(),
+                chainlock_height.clone(),
             )
             .await?,
         );
@@ -131,6 +142,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                     storage.block_headers(),
                     storage.metadata(),
                     masternode_list_engine.clone(),
+                    chainlock_height.clone(),
                 )
                 .await,
             );

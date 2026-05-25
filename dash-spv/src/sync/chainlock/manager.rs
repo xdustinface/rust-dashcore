@@ -5,6 +5,7 @@
 //! (all blocks below the best ChainLock are implicitly locked), we only track
 //! the best validated ChainLock.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use dashcore::ephemerealdata::chain_lock::ChainLock;
@@ -48,6 +49,10 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// so we don't lose a chainlock that landed during the gap between
     /// the chainlock manager starting and masternode sync completing.
     pending_validation: Option<ChainLock>,
+    /// Shared snapshot of the best validated chainlock height. `0` means
+    /// "no chainlock observed yet". Read by `BlockHeadersManager` as the
+    /// floor for the reorg cascade.
+    chainlock_height: Arc<AtomicU32>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
@@ -56,6 +61,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         header_storage: Arc<RwLock<H>>,
         metadata_storage: Arc<RwLock<M>>,
         masternode_engine: Arc<RwLock<MasternodeListEngine>>,
+        chainlock_height: Arc<AtomicU32>,
     ) -> Self {
         let mut manager = Self {
             progress: ChainLockProgress::default(),
@@ -66,10 +72,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
             requested_chainlocks: HashSet::new(),
             masternode_ready: false,
             pending_validation: None,
+            chainlock_height,
         };
 
         // TODO: Move load_best_chainlock() and save_best_chainlock() to MetadataStorage trait.
         manager.load_best_chainlock().await;
+        if let Some(cl) = &manager.best_chainlock {
+            manager.chainlock_height.store(cl.block_height, Ordering::Release);
+        }
 
         manager
     }
@@ -99,7 +109,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
             if self.verify_block_hash(&pending).await && self.validate_signature(&pending).await {
                 self.progress.add_valid(1);
                 self.progress.update_best_validated_height(pending.block_height);
+                let height = pending.block_height;
                 self.best_chainlock = Some(pending);
+                self.chainlock_height.store(height, Ordering::Release);
                 self.save_best_chainlock().await;
             } else {
                 self.progress.add_invalid(1);
@@ -168,6 +180,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
 
             // Update best ChainLock and persist to storage
             self.best_chainlock = Some(chainlock.clone());
+            self.chainlock_height.store(height, Ordering::Release);
             self.save_best_chainlock().await;
         } else {
             self.progress.add_invalid(1);
@@ -315,7 +328,13 @@ mod tests {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
         let engine =
             Arc::new(RwLock::new(MasternodeListEngine::default_for_network(Network::Testnet)));
-        ChainLockManager::new(storage.block_headers(), storage.metadata(), engine).await
+        ChainLockManager::new(
+            storage.block_headers(),
+            storage.metadata(),
+            engine,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .await
     }
 
     async fn create_test_manager_with_storage(
@@ -323,7 +342,13 @@ mod tests {
     ) -> TestChainLockManager {
         let engine =
             Arc::new(RwLock::new(MasternodeListEngine::default_for_network(Network::Testnet)));
-        ChainLockManager::new(storage.block_headers(), storage.metadata(), engine).await
+        ChainLockManager::new(
+            storage.block_headers(),
+            storage.metadata(),
+            engine,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .await
     }
 
     fn create_test_chainlock(height: u32) -> ChainLock {

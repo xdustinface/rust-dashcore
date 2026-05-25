@@ -1,6 +1,8 @@
 use crate::error::SyncResult;
 use crate::network::{Message, MessageType, NetworkEvent, RequestSender};
-use crate::storage::{BlockHeaderStorage, MetadataStorage};
+use crate::storage::{
+    BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage, MetadataStorage,
+};
 use crate::sync::sync_manager::ensure_not_started;
 use crate::sync::{
     BlockHeadersManager, ManagerIdentifier, ProgressPercentage, SyncEvent, SyncManager,
@@ -18,7 +20,14 @@ pub(super) const UNSOLICITED_HEADERS_WAIT_TIMEOUT: Duration = Duration::from_sec
 pub(super) const FORK_BUFFER_TTL: Duration = Duration::from_secs(60);
 
 #[async_trait]
-impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersManager<H, M> {
+impl<
+        H: BlockHeaderStorage,
+        FH: FilterHeaderStorage,
+        F: FilterStorage,
+        B: BlockStorage,
+        M: MetadataStorage,
+    > SyncManager for BlockHeadersManager<H, FH, F, B, M>
+{
     fn identifier(&self) -> ManagerIdentifier {
         ManagerIdentifier::BlockHeader
     }
@@ -131,16 +140,23 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
             tracing::debug!("Expired {} stale fork branches", evicted);
             self.prune_fork_tip_index();
         }
+
+        // Evict deny-list entries that the chainlock floor has caught up to.
+        if let Some(cl_height) = self.best_chainlock_height() {
+            let mut state = self.reorg_state.lock().await;
+            state.evict_expired_denials(cl_height);
+        }
+
+        let mut events: Vec<SyncEvent> = Vec::new();
         if let Some(candidate) = self.take_pending_fork_candidate() {
-            // Reorg promotion is not yet wired into the coordinator. Log here
-            // so detection can be confirmed end-to-end before that lands.
-            tracing::warn!(
-                "Fork candidate ready (ancestor={} headers={} work_bytes={:?}), \
-                 reorg promotion not yet wired",
+            tracing::info!(
+                "driving reorg cascade: ancestor={} headers={}",
                 candidate.ancestor_height,
-                candidate.headers.len(),
-                candidate.total_work.as_bytes()
+                candidate.headers.len()
             );
+            if let Some(event) = self.drive_reorg(candidate).await? {
+                events.push(event);
+            }
         }
 
         // During initial sync, send more requests and log progress.
@@ -153,7 +169,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
                 tracing::debug!("Tick: pipeline sent {} more requests", sent);
             }
 
-            return Ok(vec![]);
+            return Ok(events);
         }
 
         // Post-sync: check for stale block announcements
@@ -185,7 +201,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
             }
         }
 
-        Ok(vec![])
+        Ok(events)
     }
 
     async fn handle_network_event(

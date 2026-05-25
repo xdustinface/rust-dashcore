@@ -8,19 +8,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
 
 use crate::chain::{ChainWork, CheckpointManager, ForkCandidate};
-use crate::sync::reorg::ReorgState;
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
-use crate::storage::{BlockHeaderStorage, BlockHeaderTip, MetadataStorage};
+use crate::storage::{
+    BlockHeaderStorage, BlockHeaderTip, BlockStorage, FilterHeaderStorage, FilterStorage,
+    MetadataStorage,
+};
 use crate::sync::block_headers::fork_buffer::ForkBuffer;
 use crate::sync::block_headers::HeadersPipeline;
+use crate::sync::reorg::{handle_reorg, ReorgState, ReorgStorages};
 use crate::sync::{BlockHeadersProgress, ProgressPercentage, SyncEvent, SyncManager, SyncState};
 use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
@@ -36,14 +39,33 @@ use tokio::sync::RwLock;
 /// - Initial header sync using parallel pipeline (checkpoint-based segments)
 /// - Post-sync header updates via inventory announcements
 ///
-/// Generic over `H: BlockHeaderStorage` to allow different storage implementations.
-pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
+/// Generic over the four storage types to allow different storage
+/// implementations and to give the manager direct handles for the reorg
+/// cascade.
+pub struct BlockHeadersManager<
+    H: BlockHeaderStorage,
+    FH: FilterHeaderStorage,
+    F: FilterStorage,
+    B: BlockStorage,
+    M: MetadataStorage,
+> {
     /// Current progress of the manager.
     pub(super) progress: BlockHeadersProgress,
     /// Block header storage.
     pub(super) header_storage: Arc<RwLock<H>>,
     /// Metadata storage for persisting the best peer tip height.
     pub(super) metadata_storage: Arc<RwLock<M>>,
+    /// Filter header storage, truncated by the reorg cascade. `None` when
+    /// filter sync is disabled.
+    pub(super) filter_header_storage: Option<Arc<RwLock<FH>>>,
+    /// Filter storage, truncated by the reorg cascade. `None` when filter
+    /// sync is disabled.
+    pub(super) filter_storage: Option<Arc<RwLock<F>>>,
+    /// Block storage, truncated by the reorg cascade. `None` when filter
+    /// sync is disabled.
+    pub(super) block_storage: Option<Arc<RwLock<B>>>,
+    /// Checkpoint manager, consulted by the cascade's checkpoint floor.
+    pub(super) checkpoint_manager: Arc<CheckpointManager>,
     /// Pipeline for parallel header downloads (used for both initial sync and post-sync).
     pub(super) pipeline: HeadersPipeline,
     /// Pending block announcements waiting for headers message (post-sync).
@@ -64,6 +86,10 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// commits, used to invalidate stale in-flight responses in downstream
     /// managers.
     pub(super) reorg_generation: Arc<AtomicU64>,
+    /// Best validated chainlock height. `0` means "no chainlock observed
+    /// yet". Updated by `ChainLockManager` and read by the cascade as the
+    /// floor below which a fork ancestor cannot land.
+    pub(super) chainlock_height: Arc<AtomicU32>,
     /// Single-flight reorg state plus the deny-list of fork tip hashes that
     /// have been rejected by a guard (checkpoint floor, chainlock floor,
     /// depth cap).
@@ -73,7 +99,14 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     pub(super) side_headers: Vec<(u32, BlockHash)>,
 }
 
-impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
+impl<
+        H: BlockHeaderStorage,
+        FH: FilterHeaderStorage,
+        F: FilterStorage,
+        B: BlockStorage,
+        M: MetadataStorage,
+    > std::fmt::Debug for BlockHeadersManager<H, FH, F, B, M>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockHeadersManager")
             .field("progress", &self.progress)
@@ -82,14 +115,26 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeaders
     }
 }
 
-impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
+impl<
+        H: BlockHeaderStorage,
+        FH: FilterHeaderStorage,
+        F: FilterStorage,
+        B: BlockStorage,
+        M: MetadataStorage,
+    > BlockHeadersManager<H, FH, F, B, M>
+{
     /// Create a new headers manager with the given storage and checkpoint manager.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         header_storage: Arc<RwLock<H>>,
         metadata_storage: Arc<RwLock<M>>,
+        filter_header_storage: Option<Arc<RwLock<FH>>>,
+        filter_storage: Option<Arc<RwLock<F>>>,
+        block_storage: Option<Arc<RwLock<B>>>,
         checkpoint_manager: Arc<CheckpointManager>,
         network: Network,
         reorg_generation: Arc<AtomicU64>,
+        chainlock_height: Arc<AtomicU32>,
     ) -> SyncResult<Self> {
         let tip = header_storage
             .read()
@@ -113,6 +158,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             progress: initial_progress,
             header_storage,
             metadata_storage,
+            filter_header_storage,
+            filter_storage,
+            block_storage,
+            checkpoint_manager: checkpoint_manager.clone(),
             pipeline: HeadersPipeline::new(checkpoint_manager),
             pending_announcements: HashMap::new(),
             announced_peers: HashSet::new(),
@@ -120,6 +169,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             pending_fork_candidate: None,
             fork_tip_index: HashMap::new(),
             reorg_generation,
+            chainlock_height,
             reorg_state: Arc::new(Mutex::new(ReorgState::default())),
             side_headers: Vec::new(),
         })
@@ -128,6 +178,42 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
     /// Current reorg generation counter snapshot.
     pub(crate) fn current_generation(&self) -> u64 {
         self.reorg_generation.load(Ordering::Acquire)
+    }
+
+    /// Best chainlock height as `Option<u32>`. `0` is mapped to `None`
+    /// (no chainlock yet).
+    pub(super) fn best_chainlock_height(&self) -> Option<u32> {
+        match self.chainlock_height.load(Ordering::Acquire) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    /// Drive the reorg cascade for a buffered fork candidate.
+    pub(super) async fn drive_reorg(
+        &mut self,
+        candidate: ForkCandidate,
+    ) -> SyncResult<Option<SyncEvent>> {
+        let current_tip = self.tip().await?;
+        let current_tip_height = current_tip.height();
+        let current_tip_hash = *current_tip.hash();
+        let storages: ReorgStorages<'_, H, FH, F, B> = ReorgStorages {
+            block_header_storage: &self.header_storage,
+            filter_header_storage: self.filter_header_storage.as_ref(),
+            filter_storage: self.filter_storage.as_ref(),
+            block_storage: self.block_storage.as_ref(),
+        };
+        handle_reorg(
+            candidate,
+            &self.reorg_state,
+            &self.reorg_generation,
+            storages,
+            &self.checkpoint_manager,
+            self.best_chainlock_height(),
+            current_tip_height,
+            current_tip_hash,
+        )
+        .await
     }
 
     /// Number of ancestor headers DGW v3 requires to compute next bits.
@@ -442,7 +528,9 @@ mod tests {
     use crate::chain::checkpoints::testnet_checkpoints;
     use crate::network::{MessageType, NetworkEvent, NetworkRequest, RequestSender};
     use crate::storage::{
-        DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
+        DiskStorageManager, PersistentBlockHeaderStorage, PersistentBlockStorage,
+        PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
+        StorageManager,
     };
     use crate::sync::block_headers::fork_buffer::MAX_FORK_HEADERS_PER_PEER;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
@@ -450,8 +538,13 @@ mod tests {
     use dashcore_hashes::Hash;
     use tokio::sync::mpsc::unbounded_channel;
 
-    type TestBlockHeadersManager =
-        BlockHeadersManager<PersistentBlockHeaderStorage, PersistentMetadataStorage>;
+    type TestBlockHeadersManager = BlockHeadersManager<
+        PersistentBlockHeaderStorage,
+        PersistentFilterHeaderStorage,
+        PersistentFilterStorage,
+        PersistentBlockStorage,
+        PersistentMetadataStorage,
+    >;
 
     fn create_test_checkpoint_manager() -> Arc<CheckpointManager> {
         Arc::new(CheckpointManager::new(testnet_checkpoints()))
@@ -463,12 +556,22 @@ mod tests {
         let genesis = Header::dummy_batch(0..1);
         storage.store_headers(&genesis).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        BlockHeadersManager::new(
+        BlockHeadersManager::<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+            PersistentMetadataStorage,
+        >::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Testnet,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .expect("Failed to create BlockHeadersManager")
@@ -763,12 +866,16 @@ mod tests {
         // First header in dummy_chain has prev = all_zeros (treat as genesis).
         storage.store_headers(&chain).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        let manager = BlockHeadersManager::new(
+        let manager: TestBlockHeadersManager = BlockHeadersManager::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Testnet,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .unwrap();
@@ -846,12 +953,16 @@ mod tests {
         }
         storage.store_headers(&chain).await.unwrap();
         let checkpoint_manager = Arc::new(CheckpointManager::new(vec![]));
-        let manager = BlockHeadersManager::new(
+        let manager: TestBlockHeadersManager = BlockHeadersManager::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Regtest,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .expect("failed to create regtest manager");
