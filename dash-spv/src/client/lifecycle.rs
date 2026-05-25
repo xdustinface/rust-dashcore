@@ -24,6 +24,7 @@ use dashcore::network::constants::NetworkExt;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
 use dashcore_hashes::Hash;
 use key_wallet_manager::WalletInterface;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, RwLock};
 
@@ -70,20 +71,26 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             _ => Vec::new(),
         };
         let checkpoint_manager = Arc::new(CheckpointManager::new(checkpoints));
+        let reorg_generation = Arc::new(AtomicU64::new(0));
         managers.block_headers = Some(
             BlockHeadersManager::new(
                 storage.block_headers(),
                 storage.metadata(),
                 checkpoint_manager,
                 config.network,
+                reorg_generation.clone(),
             )
             .await?,
         );
 
         if config.enable_filters {
             managers.filter_headers = Some(
-                FilterHeadersManager::new(storage.block_headers(), storage.filter_headers())
-                    .await?,
+                FilterHeadersManager::new(
+                    storage.block_headers(),
+                    storage.filter_headers(),
+                    reorg_generation.clone(),
+                )
+                .await?,
             );
             managers.filters = Some(
                 FiltersManager::new(
@@ -91,11 +98,18 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                     storage.block_headers(),
                     storage.filter_headers(),
                     storage.filters(),
+                    reorg_generation.clone(),
                 )
                 .await,
             );
             managers.blocks = Some(
-                BlocksManager::new(wallet.clone(), storage.block_headers(), storage.blocks()).await,
+                BlocksManager::new(
+                    wallet.clone(),
+                    storage.block_headers(),
+                    storage.blocks(),
+                    reorg_generation.clone(),
+                )
+                .await,
             );
         }
 
@@ -134,7 +148,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             ));
         }
 
-        let sync_coordinator = SyncCoordinator::new(managers).await;
+        let sync_coordinator = SyncCoordinator::new(managers, reorg_generation).await;
 
         // Wrap storage in Arc<Mutex>
         let storage = Arc::new(Mutex::new(storage));

@@ -3,6 +3,7 @@
 //! Downloads blocks that matched wallet filters and processes them in height order.
 //! Subscribes to BlockNeeded events and emits BlockProcessed events.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -39,6 +40,9 @@ pub struct BlocksManager<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterf
     pub(super) pipeline: BlocksPipeline,
     /// Whether FiltersSyncComplete has been received.
     pub(super) filters_sync_complete: bool,
+    /// Shared generation counter used to invalidate stale `Block` responses
+    /// delivered after a reorg cascade.
+    pub(super) reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H, B, W> {
@@ -47,6 +51,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
         wallet: Arc<RwLock<W>>,
         header_storage: Arc<RwLock<H>>,
         block_storage: Arc<RwLock<B>>,
+        reorg_generation: Arc<AtomicU64>,
     ) -> Self {
         let last_processed_height = wallet.read().await.last_processed_height();
 
@@ -60,11 +65,18 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             wallet,
             pipeline: BlocksPipeline::new(),
             filters_sync_complete: false,
+            reorg_generation,
         }
     }
 
+    /// Current reorg generation counter snapshot.
+    pub(super) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
+    }
+
     pub(super) async fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<()> {
-        let sent = self.pipeline.send_pending(requests).await?;
+        let sent =
+            self.pipeline.send_pending_with_generation(requests, self.current_generation()).await?;
         if sent > 0 {
             self.progress.add_requested(sent as u32);
         }
@@ -183,7 +195,13 @@ mod tests {
     async fn create_test_manager() -> TestBlocksManager {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
-        BlocksManager::new(wallet, storage.block_headers(), storage.blocks()).await
+        BlocksManager::new(
+            wallet,
+            storage.block_headers(),
+            storage.blocks(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -296,7 +314,13 @@ mod tests {
             PersistentBlockHeaderStorage,
             PersistentBlockStorage,
             MultiMockWallet,
-        > = BlocksManager::new(multi.clone(), storage.block_headers(), storage.blocks()).await;
+        > = BlocksManager::new(
+            multi.clone(),
+            storage.block_headers(),
+            storage.blocks(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
         manager.progress.set_state(SyncState::Syncing);
 
         let header = Header {

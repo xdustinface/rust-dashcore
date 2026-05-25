@@ -8,10 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::Mutex;
+
 use crate::chain::{ChainWork, CheckpointManager, ForkCandidate};
+use crate::sync::reorg::ReorgState;
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
 use crate::storage::{BlockHeaderStorage, BlockHeaderTip, MetadataStorage};
@@ -56,6 +60,17 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Populated whenever a fork batch is buffered so that subsequent batches
     /// extending the same branch are routed to `ingest_fork` correctly.
     fork_tip_index: HashMap<BlockHash, u32>,
+    /// Shared generation counter bumped by `handle_reorg` once a cascade
+    /// commits, used to invalidate stale in-flight responses in downstream
+    /// managers.
+    pub(super) reorg_generation: Arc<AtomicU64>,
+    /// Single-flight reorg state plus the deny-list of fork tip hashes that
+    /// have been rejected by a guard (checkpoint floor, chainlock floor,
+    /// depth cap).
+    pub(super) reorg_state: Arc<Mutex<ReorgState>>,
+    /// Headers seen on a chainlocked-conflicting fork. Recorded for
+    /// monitoring without penalizing the peer.
+    pub(super) side_headers: Vec<(u32, BlockHash)>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
@@ -74,6 +89,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         metadata_storage: Arc<RwLock<M>>,
         checkpoint_manager: Arc<CheckpointManager>,
         network: Network,
+        reorg_generation: Arc<AtomicU64>,
     ) -> SyncResult<Self> {
         let tip = header_storage
             .read()
@@ -103,7 +119,15 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             fork_buffer: ForkBuffer::new(Params::new(network)),
             pending_fork_candidate: None,
             fork_tip_index: HashMap::new(),
+            reorg_generation,
+            reorg_state: Arc::new(Mutex::new(ReorgState::default())),
+            side_headers: Vec::new(),
         })
+    }
+
+    /// Current reorg generation counter snapshot.
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
     }
 
     /// Number of ancestor headers DGW v3 requires to compute next bits.
@@ -444,6 +468,7 @@ mod tests {
             storage.metadata(),
             checkpoint_manager,
             Network::Testnet,
+            Arc::new(AtomicU64::new(0)),
         )
         .await
         .expect("Failed to create BlockHeadersManager")
@@ -743,6 +768,7 @@ mod tests {
             storage.metadata(),
             checkpoint_manager,
             Network::Testnet,
+            Arc::new(AtomicU64::new(0)),
         )
         .await
         .unwrap();
@@ -825,6 +851,7 @@ mod tests {
             storage.metadata(),
             checkpoint_manager,
             Network::Regtest,
+            Arc::new(AtomicU64::new(0)),
         )
         .await
         .expect("failed to create regtest manager");

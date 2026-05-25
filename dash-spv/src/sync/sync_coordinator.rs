@@ -4,6 +4,8 @@
 //! tokio task for true parallel processing. It tracks aggregate progress and
 //! coordinates graceful shutdown.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{select_all, StreamExt};
@@ -136,6 +138,11 @@ where
     shutdown: CancellationToken,
     /// Handle for the progress aggregation task.
     progress_task: Option<tokio::task::JoinHandle<()>>,
+    /// Generation counter that bumps on every successful reorg cascade.
+    /// Managers clone this `Arc` at construction so they can tag outgoing
+    /// requests and drop responses whose snapshot disagrees with the
+    /// current value.
+    reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H, FH, F, B, M, W> SyncCoordinator<H, FH, F, B, M, W>
@@ -148,7 +155,10 @@ where
     W: WalletInterface + 'static,
 {
     /// Create a new coordinator with the given config.
-    pub(crate) async fn new(managers: Managers<H, FH, F, B, M, W>) -> Self {
+    pub(crate) async fn new(
+        managers: Managers<H, FH, F, B, M, W>,
+        reorg_generation: Arc<AtomicU64>,
+    ) -> Self {
         let mut initial_progress = SyncProgress::default();
 
         try_update_progress(managers.block_headers.as_ref(), &mut initial_progress);
@@ -174,7 +184,14 @@ where
             sync_start_time: None,
             shutdown: CancellationToken::new(),
             progress_task: None,
+            reorg_generation,
         }
+    }
+
+    /// Clone the shared reorg generation `Arc`. Managers hold this clone so they
+    /// can tag requests and detect stale responses after a reorg cascade.
+    pub(crate) fn reorg_generation(&self) -> Arc<AtomicU64> {
+        self.reorg_generation.clone()
     }
 
     /// Subscribe to progress updates.

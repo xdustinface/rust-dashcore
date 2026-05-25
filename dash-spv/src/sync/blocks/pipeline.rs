@@ -108,6 +108,17 @@ impl BlocksPipeline {
     /// Sends multiple smaller GetData messages to distribute requests across peers.
     /// Returns the number of blocks requested.
     pub(super) async fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<usize> {
+        self.send_pending_with_generation(requests, 0).await
+    }
+
+    /// Send pending block requests up to the concurrency limit, tagging each
+    /// in-flight slot with the current reorg generation so stale block
+    /// responses can be dropped.
+    pub(super) async fn send_pending_with_generation(
+        &mut self,
+        requests: &RequestSender,
+        generation: u64,
+    ) -> SyncResult<usize> {
         let mut total_sent = 0;
 
         while self.coordinator.available_to_send() > 0 {
@@ -119,18 +130,25 @@ impl BlocksPipeline {
             }
 
             requests.request_blocks(hashes.clone())?;
-            self.coordinator.mark_sent(&hashes);
+            self.coordinator.mark_sent_with_generation(&hashes, generation);
             total_sent += hashes.len();
 
             tracing::debug!(
-                "Requested {} blocks ({} downloading, {} pending)",
+                "Requested {} blocks ({} downloading, {} pending, generation {})",
                 hashes.len(),
                 self.coordinator.active_count(),
-                self.coordinator.pending_count()
+                self.coordinator.pending_count(),
+                generation
             );
         }
 
         Ok(total_sent)
+    }
+
+    /// Look up the generation snapshot recorded when the block download for
+    /// `hash` was sent.
+    pub(super) fn generation_for_hash(&self, hash: &BlockHash) -> Option<u64> {
+        self.coordinator.generation_for(hash)
     }
 
     /// Handle a received block using internal height mapping.

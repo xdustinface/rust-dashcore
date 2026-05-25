@@ -58,6 +58,9 @@ pub(crate) struct DownloadCoordinator<K: Hash + Eq + Clone> {
     pending: VecDeque<K>,
     /// Items currently in-flight (key -> sent time).
     in_flight: HashMap<K, Instant>,
+    /// Generation snapshot taken when each in-flight key was marked sent.
+    /// Used by reorg-aware pipelines to drop stale responses.
+    generations: HashMap<K, u64>,
     /// Retry counts per key.
     retry_counts: HashMap<K, u32>,
     /// Configuration.
@@ -78,6 +81,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
         Self {
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
+            generations: HashMap::new(),
             retry_counts: HashMap::new(),
             config,
             last_progress: Instant::now(),
@@ -88,6 +92,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
     pub(crate) fn clear(&mut self) {
         self.pending.clear();
         self.in_flight.clear();
+        self.generations.clear();
         self.retry_counts.clear();
         self.last_progress = Instant::now();
     }
@@ -103,6 +108,9 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
         let items: Vec<K> = self.in_flight.drain().map(|(k, _)| k).collect();
         if items.is_empty() {
             return;
+        }
+        for item in &items {
+            self.generations.remove(item);
         }
         for item in items.into_iter().rev() {
             self.pending.push_front(item);
@@ -152,11 +160,27 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
         }
     }
 
+    /// Mark items as sent and tag them with a generation snapshot, so a later
+    /// `receive` from a stale generation can be detected and dropped.
+    pub(crate) fn mark_sent_with_generation(&mut self, items: &[K], generation: u64) {
+        let now = Instant::now();
+        for item in items {
+            self.in_flight.insert(item.clone(), now);
+            self.generations.insert(item.clone(), generation);
+        }
+    }
+
+    /// Read the generation snapshot recorded for an in-flight key.
+    pub(crate) fn generation_for(&self, key: &K) -> Option<u64> {
+        self.generations.get(key).copied()
+    }
+
     /// Handle a received item.
     ///
     /// Returns true if the item was being tracked, false if unexpected.
     pub(crate) fn receive(&mut self, key: &K) -> bool {
         if self.in_flight.remove(key).is_some() {
+            self.generations.remove(key);
             self.retry_counts.remove(key);
             self.last_progress = Instant::now();
             true
@@ -175,6 +199,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
     pub(crate) fn cancel_pending(&mut self, key: &K) {
         self.pending.retain(|k| k != key);
         self.retry_counts.remove(key);
+        self.generations.remove(key);
     }
 
     /// Check if an item is currently in-flight.
@@ -197,6 +222,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
 
         for key in &timed_out {
             self.in_flight.remove(key);
+            self.generations.remove(key);
         }
 
         if !timed_out.is_empty() {
