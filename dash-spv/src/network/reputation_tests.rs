@@ -463,6 +463,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_score_based_ban_survives_restart() {
+        let peer: SocketAddr = "127.0.0.1:5010".parse().unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
+            .await
+            .expect("Failed to open PersistentPeerStorage");
+
+        // Accumulate score to the ban threshold in the first session.
+        let session_one = PeerReputationManager::new();
+        for _ in 0..10 {
+            session_one.update_reputation(peer, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(session_one.is_banned(&peer).await, "peer must be banned in session one");
+        session_one.save_to_storage(&peer_storage).await.unwrap();
+
+        // Load into a fresh manager (simulating a restart — `banned_until` is not persisted).
+        let session_two = PeerReputationManager::new();
+        session_two.load_from_storage(&peer_storage).await.unwrap();
+
+        assert!(
+            session_two.is_banned(&peer).await,
+            "score-based ban must survive restart even when banned_until is not persisted"
+        );
+
+        let input = vec![(peer, ())];
+        let surviving = session_two.filter_unbanned(input).await;
+        assert!(
+            surviving.is_empty(),
+            "filter_unbanned must exclude a peer whose score is at the ban threshold after restart"
+        );
+    }
+
+    #[tokio::test]
     async fn test_selection_weights_match_score_offset() {
         let manager = PeerReputationManager::new();
         let best: SocketAddr = "127.0.0.1:6001".parse().unwrap();

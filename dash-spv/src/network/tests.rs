@@ -138,10 +138,10 @@ mod pool_tests {
         assert_eq!(good_hits + neutral_hits, samples);
 
         // Weight good = max(1, 100 - (-50)) = 150, weight neutral = max(1, 100 - 0) = 100.
-        // Good should dominate by ~1.5x. Use a loose lower bound to stay robust.
+        // Good should dominate by ~1.5x, so good_hits must exceed neutral_hits.
         assert!(
-            good_hits > neutral_hits / 2,
-            "good (weight 150) should outpace neutral (weight 100): good={}, neutral={}",
+            good_hits > neutral_hits,
+            "good (weight 150) must beat neutral (weight 100): good={}, neutral={}",
             good_hits,
             neutral_hits
         );
@@ -198,32 +198,26 @@ mod pool_tests {
         // Make one peer the clear worst.
         let worst = peers[0];
         reputation.update_reputation(worst, 60, "bad").await; // total score = 70
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS);
 
-        // Simulate an incoming peer with score 0 (better than the worst).
+        // Incoming peer with score 0 is better: eviction must fire and remove `worst`.
         let incoming = test_socket_address(99);
-        let incoming_score = reputation.get_score(&incoming).await;
-        let candidates = manager.test_get_all_peers().await;
+        let evicted = manager.test_try_evict_for_incoming(incoming).await;
+        assert!(evicted, "better incoming peer must trigger eviction");
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS - 1, "pool must shrink by one");
+        assert!(!manager.test_is_connected(&worst).await, "worst peer must be gone after eviction");
 
-        let victim = reputation.pick_worst(&candidates).await.expect("pool is non-empty");
-        let victim_score = reputation.get_score(&victim).await;
+        // Re-fill to capacity for the guard-rejection scenario.
+        let filler = test_socket_address(100);
+        manager.insert_test_peer(filler, cf).await;
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS);
 
-        assert_eq!(victim, worst, "pick_worst must identify the highest-scored peer");
-        assert!(
-            victim_score > incoming_score,
-            "eviction guard: evict only when victim_score ({}) > incoming_score ({})",
-            victim_score,
-            incoming_score
-        );
-
-        // Verify the guard rejects eviction when incoming peer is worse than the worst.
-        reputation.update_reputation(incoming, 80, "newcomer is bad").await;
-        let newcomer_score = reputation.get_score(&incoming).await;
-        assert!(
-            victim_score <= newcomer_score,
-            "when incoming ({}) is not strictly better than victim ({}), guard must prevent eviction",
-            newcomer_score,
-            victim_score
-        );
+        // Incoming peer with high score (worse than all existing peers): no eviction.
+        let bad_incoming = test_socket_address(101);
+        reputation.update_reputation(bad_incoming, 80, "newcomer is bad").await;
+        let evicted = manager.test_try_evict_for_incoming(bad_incoming).await;
+        assert!(!evicted, "incoming peer worse than the worst must not trigger eviction");
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS, "pool size must not change");
     }
 
     #[tokio::test(start_paused = true)]
