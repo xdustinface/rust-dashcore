@@ -19,6 +19,7 @@ mod peer_tests {
 
 #[cfg(test)]
 mod pool_tests {
+    use crate::network::constants::TARGET_PEERS;
     use crate::network::manager::PeerNetworkManager;
     use crate::network::peer::Peer;
     use crate::network::pool::PeerPool;
@@ -103,7 +104,7 @@ mod pool_tests {
     }
 
     #[tokio::test]
-    async fn test_next_peer_skips_banned_and_favours_high_score() {
+    async fn test_next_peer_skips_banned_and_favours_low_score() {
         let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
         let good = test_socket_address(11);
         let neutral = test_socket_address(12);
@@ -136,13 +137,13 @@ mod pool_tests {
         }
         assert_eq!(good_hits + neutral_hits, samples);
 
-        // Weight good = max(1, -50 + 51) = 1, weight neutral = max(1, 0 + 51) = 51.
-        // Neutral should dominate by ~51x. Use a loose lower bound to stay robust.
+        // Weight good = max(1, 100 - (-50)) = 150, weight neutral = max(1, 100 - 0) = 100.
+        // Good should dominate by ~1.5x. Use a loose lower bound to stay robust.
         assert!(
-            neutral_hits > good_hits * 10,
-            "neutral (weight 51) should massively outpace good (weight 1): neutral={}, good={}",
-            neutral_hits,
-            good_hits
+            good_hits > neutral_hits / 2,
+            "good (weight 150) should outpace neutral (weight 100): good={}, neutral={}",
+            good_hits,
+            neutral_hits
         );
     }
 
@@ -170,15 +171,58 @@ mod pool_tests {
             }
         }
 
-        // Expected weight ratio: high = max(1, 99 + 51) = 150, zero = 51.
-        // Ratio = 150/51 ≈ 2.94. Use a loose tolerance to avoid flakes.
-        let ratio = high_hits as f64 / zero_hits.max(1) as f64;
+        // Weight high (score 99) = max(1, 100 - 99) = 1, weight zero (score 0) = 100 - 0 = 100.
+        // zero should dominate by ~100x. Use a loose lower bound to stay robust.
+        let ratio = zero_hits as f64 / high_hits.max(1) as f64;
         assert!(
-            (2.0..4.0).contains(&ratio),
-            "high-score peer should win between 2x and 4x as often, ratio={}, high={}, zero={}",
-            ratio,
+            ratio > 20.0,
+            "neutral peer (weight 100) should massively outpace near-ban peer (weight 1): zero={}, high={}, ratio={}",
+            zero_hits,
             high_hits,
-            zero_hits
+            ratio
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eviction_guard_replaces_worst_when_score_is_strictly_worse() {
+        let cf = ServiceFlags::NETWORK;
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let reputation = manager.test_reputation_manager();
+
+        // Fill the pool to capacity. TARGET_PEERS = 3.
+        let peers: Vec<_> = (0..TARGET_PEERS).map(|i| test_socket_address(i as u8 + 30)).collect();
+        for &addr in &peers {
+            manager.insert_test_peer(addr, cf).await;
+            reputation.update_reputation(addr, 10, "mild").await;
+        }
+        // Make one peer the clear worst.
+        let worst = peers[0];
+        reputation.update_reputation(worst, 60, "bad").await; // total score = 70
+
+        // Simulate an incoming peer with score 0 (better than the worst).
+        let incoming = test_socket_address(99);
+        let incoming_score = reputation.get_score(&incoming).await;
+        let candidates = manager.test_get_all_peers().await;
+
+        let victim = reputation.pick_worst(&candidates).await.expect("pool is non-empty");
+        let victim_score = reputation.get_score(&victim).await;
+
+        assert_eq!(victim, worst, "pick_worst must identify the highest-scored peer");
+        assert!(
+            victim_score > incoming_score,
+            "eviction guard: evict only when victim_score ({}) > incoming_score ({})",
+            victim_score,
+            incoming_score
+        );
+
+        // Verify the guard rejects eviction when incoming peer is worse than the worst.
+        reputation.update_reputation(incoming, 80, "newcomer is bad").await;
+        let newcomer_score = reputation.get_score(&incoming).await;
+        assert!(
+            victim_score <= newcomer_score,
+            "when incoming ({}) is not strictly better than victim ({}), guard must prevent eviction",
+            newcomer_score,
+            victim_score
         );
     }
 

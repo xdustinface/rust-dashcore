@@ -479,9 +479,9 @@ mod tests {
         let peers = vec![(best, ()), (neutral, ()), (worst, ()), (banned, ())];
         let weights = manager.selection_weights(&peers).await;
         assert_eq!(weights.len(), 4);
-        assert_eq!(weights[0], 1, "score -50 maps to weight 1");
-        assert_eq!(weights[1], 51, "score 0 maps to weight 51");
-        assert_eq!(weights[2], 141, "score 90 maps to weight 141");
+        assert_eq!(weights[0], 150, "score -50 maps to weight 150 (highest priority)");
+        assert_eq!(weights[1], 100, "score 0 maps to weight 100 (neutral)");
+        assert_eq!(weights[2], 10, "score 90 maps to weight 10 (near-ban, rarely selected)");
         assert_eq!(weights[3], 0, "banned peer must have weight 0");
     }
 
@@ -516,6 +516,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pick_worst_all_neutral_returns_some_peer() {
+        let manager = PeerReputationManager::new();
+        let a: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+        let peers = vec![(a, ()), (b, ())];
+        let victim =
+            manager.pick_worst(&peers).await.expect("must return Some for non-empty input");
+        assert!(
+            victim == a || victim == b,
+            "any peer is valid when scores are equal and no events exist"
+        );
+    }
+
+    #[tokio::test]
     async fn test_record_disconnect_sets_last_reason_and_event() {
         let manager = PeerReputationManager::new();
         let peer: SocketAddr = "127.0.0.1:7201".parse().unwrap();
@@ -528,7 +542,8 @@ mod tests {
 
         let events = manager.get_recent_events().await;
         let event = events.iter().rev().find(|e| e.peer == peer).expect("disconnect event present");
-        assert!(event.reason.contains("ping timeout"), "event reason must name the cause");
+        let expected = format!("disconnect: {}", DisconnectReason::PingTimeout.as_str());
+        assert_eq!(event.reason, expected, "event reason must encode the disconnect cause exactly");
     }
 
     #[tokio::test]
