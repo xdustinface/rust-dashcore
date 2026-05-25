@@ -195,6 +195,11 @@ impl ForkBuffer {
         })
     }
 
+    /// Return the set of branch tip hashes currently buffered.
+    pub(super) fn branch_tip_hashes(&self) -> impl Iterator<Item = &BlockHash> {
+        self.branches.keys().map(|(_, tip)| tip)
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.branches.len()

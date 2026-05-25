@@ -52,10 +52,10 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Fork branch that has beaten the active chain on work and is ready for
     /// promotion by the sync coordinator.
     pending_fork_candidate: Option<ForkCandidate>,
-    /// Maps the last-known fork branch tip hash to `(peer, ancestor_height)`.
+    /// Maps the last-known fork branch tip hash to its ancestor height.
     /// Populated whenever a fork batch is buffered so that subsequent batches
     /// extending the same branch are routed to `ingest_fork` correctly.
-    fork_tip_index: HashMap<BlockHash, (SocketAddr, u32)>,
+    fork_tip_index: HashMap<BlockHash, u32>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
@@ -151,7 +151,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         // can be routed here even though their prev_blockhash won't be found
         // on the active chain.
         if let Some(last) = headers.last() {
-            self.fork_tip_index.insert(last.block_hash(), (peer, ancestor_height));
+            self.fork_tip_index.insert(last.block_hash(), ancestor_height);
         }
 
         let active_extension_work = ChainWork::accumulate(ChainWork::zero(), &active_extension);
@@ -163,8 +163,16 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                 peer
             );
             self.pending_fork_candidate = Some(candidate);
+            self.prune_fork_tip_index();
         }
         Ok(())
+    }
+
+    /// Remove `fork_tip_index` entries whose branch no longer exists in the buffer.
+    pub(super) fn prune_fork_tip_index(&mut self) {
+        let live_tips: HashSet<BlockHash> =
+            self.fork_buffer.branch_tip_hashes().copied().collect();
+        self.fork_tip_index.retain(|tip, _| live_tips.contains(tip));
     }
 
     pub(super) async fn tip(&self) -> SyncResult<BlockHeaderTip> {
@@ -257,7 +265,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                     self.ingest_fork(peer, headers, prev_h).await?;
                     return Ok(Vec::new());
                 }
-            } else if let Some(&(_, ancestor_height)) =
+            } else if let Some(&ancestor_height) =
                 self.fork_tip_index.get(&first.prev_blockhash)
             {
                 // prev_blockhash is a fork tip, not on the active chain.
