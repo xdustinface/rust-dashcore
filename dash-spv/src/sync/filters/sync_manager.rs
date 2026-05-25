@@ -57,7 +57,13 @@ impl<
         // insert a fresh batch at `scan_start` and clobber the existing one,
         // leaking its `pending_blocks` counter forever.
         if !self.active_batches.is_empty() {
-            self.filter_pipeline.send_pending(requests, &*self.header_storage.read().await, self.current_generation()).await?;
+            self.filter_pipeline
+                .send_pending(
+                    requests,
+                    &*self.header_storage.read().await,
+                    self.current_generation(),
+                )
+                .await?;
             self.set_state(SyncState::Syncing);
             return Ok(vec![]);
         }
@@ -139,7 +145,9 @@ impl<
             if req_gen != current_gen {
                 tracing::debug!(
                     "dropping stale CFilter at height {}: generation {} != {}",
-                    h, req_gen, current_gen
+                    h,
+                    req_gen,
+                    current_gen
                 );
                 return Ok(vec![]);
             }
@@ -150,7 +158,9 @@ impl<
 
         // Send more requests if there are free slots
         let header_storage = self.header_storage.read().await;
-        self.filter_pipeline.send_pending(requests, &*header_storage, self.current_generation()).await?;
+        self.filter_pipeline
+            .send_pending(requests, &*header_storage, self.current_generation())
+            .await?;
         drop(header_storage);
 
         Ok(self.store_and_match_batches().await?)
@@ -276,7 +286,9 @@ impl<
 
         // Send pending requests (decoupled from processing)
         let header_storage = self.header_storage.read().await;
-        self.filter_pipeline.send_pending(requests, &*header_storage, self.current_generation()).await?;
+        self.filter_pipeline
+            .send_pending(requests, &*header_storage, self.current_generation())
+            .await?;
         drop(header_storage);
 
         // Store completed batches and do speculative matching

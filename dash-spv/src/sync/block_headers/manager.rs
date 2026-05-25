@@ -175,11 +175,6 @@ impl<
         })
     }
 
-    /// Current reorg generation counter snapshot.
-    pub(crate) fn current_generation(&self) -> u64 {
-        self.reorg_generation.load(Ordering::Acquire)
-    }
-
     /// Best chainlock height as `Option<u32>`. `0` is mapped to `None`
     /// (no chainlock yet).
     pub(super) fn best_chainlock_height(&self) -> Option<u32> {
@@ -241,12 +236,12 @@ impl<
             if ancestor_height <= cl_height {
                 tracing::warn!(
                     "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
-                    peer, ancestor_height, cl_height
+                    peer,
+                    ancestor_height,
+                    cl_height
                 );
-                let mut height = ancestor_height + 1;
-                for h in headers {
+                for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
                     self.side_headers.push((height, h.block_hash()));
-                    height += 1;
                 }
                 return Ok(());
             }
@@ -1219,8 +1214,7 @@ mod tests {
         let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
         let (sender, _rx) = create_test_request_sender();
 
-        let events =
-            manager.handle_headers_pipeline(&[fork_header], peer, &sender).await.unwrap();
+        let events = manager.handle_headers_pipeline(&[fork_header], peer, &sender).await.unwrap();
         assert!(events.is_empty(), "chainlock-conflicting fork produces no events");
         assert_eq!(manager.fork_buffer.len(), 0, "fork buffer must stay empty");
         assert_eq!(manager.side_headers.len(), 1, "side_headers must record the header");

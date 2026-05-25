@@ -57,7 +57,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
             if req_gen != current_gen {
                 tracing::debug!(
                     "dropping stale CFHeaders stop_hash {}: generation {} != {}",
-                    cfheaders.stop_hash, req_gen, current_gen
+                    cfheaders.stop_hash,
+                    req_gen,
+                    current_gen
                 );
                 return Ok(vec![]);
             }

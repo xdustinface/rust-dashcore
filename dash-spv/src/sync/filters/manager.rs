@@ -257,7 +257,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         if download_start <= self.progress.filter_header_tip_height() {
             self.filter_pipeline.init(download_start, self.progress.filter_header_tip_height());
             let header_storage = self.header_storage.read().await;
-            self.filter_pipeline.send_pending(requests, &*header_storage, self.current_generation()).await?;
+            self.filter_pipeline
+                .send_pending(requests, &*header_storage, self.current_generation())
+                .await?;
             drop(header_storage);
         } else {
             // No new filters to download, scanning stored filters only
@@ -913,7 +915,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 self.filter_pipeline.extend_target(tip_height);
                 if self.progress.stored_height() < self.progress.filter_header_tip_height() {
                     let header_storage = self.header_storage.read().await;
-                    self.filter_pipeline.send_pending(requests, &*header_storage, self.current_generation()).await?;
+                    self.filter_pipeline
+                        .send_pending(requests, &*header_storage, self.current_generation())
+                        .await?;
                 }
 
                 if self.active_batches.is_empty() {

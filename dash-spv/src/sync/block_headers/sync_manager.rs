@@ -150,9 +150,10 @@ impl<
         let mut events: Vec<SyncEvent> = Vec::new();
         if let Some(candidate) = self.take_pending_fork_candidate() {
             tracing::info!(
-                "driving reorg cascade: ancestor={} headers={}",
+                "driving reorg cascade: ancestor={} headers={} work_bytes={:?}",
                 candidate.ancestor_height,
-                candidate.headers.len()
+                candidate.headers.len(),
+                candidate.total_work.as_bytes()
             );
             if let Some(event) = self.drive_reorg(candidate).await? {
                 events.push(event);

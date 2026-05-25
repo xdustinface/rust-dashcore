@@ -106,10 +106,7 @@ where
             return Ok(None);
         }
         if state.deny_list.contains_key(&candidate_tip_hash) {
-            tracing::debug!(
-                "fork tip {} is on the deny-list, skipping",
-                candidate_tip_hash
-            );
+            tracing::debug!("fork tip {} is on the deny-list, skipping", candidate_tip_hash);
             return Ok(None);
         }
         state.in_flight = true;
@@ -158,10 +155,7 @@ where
             "rejecting reorg: ancestor {} at or below last checkpoint",
             candidate.ancestor_height
         );
-        let ttl = checkpoint_manager
-            .last_checkpoint()
-            .map(|cp| cp.height)
-            .unwrap_or(u32::MAX);
+        let ttl = checkpoint_manager.last_checkpoint().map(|cp| cp.height).unwrap_or(u32::MAX);
         state.lock().await.deny_list.insert(candidate_tip_hash, ttl);
         return Ok(None);
     }
@@ -180,10 +174,8 @@ where
             }
         }
         None => {
-            let checkpoint_height = checkpoint_manager
-                .last_checkpoint()
-                .map(|cp| cp.height)
-                .unwrap_or(0);
+            let checkpoint_height =
+                checkpoint_manager.last_checkpoint().map(|cp| cp.height).unwrap_or(0);
             let recent_floor = current_tip_height.saturating_sub(FRESH_CLIENT_FORK_FLOOR);
             let floor = checkpoint_height.max(recent_floor);
             if candidate.ancestor_height < floor {
@@ -201,11 +193,7 @@ where
     // Depth cap.
     let depth = current_tip_height.saturating_sub(candidate.ancestor_height);
     if depth > MAX_REORG_DEPTH {
-        tracing::warn!(
-            "rejecting reorg: depth {} exceeds cap {}",
-            depth,
-            MAX_REORG_DEPTH
-        );
+        tracing::warn!("rejecting reorg: depth {} exceeds cap {}", depth, MAX_REORG_DEPTH);
         state.lock().await.deny_list.insert(candidate_tip_hash, u32::MAX);
         return Ok(Some(SyncEvent::DeepReorgDetected {
             fork_height: candidate.ancestor_height,
@@ -334,8 +322,7 @@ mod tests {
         let filters = storage.filters();
         let blocks = storage.blocks();
 
-        let candidate =
-            fork_candidate_from(5, chain[5].block_hash(), 3, 1_700_010_000);
+        let candidate = fork_candidate_from(5, chain[5].block_hash(), 3, 1_700_010_000);
 
         let state = Mutex::new(ReorgState::default());
         let generation = AtomicU64::new(7);
@@ -402,12 +389,12 @@ mod tests {
         let filters = storage.filters();
         let blocks = storage.blocks();
 
-        let candidate =
-            fork_candidate_from(2, chain[2].block_hash(), 2, 1_700_010_000);
+        let candidate = fork_candidate_from(2, chain[2].block_hash(), 2, 1_700_010_000);
 
-        let mut state_inner = ReorgState::default();
-        state_inner.in_flight = true;
-        let state = Mutex::new(state_inner);
+        let state = Mutex::new(ReorgState {
+            in_flight: true,
+            ..ReorgState::default()
+        });
         let generation = AtomicU64::new(3);
         let checkpoint_manager = CheckpointManager::new(vec![]);
 
@@ -451,8 +438,7 @@ mod tests {
         let filters = storage.filters();
         let blocks = storage.blocks();
 
-        let candidate =
-            fork_candidate_from(3, chain[3].block_hash(), 2, 1_700_010_000);
+        let candidate = fork_candidate_from(3, chain[3].block_hash(), 2, 1_700_010_000);
         let candidate_tip = candidate.tip_hash();
 
         let state = Mutex::new(ReorgState::default());
@@ -502,8 +488,7 @@ mod tests {
         let blocks = storage.blocks();
 
         // ancestor at 10, tip at 119 → depth 109 > 100.
-        let candidate =
-            fork_candidate_from(10, chain[10].block_hash(), 3, 1_700_100_000);
+        let candidate = fork_candidate_from(10, chain[10].block_hash(), 3, 1_700_100_000);
         let candidate_tip = candidate.tip_hash();
 
         let state = Mutex::new(ReorgState::default());
@@ -562,8 +547,7 @@ mod tests {
         let filters = storage.filters();
         let blocks = storage.blocks();
 
-        let candidate =
-            fork_candidate_from(5, chain[5].block_hash(), 2, 1_700_010_000);
+        let candidate = fork_candidate_from(5, chain[5].block_hash(), 2, 1_700_010_000);
 
         let state = Mutex::new(ReorgState::default());
         let generation = AtomicU64::new(0);

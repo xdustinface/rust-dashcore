@@ -169,11 +169,6 @@ impl FilterHeadersPipeline {
         Ok(())
     }
 
-    /// Send pending requests using a RequestSender (synchronous).
-    pub(super) fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<usize> {
-        self.send_pending_with_generation(requests, 0)
-    }
-
     /// Send pending requests, tagging each in-flight slot with the current
     /// reorg generation so stale `CFHeaders` responses can be dropped.
     pub(super) fn send_pending_with_generation(
@@ -435,7 +430,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let requests = RequestSender::new(tx);
 
-        let err = pipeline.send_pending(&requests).unwrap_err();
+        let err = pipeline.send_pending_with_generation(&requests, 0).unwrap_err();
         assert!(matches!(err, SyncError::InvalidState(_)));
     }
 

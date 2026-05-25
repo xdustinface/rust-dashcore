@@ -160,7 +160,11 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             ));
         }
 
-        let sync_coordinator = SyncCoordinator::new(managers, reorg_generation).await;
+        // `reorg_generation` is held by each manager (via clones threaded in
+        // above); the coordinator itself never reads it directly, so we
+        // don't need to keep an additional handle past this point.
+        drop(reorg_generation);
+        let sync_coordinator = SyncCoordinator::new(managers).await;
 
         // Wrap storage in Arc<Mutex>
         let storage = Arc::new(Mutex::new(storage));

@@ -103,17 +103,12 @@ impl BlocksPipeline {
         self.coordinator.available_to_send() > 0
     }
 
-    /// Send pending block requests up to the concurrency limit.
-    ///
-    /// Sends multiple smaller GetData messages to distribute requests across peers.
-    /// Returns the number of blocks requested.
-    pub(super) async fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<usize> {
-        self.send_pending_with_generation(requests, 0).await
-    }
-
     /// Send pending block requests up to the concurrency limit, tagging each
     /// in-flight slot with the current reorg generation so stale block
     /// responses can be dropped.
+    ///
+    /// Sends multiple smaller GetData messages to distribute requests across peers.
+    /// Returns the number of blocks requested.
     pub(super) async fn send_pending_with_generation(
         &mut self,
         requests: &RequestSender,

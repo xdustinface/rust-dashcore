@@ -78,7 +78,9 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
             if req_gen != current_gen {
                 tracing::debug!(
                     "dropping stale Block {}: generation {} != {}",
-                    hashed_block.hash(), req_gen, current_gen
+                    hashed_block.hash(),
+                    req_gen,
+                    current_gen
                 );
                 return Ok(vec![]);
             }

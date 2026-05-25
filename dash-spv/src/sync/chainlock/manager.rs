@@ -285,12 +285,6 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         self.best_chainlock.as_ref()
     }
 
-    /// Height of the best validated ChainLock, if any. Used by the reorg
-    /// pipeline as the lower bound below which a fork ancestor cannot land.
-    pub(crate) fn best_chainlock_height(&self) -> Option<u32> {
-        self.best_chainlock.as_ref().map(|cl| cl.block_height)
-    }
-
     /// Check if a block at the given height is chainlocked.
     /// All blocks at or below the best validated ChainLock height are considered locked.
     pub fn is_block_chainlocked(&self, height: u32) -> bool {
