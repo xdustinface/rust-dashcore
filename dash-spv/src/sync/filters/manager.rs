@@ -149,6 +149,18 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         self.filter_pipeline = FiltersPipeline::new();
     }
 
+    /// Reset all sync state to begin again at `fork_height` after a reorg
+    /// cascade. Clears in-flight batches and rewinds the per-batch
+    /// processing cursors so the next `FilterHeadersStored` event drives a
+    /// fresh download starting at the truncated ancestor.
+    pub(super) fn reset_for_reorg(&mut self, fork_height: u32) {
+        self.reset_for_rescan();
+        self.next_batch_to_store = fork_height;
+        self.processing_height = fork_height;
+        self.progress.update_committed_height(fork_height);
+        self.progress.update_stored_height(fork_height);
+    }
+
     async fn load_filters(
         &self,
         start_height: u32,

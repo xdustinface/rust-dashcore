@@ -175,6 +175,19 @@ impl<
                 return self.handle_new_filter_headers(*tip_height, requests).await;
             }
 
+            SyncEvent::ChainReorg {
+                fork_height,
+                ..
+            } => {
+                tracing::info!(
+                    "FiltersManager: cascading ChainReorg, resetting state at {}",
+                    fork_height
+                );
+                self.reset_for_reorg(*fork_height);
+                self.set_state(SyncState::WaitForEvents);
+                return Ok(vec![]);
+            }
+
             // React to BlockProcessed events from the BlocksManager
             SyncEvent::BlockProcessed {
                 block_hash,

@@ -152,6 +152,20 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
             SyncEvent::BlockHeadersStored {
                 tip_height,
             } => self.handle_new_headers(*tip_height, requests).await,
+            SyncEvent::ChainReorg {
+                fork_height,
+                ..
+            } => {
+                tracing::info!(
+                    "FilterHeadersManager: cascading ChainReorg, resetting pipeline at {}",
+                    fork_height
+                );
+                self.pipeline = FilterHeadersPipeline::default();
+                self.checkpoint_start_height = None;
+                self.progress.update_current_height(*fork_height);
+                self.set_state(SyncState::WaitForEvents);
+                Ok(vec![])
+            }
             _ => Ok(vec![]),
         }
     }

@@ -185,6 +185,23 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
             return self.process_buffered_blocks().await;
         }
 
+        // React to a cascade-driven reorg: drop all in-flight block work so the
+        // truncated chain's filter pipeline can re-issue downloads from scratch.
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                "BlocksManager: cascading ChainReorg, resetting pipeline at {}",
+                fork_height
+            );
+            self.pipeline = super::pipeline::BlocksPipeline::new();
+            self.filters_sync_complete = false;
+            self.set_state(SyncState::WaitForEvents);
+            return Ok(vec![]);
+        }
+
         // React to FiltersSyncComplete - filters are done, no more BlocksNeeded events coming
         if let SyncEvent::FiltersSyncComplete {
             ..
