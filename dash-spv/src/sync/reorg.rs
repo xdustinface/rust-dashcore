@@ -24,6 +24,13 @@ use crate::sync::SyncEvent;
 /// deny-list.
 pub(crate) const MAX_REORG_DEPTH: u32 = 100;
 
+/// Returns `true` when a fork's common ancestor lies strictly below the best
+/// chainlock height, meaning the fork rewrites at least one finalised block
+/// and can never become canonical.
+pub(crate) fn is_below_chainlock_floor(ancestor_height: u32, cl_height: u32) -> bool {
+    ancestor_height < cl_height
+}
+
 /// Fallback floor distance used when no chainlock has been observed yet.
 /// A fork ancestor below `current_tip_height - FRESH_CLIENT_FORK_FLOOR` is
 /// rejected to prevent deep reorgs on a fresh client that has no chainlock
@@ -163,7 +170,7 @@ where
     // Chainlock floor or fresh-client fallback.
     match best_chainlock_height {
         Some(cl_height) => {
-            if candidate.ancestor_height < cl_height {
+            if is_below_chainlock_floor(candidate.ancestor_height, cl_height) {
                 tracing::warn!(
                     "rejecting reorg: ancestor {} below best chainlock {}",
                     candidate.ancestor_height,
