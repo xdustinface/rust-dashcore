@@ -604,8 +604,12 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
     assert_eq!(orphaned.len(), reorg_depth as usize);
     assert_eq!(replacement.len(), reorg_depth as usize + 1);
 
-    let (observed_fork, _new_tip) =
-        wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, SYNC_TIMEOUT).await;
+    let (observed_fork, _new_tip) = wait_for_chain_reorg_event(
+        &mut client_handle.sync_event_receiver,
+        Some(fork_height),
+        SYNC_TIMEOUT,
+    )
+    .await;
     assert_eq!(
         observed_fork, fork_height,
         "ChainReorg fork height should match orchestrated reorg"
@@ -695,7 +699,8 @@ async fn test_qrinfo_refresh_across_dip24_cycle_reorg() {
     let dkg_interval = ctx.mn_ctx.metadata.dkg_interval;
     let (_orphaned, _replacement) = ctx.mn_ctx.mine_reorg(dkg_interval);
 
-    let _ = wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, SYNC_TIMEOUT).await;
+    let _ = wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, None, SYNC_TIMEOUT)
+        .await;
 
     {
         let engine = client_handle.engine.read().await;
