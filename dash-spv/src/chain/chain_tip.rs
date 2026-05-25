@@ -44,3 +44,18 @@ pub(crate) struct ForkCandidate {
     pub(crate) headers: Vec<HashedBlockHeader>,
     pub(crate) total_work: ChainWork,
 }
+
+impl ForkCandidate {
+    /// Hash of the candidate's tip header.
+    pub(crate) fn tip_hash(&self) -> BlockHash {
+        self.headers
+            .last()
+            .map(|h| *h.hash())
+            .expect("ForkCandidate must carry at least one header")
+    }
+
+    /// Height of the candidate's tip header.
+    pub(crate) fn tip_height(&self) -> u32 {
+        self.ancestor_height + self.headers.len() as u32
+    }
+}
