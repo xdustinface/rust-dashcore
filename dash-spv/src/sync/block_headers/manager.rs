@@ -52,6 +52,10 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Fork branch that has beaten the active chain on work and is ready for
     /// promotion by the sync coordinator.
     pending_fork_candidate: Option<ForkCandidate>,
+    /// Maps the last-known fork branch tip hash to `(peer, ancestor_height)`.
+    /// Populated whenever a fork batch is buffered so that subsequent batches
+    /// extending the same branch are routed to `ingest_fork` correctly.
+    fork_tip_index: HashMap<BlockHash, (SocketAddr, u32)>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
@@ -98,6 +102,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             announced_peers: HashSet::new(),
             fork_buffer: ForkBuffer::new(Params::new(network)),
             pending_fork_candidate: None,
+            fork_tip_index: HashMap::new(),
         })
     }
 
@@ -121,6 +126,15 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         let storage = self.header_storage.read().await;
         let history_start = ancestor_height.saturating_sub(Self::DGW_HISTORY);
         let history = storage.load_headers(history_start..ancestor_height + 1).await?;
+        let expected_len = (ancestor_height + 1 - history_start) as usize;
+        if history.len() != expected_len {
+            return Err(SyncError::Validation(format!(
+                "storage gap before ancestor at height {}: expected {} headers, got {}",
+                ancestor_height,
+                expected_len,
+                history.len()
+            )));
+        }
         let ancestor = *history.last().ok_or_else(|| {
             SyncError::Validation(format!("missing ancestor header at height {}", ancestor_height))
         })?;
@@ -132,6 +146,13 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         drop(storage);
 
         self.fork_buffer.ingest(peer, headers, ancestor_height, ancestor, &history)?;
+
+        // Track the new fork tip so subsequent batches extending this branch
+        // can be routed here even though their prev_blockhash won't be found
+        // on the active chain.
+        if let Some(last) = headers.last() {
+            self.fork_tip_index.insert(last.block_hash(), (peer, ancestor_height));
+        }
 
         let active_extension_work = ChainWork::accumulate(ChainWork::zero(), &active_extension);
         if let Some(candidate) = self.fork_buffer.take_winning_candidate(active_extension_work) {
@@ -173,6 +194,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         loop {
             if let Some(header) = storage.get_header(height).await? {
                 locator.push(header.block_hash());
+            } else {
+                tracing::warn!("build_locator: header at height {} missing from storage", height);
             }
             if height == 0 {
                 break;
@@ -234,6 +257,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                     self.ingest_fork(peer, headers, prev_h).await?;
                     return Ok(Vec::new());
                 }
+            } else if let Some(&(_, ancestor_height)) =
+                self.fork_tip_index.get(&first.prev_blockhash)
+            {
+                // prev_blockhash is a fork tip, not on the active chain.
+                // Route continuation batches to the fork buffer using the
+                // same ancestor_height as the first batch.
+                self.ingest_fork(peer, headers, ancestor_height).await?;
+                return Ok(Vec::new());
             }
         }
 
@@ -737,6 +768,100 @@ mod tests {
 
         // Stays under the dashd ~32 entry bound.
         assert!(locator.len() <= 32, "locator should not exceed 32 entries, got {}", locator.len());
+    }
+
+    /// Build a regtest manager seeded with `count` blocks so the storage tip is
+    /// at height `count - 1`. Returns the manager and the stored chain.
+    async fn create_regtest_manager_with_chain(
+        count: usize,
+    ) -> (TestBlockHeadersManager, Vec<Header>) {
+        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
+        let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        // Build a real hash-chained regtest chain using easy PoW so storage
+        // can index the hashes for `get_header_height_by_hash`.
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let mut prev = BlockHash::all_zeros();
+        let mut chain = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time: 1_700_000_000 + i as u32 * 600,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            chain.push(h);
+        }
+        storage.store_headers(&chain).await.unwrap();
+        let checkpoint_manager = Arc::new(CheckpointManager::new(vec![]));
+        let manager = BlockHeadersManager::new(
+            storage.block_headers(),
+            storage.metadata(),
+            checkpoint_manager,
+            Network::Regtest,
+        )
+        .await
+        .expect("failed to create regtest manager");
+        (manager, chain)
+    }
+
+    #[tokio::test]
+    async fn fork_header_at_depth_is_routed_to_buffer() {
+        // Store a 5-block chain (heights 0-4). Build a fork extending height 1
+        // (depth 3 below tip=4). The fork must be routed to the fork buffer,
+        // not the pipeline. Routing is confirmed by the return being empty
+        // events and the fork buffer holding one entry.
+        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+
+        let (mut manager, chain) = create_regtest_manager_with_chain(5).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+
+        // Build one valid fork header extending chain[1] (height 1, depth 3).
+        let ancestor = chain[1];
+        let fork_time = ancestor.time + 11 * 600 + 1;
+        let mut fork_header = None;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: fork_time,
+                bits: easy_bits,
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce space exhausted");
+
+        let events = manager.handle_headers_pipeline(&[fork_header], peer, &sender).await.unwrap();
+
+        // Fork path returns no events, not the pipeline path.
+        assert!(events.is_empty());
+        // Branch entered the buffer.
+        assert_eq!(manager.fork_buffer.len(), 1);
+        assert!(manager.take_pending_fork_candidate().is_none());
     }
 
     #[tokio::test]

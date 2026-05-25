@@ -643,4 +643,53 @@ mod tests {
         pipeline.mark_tip_complete();
         assert!(pipeline.is_tip_complete());
     }
+
+    #[test]
+    fn send_pending_uses_full_locator_when_storage_matches_tip_and_single_entry_otherwise() {
+        use crate::network::NetworkRequest;
+        use dashcore::network::message::NetworkMessage;
+
+        let tip_hash = BlockHash::dummy(77);
+        let mut tip_seg = SegmentState::new(0, 100, tip_hash, None, None);
+        tip_seg.current_tip_hash = tip_hash;
+
+        let cm = create_test_checkpoint_manager(true);
+        let mut pipeline = HeadersPipeline::new(cm);
+        pipeline.initialized = true;
+        pipeline.segments = vec![tip_seg];
+
+        let (sender, mut rx) = create_test_request_sender();
+        let full_locator = vec![tip_hash, BlockHash::dummy(1), BlockHash::dummy(0)];
+
+        // Storage-caught-up case: tip_locator[0] == segment.current_tip_hash.
+        // Expect the full locator to be sent.
+        pipeline.send_pending(&sender, &full_locator).unwrap();
+        match rx.try_recv().unwrap() {
+            NetworkRequest::SendMessage(NetworkMessage::GetHeaders(msg)) => {
+                assert_eq!(
+                    msg.locator_hashes, full_locator,
+                    "full locator when storage matches segment tip"
+                );
+            }
+            other => panic!("unexpected request: {:?}", other),
+        }
+
+        // Mid-sync case: segment has advanced past storage, so tip_locator[0]
+        // no longer matches segment.current_tip_hash. Expect single-entry fallback.
+        let advanced_hash = BlockHash::dummy(88);
+        pipeline.segments[0].current_tip_hash = advanced_hash;
+        pipeline.segments[0].clear_in_flight();
+
+        pipeline.send_pending(&sender, &full_locator).unwrap();
+        match rx.try_recv().unwrap() {
+            NetworkRequest::SendMessage(NetworkMessage::GetHeaders(msg)) => {
+                assert_eq!(
+                    msg.locator_hashes,
+                    vec![advanced_hash],
+                    "single-entry fallback when storage lags segment tip"
+                );
+            }
+            other => panic!("unexpected request: {:?}", other),
+        }
+    }
 }

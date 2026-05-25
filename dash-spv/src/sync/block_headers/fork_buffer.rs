@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use dashcore::consensus::Params;
 use dashcore::{BlockHash, Header};
 
-use crate::chain::difficulty::next_work_required_dgw_v3;
+use crate::chain::difficulty::{min_difficulty_bits, next_work_required_dgw_v3};
 use crate::chain::{ChainWork, ForkCandidate};
 use crate::error::{SyncError, SyncResult};
 use crate::types::HashedBlockHeader;
@@ -26,6 +26,9 @@ const MTP_WINDOW: usize = 11;
 
 /// Cap on simultaneous fork branches buffered per peer to keep memory bounded.
 const MAX_FORK_HEADERS_PER_PEER: usize = 4096;
+
+/// Maximum distinct fork branch tips a single peer may contribute.
+const MAX_BRANCHES_PER_PEER: usize = 16;
 
 #[derive(Debug)]
 pub(super) struct ForkBuffer {
@@ -73,6 +76,13 @@ impl ForkBuffer {
                 MAX_FORK_HEADERS_PER_PEER
             )));
         }
+        let peer_branch_count = self.branches.keys().filter(|(p, _)| *p == peer).count();
+        if peer_branch_count >= MAX_BRANCHES_PER_PEER {
+            return Err(SyncError::Validation(format!(
+                "Too many concurrent fork branches from peer {} (max {})",
+                peer, MAX_BRANCHES_PER_PEER
+            )));
+        }
         debug_assert_eq!(
             history.last().map(|h| h.block_hash()),
             Some(ancestor_header.block_hash()),
@@ -115,7 +125,9 @@ impl ForkBuffer {
             // DGW v3 retarget anchored at the ancestor's window.
             let expected_bits =
                 next_work_required_dgw_v3(&rolling_history, height - 1, &self.params);
-            if header.bits != expected_bits {
+            let min_diff = min_difficulty_bits(&self.params, prev.time, prev.bits, header.time);
+            let bits_ok = header.bits == expected_bits || min_diff == Some(header.bits);
+            if !bits_ok {
                 return Err(SyncError::Validation(format!(
                     "Fork header at height {} bad bits: got {:?}, expected {:?}",
                     height, header.bits, expected_bits
@@ -278,6 +290,9 @@ mod tests {
 
     #[test]
     fn ingest_rejects_branch_with_bad_pow() {
+        // One fork header with bits set to the hardest possible compact target
+        // so that no X11 hash can satisfy PoW. The DGW bits mismatch is also
+        // present, but PoW fires first and we assert specifically on that error.
         let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
         let mut buf = ForkBuffer::new(regtest_params());
 
@@ -285,18 +300,104 @@ mod tests {
         let ancestor_height = (active.len() as u32) - 1;
         let ancestor = *active.last().unwrap();
 
-        let mut fork = build_chain(1_700_000_000 + 12 * 600, 100, ancestor.block_hash());
-        // Wreck the last header's PoW by raising the difficulty target.
-        let last_idx = fork.len() - 1;
-        fork[last_idx].bits = CompactTarget::from_consensus(0x1d00ffff);
-        // Re-chain hashes don't change since prev_blockhash already set;
-        // the bits change breaks PoW, not continuity.
+        // 0x01000001 encodes target=1; no 32-byte X11 output can be ≤ 1.
+        let impossible_bits = CompactTarget::from_consensus(0x01000001);
+        let fork_header = Header {
+            version: Version::ONE,
+            prev_blockhash: ancestor.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000 + 12 * 600,
+            bits: impossible_bits,
+            nonce: 0,
+        };
 
         let err = buf
-            .ingest(peer, &fork, ancestor_height, ancestor, &active)
-            .expect_err("bad PoW must be rejected");
-        assert!(matches!(err, SyncError::Validation(_)), "got {:?}", err);
-        // Nothing buffered on rejection.
+            .ingest(peer, &[fork_header], ancestor_height, ancestor, &active)
+            .expect_err("impossible PoW target must be rejected");
+        assert!(
+            matches!(&err, SyncError::Validation(msg) if msg.contains("failed PoW target")),
+            "expected PoW failure, got: {:?}",
+            err
+        );
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn ingest_rejects_branch_with_wrong_bits() {
+        // One fork header with correct PoW nonce but wrong bits field (DGW mismatch
+        // only). Because the nonce was found for EASY_BITS and EASY_BITS is the
+        // regtest pow_limit, any change to bits leaves the nonce intact — the hash
+        // still meets the original target — so only the bits check fires.
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let mut fork_header = easy_header(ancestor.block_hash(), 1_700_000_000 + 12 * 600, 0);
+        // Switch bits to 0x2100ffff (easier than EASY_BITS) so the existing
+        // nonce still satisfies PoW, but the bits value differs from the DGW
+        // expected output (0x207fffff on regtest). This isolates the DGW check.
+        let different_bits = CompactTarget::from_consensus(0x2100_ffff);
+        fork_header.bits = different_bits;
+
+        let err = buf
+            .ingest(peer, &[fork_header], ancestor_height, ancestor, &active)
+            .expect_err("wrong bits must be rejected");
+        assert!(
+            matches!(&err, SyncError::Validation(msg) if msg.contains("bad bits")),
+            "expected DGW bits failure, got: {:?}",
+            err
+        );
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn ingest_rejects_branch_with_stale_timestamp() {
+        // One fork header whose time equals the MTP of the ancestor window,
+        // violating the strictly-greater rule (time must be > MTP, not >=).
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        // Build 11 headers at regular 600s spacing.
+        let start_time = 1_700_000_000u32;
+        let active = build_chain(start_time, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        // Compute the MTP of the 11-block window.
+        let mut times: Vec<u32> = active.iter().map(|h| h.time).collect();
+        times.sort_unstable();
+        let mtp = times[times.len() / 2] as u64;
+
+        // Build a fork header with time == mtp (must be strictly greater).
+        // Search nonces for one whose hash meets the easy target at this time.
+        let mut fork_header = None;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: mtp as u32,
+                bits: CompactTarget::from_consensus(EASY_BITS),
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce search exhausted for MTP test");
+
+        let err = buf
+            .ingest(peer, &[fork_header], ancestor_height, ancestor, &active)
+            .expect_err("MTP violation must be rejected");
+        assert!(
+            matches!(&err, SyncError::Validation(msg) if msg.contains("MTP rule")),
+            "expected MTP failure, got: {:?}",
+            err
+        );
         assert_eq!(buf.len(), 0);
     }
 

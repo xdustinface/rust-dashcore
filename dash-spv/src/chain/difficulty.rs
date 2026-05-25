@@ -86,6 +86,45 @@ pub(crate) fn next_work_required_dgw_v3(
     Target::from_be_bytes(bn_new.to_be_bytes()).to_compact_lossy()
 }
 
+/// Check whether `candidate_time` triggers a min-difficulty exception for
+/// networks where `allow_min_difficulty_blocks` is set (testnet, devnet).
+///
+/// Mirrors dashd's `fPowAllowMinDifficultyBlocks` branch in `GetNextWorkRequired`:
+/// - If candidate time > prev tip time + 2h: return `pow_limit` bits.
+/// - If candidate time > prev tip time + 4×spacing: return prev tip bits * 10
+///   (clamped to `pow_limit`).
+/// - Otherwise: return `None` (normal DGW applies).
+pub(crate) fn min_difficulty_bits(
+    params: &Params,
+    prev_tip_time: u32,
+    prev_tip_bits: CompactTarget,
+    candidate_time: u32,
+) -> Option<CompactTarget> {
+    if !params.allow_min_difficulty_blocks {
+        return None;
+    }
+    let pow_limit = pow_limit_target(params.network);
+    let pow_limit_bits = pow_limit.to_compact_lossy();
+    let gap = (candidate_time as i64 - prev_tip_time as i64).max(0) as u64;
+    if gap > 2 * 60 * 60 {
+        return Some(pow_limit_bits);
+    }
+    if gap > params.pow_target_spacing * 4 {
+        let prev_target = U256::from_be_bytes(Target::from_compact(prev_tip_bits).to_be_bytes());
+        let limit = U256::from_be_bytes(pow_limit.to_be_bytes());
+        // Clamp before multiplying to avoid 256-bit overflow: if prev_target is
+        // already at or above pow_limit / 10, the result caps to pow_limit.
+        let threshold = limit.div_u64(10);
+        let result = if prev_target >= threshold {
+            limit
+        } else {
+            prev_target.mul_u64(10)
+        };
+        return Some(Target::from_be_bytes(result.to_be_bytes()).to_compact_lossy());
+    }
+    None
+}
+
 fn pow_limit_target(network: Network) -> Target {
     // dashcore stores network `pow_limit` as a `Work` value whose `to_target`
     // inverse does not match dashd's `consensus.powLimit` for the network
@@ -189,6 +228,7 @@ impl U256 {
             *slot = prod as u64;
             carry = prod >> 64;
         }
+        debug_assert_eq!(carry, 0, "U256::mul_u64 overflow: result exceeds 256 bits");
         U256 {
             limbs: out,
         }
