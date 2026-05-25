@@ -638,3 +638,86 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
 
     client_handle.stop().await;
 }
+
+/// Mine a DKG cycle, then invalidate the commitment block so a competing
+/// branch's commitment replaces it. The rewind must drop the orphaned cycle's
+/// rotated quorums from `rotated_quorums_per_cycle` and the post-rewind
+/// QRInfo must refill the map with the new cycle's quorums. The orchestration
+/// requires a full live masternode network so the replacement DKG can actually
+/// complete; on infrastructure where that is flaky the test is marked
+/// `#[ignore]` and tracked under issue #142.
+#[tokio::test]
+#[ignore = "see #142: needs reliable replacement DKG on regtest masternode harness"]
+async fn test_qrinfo_refresh_across_dip24_cycle_reorg() {
+    let Some(mut ctx) = TestContext::new(false).await else {
+        return;
+    };
+
+    let wallet = create_dummy_wallet();
+    let config =
+        create_mn_test_config(ctx.storage_path().to_path_buf(), ctx.mn_ctx.controller_addr);
+    let mut client_handle = create_and_start_client(&config, Arc::clone(&wallet)).await;
+
+    let initial =
+        wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    assert_eq!(initial.state(), SyncState::Synced);
+
+    // Mine a DKG cycle and capture the cycle key for the freshly-mined cycle.
+    let original_cycle_hash = ctx.mn_ctx.mine_dkg_cycle().expect("DKG cycle should succeed");
+    let _ = wait_for_mn_state_with_stored_cycle_above(
+        &mut client_handle.sync_event_receiver,
+        initial.current_height(),
+        SYNC_TIMEOUT,
+    )
+    .await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            engine.rotated_quorums_per_cycle.contains_key(&original_cycle_hash),
+            "freshly-mined cycle should be stored under {}",
+            original_cycle_hash
+        );
+    }
+
+    // Roll back deeply enough to invalidate the cycle commitment block, then
+    // mine a replacement DKG cycle.
+    let dkg_interval = ctx.mn_ctx.metadata.dkg_interval;
+    let (_orphaned, _replacement) = ctx.mn_ctx.mine_reorg(dkg_interval);
+
+    let _ = wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, SYNC_TIMEOUT).await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            !engine.rotated_quorums_per_cycle.contains_key(&original_cycle_hash),
+            "orphaned cycle commitment {} must be dropped from rotated_quorums_per_cycle",
+            original_cycle_hash
+        );
+    }
+
+    // Drive a replacement DKG so the new cycle's commitment is mined.
+    let replacement_cycle_hash =
+        ctx.mn_ctx.mine_dkg_cycle().expect("replacement DKG cycle should succeed");
+    let _ = wait_for_mn_state_with_stored_cycle_above(
+        &mut client_handle.sync_event_receiver,
+        initial.current_height(),
+        SYNC_TIMEOUT,
+    )
+    .await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            engine.rotated_quorums_per_cycle.contains_key(&replacement_cycle_hash),
+            "replacement cycle {} should be stored after rewind",
+            replacement_cycle_hash
+        );
+        assert_ne!(
+            replacement_cycle_hash, original_cycle_hash,
+            "replacement DKG must mint a different cycle key"
+        );
+    }
+
+    client_handle.stop().await;
+}
