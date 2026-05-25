@@ -207,6 +207,29 @@ pub enum SyncEvent {
         /// Depth of the proposed reorg (active_tip_height - fork_height).
         depth: u32,
     },
+
+    /// A CLSig was received for a block hash the local header chain has not
+    /// resolved yet. The chainlock is queued and re-evaluated when the
+    /// matching header lands.
+    ///
+    /// Emitted by: `ChainLockManager`
+    /// Consumed by: External listeners (monitoring only)
+    PendingChainLockQueued {
+        /// The chainlock that could not be matched against a local header.
+        chainlock: ChainLock,
+    },
+
+    /// A validated CLSig disagrees with the local block at its claimed
+    /// height. The local chain must reorg onto the chainlocked branch.
+    ///
+    /// Emitted by: `ChainLockManager`
+    /// Consumed by: `BlockHeadersManager`
+    ChainLockForcedReorg {
+        /// The chainlock that forces the reorg.
+        chain_lock: ChainLock,
+        /// Height at which the fork is anchored (`chain_lock.block_height - 1`).
+        fork_height: u32,
+    },
 }
 
 impl fmt::Display for SyncEvent {
@@ -305,6 +328,21 @@ impl fmt::Display for SyncEvent {
                 fork_height,
                 depth,
             } => write!(f, "DeepReorgDetected(fork_height={}, depth={})", fork_height, depth),
+            SyncEvent::PendingChainLockQueued {
+                chainlock,
+            } => write!(
+                f,
+                "PendingChainLockQueued(height={}, hash={})",
+                chainlock.block_height, chainlock.block_hash
+            ),
+            SyncEvent::ChainLockForcedReorg {
+                chain_lock,
+                fork_height,
+            } => write!(
+                f,
+                "ChainLockForcedReorg(fork_height={}, cl_height={}, cl_hash={})",
+                fork_height, chain_lock.block_height, chain_lock.block_hash
+            ),
         }
     }
 }
