@@ -414,6 +414,20 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
         event: &SyncEvent,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            new_tip,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                new_tip = %new_tip,
+                "MasternodesManager: cascading ChainReorg, rewinding engine"
+            );
+            return self.rewind_to_height(*fork_height, *new_tip, requests).await;
+        }
+
         // Track block header tip height as headers come in
         if let SyncEvent::BlockHeadersStored {
             tip_height,

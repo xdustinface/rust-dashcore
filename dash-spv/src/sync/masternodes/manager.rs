@@ -1131,7 +1131,10 @@ mod tests {
         let (mut manager, requests, _rx) = make_synced_incremental_manager(120).await;
         manager.sync_state.known_mn_list_heights.insert(120);
 
-        manager.rewind_to_height(80, BlockHash::from_byte_array([0xCC; 32]), &requests).await.unwrap();
+        manager
+            .rewind_to_height(80, BlockHash::from_byte_array([0xCC; 32]), &requests)
+            .await
+            .unwrap();
         assert!(!manager.is_synced_for_height(80));
 
         // Simulate the post-rewind QRInfo response settling: the manager's
@@ -1140,5 +1143,35 @@ mod tests {
         manager.sync_state.known_mn_list_heights.insert(80);
         assert!(manager.is_synced_for_height(80));
         assert!(!manager.is_synced_for_height(81));
+    }
+
+    /// A `SyncEvent::ChainReorg` delivered to `handle_sync_event` must invoke
+    /// the rewind path. Engine state above the fork is gone, the manager
+    /// transitions to `Syncing`, and a fresh QRInfo is queued for the new tip.
+    #[tokio::test]
+    async fn test_handle_sync_event_chain_reorg_invokes_rewind() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(120);
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::from_byte_array([0xAA; 32]),
+            new_tip: BlockHash::from_byte_array([0xBB; 32]),
+            generation: 1,
+        };
+        manager.handle_sync_event(&event, &requests).await.expect("handle_sync_event succeeds");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+        assert_eq!(manager.state(), SyncState::Syncing);
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        let queued = rx.try_recv().expect("ChainReorg must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
     }
 }
