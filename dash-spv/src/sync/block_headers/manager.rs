@@ -267,8 +267,17 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             } else if let Some(&ancestor_height) = self.fork_tip_index.get(&first.prev_blockhash) {
                 // prev_blockhash is a fork tip, not on the active chain.
                 // Route continuation batches to the fork buffer using the
-                // same ancestor_height as the first batch.
-                self.ingest_fork(peer, headers, ancestor_height).await?;
+                // same ancestor_height as the first batch. Validation errors
+                // are swallowed because the second batch anchors at the
+                // active-chain ancestor rather than the buffered fork tip;
+                // proper re-anchoring is deferred to Phase 3.
+                match self.ingest_fork(peer, headers, ancestor_height).await {
+                    Ok(()) => {}
+                    Err(SyncError::Validation(msg)) => {
+                        tracing::debug!("fork continuation validation error: {}", msg);
+                    }
+                    Err(e) => return Err(e),
+                }
                 return Ok(Vec::new());
             }
         }
@@ -888,16 +897,17 @@ mod tests {
         }
         let second_fork_header = second_fork_header.expect("nonce space exhausted");
 
-        // The continuation is routed into ingest_fork (not silently dropped). The
-        // current implementation passes the original ancestor from active storage,
-        // so the chain-continuity check in ingest fails — but the key point is the
-        // routing happened rather than silently discarding the batch as a pipeline
-        // mismatch.
+        // The continuation batch is routed through fork_tip_index to ingest_fork.
+        // The ingest fails the chain-continuity check (second batch anchors at the
+        // active-chain ancestor, not the buffered fork tip), but the Validation
+        // error is swallowed so the peer is not penalized. The fork buffer stays
+        // at one branch; proper multi-batch continuation is deferred to Phase 3.
         let result2 = manager.handle_headers_pipeline(&[second_fork_header], peer, &sender).await;
-        assert!(
-            matches!(&result2, Err(SyncError::Validation(msg)) if msg.contains("chain break")),
-            "continuation must be routed to ingest_fork (validation error), not silently dropped: {:?}",
-            result2
+        assert!(result2.is_ok(), "continuation must not propagate error to caller: {:?}", result2);
+        assert_eq!(
+            manager.fork_buffer.len(),
+            1,
+            "fork buffer must not grow (second ingest fails chain-continuity)"
         );
     }
 
