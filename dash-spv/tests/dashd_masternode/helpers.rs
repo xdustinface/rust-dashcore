@@ -39,6 +39,47 @@ pub(super) fn assert_all_rotated_quorums_verified(engine: &MasternodeListEngine)
     }
 }
 
+/// Wait for all sync components (headers, filter headers, filters, blocks, masternodes)
+/// to reach `Synced` state. Callers should use this before triggering a reorg to ensure
+/// the filter pipeline has finished downloading filters for the current tip, which prevents
+/// the SPV from re-requesting orphaned block filters after the reorg and getting disconnected
+/// by dashd for requesting invalid block hashes.
+pub(super) async fn wait_for_full_sync(
+    progress_receiver: &mut watch::Receiver<SyncProgress>,
+    timeout_secs: u64,
+) {
+    {
+        let progress = progress_receiver.borrow_and_update();
+        if progress.is_synced() {
+            return;
+        }
+    }
+
+    let timeout = time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                let progress = progress_receiver.borrow();
+                panic!(
+                    "Timeout waiting for full sync. Current progress: {:?}",
+                    progress
+                );
+            }
+            result = progress_receiver.changed() => {
+                if result.is_err() {
+                    panic!("Progress channel closed");
+                }
+                let progress = progress_receiver.borrow_and_update().clone();
+                if progress.is_synced() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Wait for masternode sync to reach Synced state.
 pub(super) async fn wait_for_masternode_sync(
     progress_receiver: &mut watch::Receiver<SyncProgress>,

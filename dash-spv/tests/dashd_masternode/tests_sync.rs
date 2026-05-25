@@ -11,8 +11,9 @@ use dashcore::sml::llmq_type::LLMQType;
 
 use super::helpers::{
     assert_all_rotated_quorums_verified, wait_for_chain_reorg_event,
-    wait_for_chainlock_height_at_least, wait_for_masternode_sync, wait_for_mn_state_event,
-    wait_for_mn_state_event_above, wait_for_mn_state_with_stored_cycle_above,
+    wait_for_chainlock_height_at_least, wait_for_full_sync, wait_for_masternode_sync,
+    wait_for_mn_state_event, wait_for_mn_state_event_above,
+    wait_for_mn_state_with_stored_cycle_above,
 };
 use super::setup::{
     create_and_start_client, create_dummy_wallet, create_mn_test_config, TestContext, SYNC_TIMEOUT,
@@ -593,6 +594,8 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
     )
     .await;
     tracing::info!("Pre-reorg masternode tip at height {}", mid);
+
+    wait_for_full_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
 
     let reorg_depth = 3;
     let pre_reorg_tip = ctx.mn_ctx.controller.get_block_count();
