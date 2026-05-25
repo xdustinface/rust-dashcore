@@ -44,6 +44,14 @@ struct BufferedBranch {
     arrived_at: Instant,
 }
 
+/// Result of extending a buffered branch with one or more continuation headers.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BranchUpdate {
+    pub(super) new_tip: BlockHash,
+    pub(super) new_height: u32,
+    pub(super) new_work: ChainWork,
+}
+
 impl ForkBuffer {
     pub(super) fn new(params: Params) -> Self {
         Self {
@@ -89,55 +97,9 @@ impl ForkBuffer {
             "history.last() must be the ancestor header"
         );
 
-        // Chain continuity: each header must extend the previous.
-        let mut prev = ancestor_header;
-        let mut hashed: Vec<HashedBlockHeader> = Vec::with_capacity(headers.len());
         let mut rolling_history: Vec<Header> = history.to_vec();
-        for (offset, header) in headers.iter().enumerate() {
-            let height = ancestor_height + offset as u32 + 1;
-            if header.prev_blockhash != prev.block_hash() {
-                return Err(SyncError::ForkChainBreak(format!(
-                    "expected prev {}, got {}",
-                    prev.block_hash(),
-                    header.prev_blockhash
-                )));
-            }
-
-            // PoW target met.
-            let hashed_header = HashedBlockHeader::from(*header);
-            if !header.target().is_met_by(*hashed_header.hash()) {
-                return Err(SyncError::Validation(format!(
-                    "Fork header at height {} failed PoW target",
-                    height
-                )));
-            }
-
-            // Median time past: candidate time must strictly exceed MTP of
-            // last 11 ancestor headers.
-            let mtp = median_time_past(&rolling_history);
-            if (header.time as u64) <= mtp {
-                return Err(SyncError::Validation(format!(
-                    "Fork header at height {} fails MTP rule ({} <= {})",
-                    height, header.time, mtp
-                )));
-            }
-
-            // DGW v3 retarget anchored at the ancestor's window.
-            let expected_bits =
-                next_work_required_dgw_v3(&rolling_history, height - 1, &self.params);
-            let min_diff = min_difficulty_bits(&self.params, prev.time, prev.bits, header.time);
-            let bits_ok = header.bits == expected_bits || min_diff == Some(header.bits);
-            if !bits_ok {
-                return Err(SyncError::Validation(format!(
-                    "Fork header at height {} bad bits: got {:?}, expected {:?}",
-                    height, header.bits, expected_bits
-                )));
-            }
-
-            hashed.push(hashed_header);
-            rolling_history.push(*header);
-            prev = *header;
-        }
+        let hashed =
+            self.validate_chain(headers, ancestor_header, ancestor_height, &mut rolling_history)?;
 
         let branch_work = ChainWork::accumulate(ChainWork::zero(), headers);
 
@@ -153,6 +115,152 @@ impl ForkBuffer {
         );
 
         Ok(())
+    }
+
+    /// Validate `headers` as a continuous extension after `prev`.
+    ///
+    /// `rolling_history` must contain the active-chain headers preceding the
+    /// branch ancestor (oldest first) plus any already-buffered branch
+    /// headers. It is extended in place with each validated header so MTP
+    /// and DGW v3 see the full window.
+    ///
+    /// `prev_height` is the height of `prev`; the first validated header
+    /// lands at `prev_height + 1`. Pass `ancestor_height` for a fresh ingest
+    /// and the branch's current tip height when extending an existing branch.
+    fn validate_chain(
+        &self,
+        headers: &[Header],
+        mut prev: Header,
+        prev_height: u32,
+        rolling_history: &mut Vec<Header>,
+    ) -> SyncResult<Vec<HashedBlockHeader>> {
+        let mut hashed: Vec<HashedBlockHeader> = Vec::with_capacity(headers.len());
+        for (offset, header) in headers.iter().enumerate() {
+            let height = prev_height + offset as u32 + 1;
+            if header.prev_blockhash != prev.block_hash() {
+                return Err(SyncError::ForkChainBreak(format!(
+                    "expected prev {}, got {}",
+                    prev.block_hash(),
+                    header.prev_blockhash
+                )));
+            }
+
+            let hashed_header = HashedBlockHeader::from(*header);
+            if !header.target().is_met_by(*hashed_header.hash()) {
+                return Err(SyncError::Validation(format!(
+                    "Fork header at height {} failed PoW target",
+                    height
+                )));
+            }
+
+            let mtp = median_time_past(rolling_history);
+            if (header.time as u64) <= mtp {
+                return Err(SyncError::Validation(format!(
+                    "Fork header at height {} fails MTP rule ({} <= {})",
+                    height, header.time, mtp
+                )));
+            }
+
+            let expected_bits =
+                next_work_required_dgw_v3(rolling_history, height - 1, &self.params);
+            let min_diff = min_difficulty_bits(&self.params, prev.time, prev.bits, header.time);
+            let bits_ok = header.bits == expected_bits || min_diff == Some(header.bits);
+            if !bits_ok {
+                return Err(SyncError::Validation(format!(
+                    "Fork header at height {} bad bits: got {:?}, expected {:?}",
+                    height, header.bits, expected_bits
+                )));
+            }
+
+            hashed.push(hashed_header);
+            rolling_history.push(*header);
+            prev = *header;
+        }
+        Ok(hashed)
+    }
+
+    /// Extend an existing buffered branch with continuation headers.
+    ///
+    /// The branch is keyed by `(peer, prev_tip_hash)`. Each new header is
+    /// validated (continuity off the branch's current tip, PoW, MTP, DGW v3)
+    /// against a rolling window built from `history` plus the branch's
+    /// already-buffered headers. On success the branch is re-keyed under the
+    /// new tip hash and the caller receives a `BranchUpdate` to update its
+    /// own tip-to-ancestor index.
+    ///
+    /// `history` is the same shape as for `ingest`: active-chain headers
+    /// preceding the branch ancestor, oldest first, with the ancestor itself
+    /// at `history.last()`.
+    pub(super) fn extend_branch(
+        &mut self,
+        peer: SocketAddr,
+        prev_tip_hash: BlockHash,
+        headers: &[Header],
+        history: &[Header],
+    ) -> SyncResult<BranchUpdate> {
+        if headers.is_empty() {
+            return Err(SyncError::Validation(
+                "extend_branch called with empty headers".to_string(),
+            ));
+        }
+        let key = (peer, prev_tip_hash);
+        let branch = self.branches.remove(&key).ok_or_else(|| {
+            SyncError::ForkChainBreak(format!(
+                "no buffered branch for peer {} tip {}",
+                peer, prev_tip_hash
+            ))
+        })?;
+
+        if branch.headers.len() + headers.len() > MAX_FORK_HEADERS_PER_PEER {
+            let total = branch.headers.len() + headers.len();
+            self.branches.insert(key, branch);
+            return Err(SyncError::Validation(format!(
+                "Fork branch extension exceeds cap: {} headers (max {})",
+                total, MAX_FORK_HEADERS_PER_PEER
+            )));
+        }
+
+        let branch_tip_height = branch.ancestor_height + branch.headers.len() as u32;
+        let branch_tip_header = *branch.headers.last().expect("non-empty buffered branch").header();
+
+        let mut rolling_history: Vec<Header> = history.to_vec();
+        rolling_history.extend(branch.headers.iter().map(|h| *h.header()));
+
+        let validated = match self.validate_chain(
+            headers,
+            branch_tip_header,
+            branch_tip_height,
+            &mut rolling_history,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.branches.insert(key, branch);
+                return Err(e);
+            }
+        };
+
+        let mut combined_headers = branch.headers;
+        combined_headers.extend(validated);
+        let added_work = ChainWork::accumulate(ChainWork::zero(), headers);
+        let new_work = branch.total_work + added_work;
+        let new_tip = combined_headers.last().expect("non-empty branch").hash().to_owned();
+        let new_height = branch.ancestor_height + combined_headers.len() as u32;
+
+        self.branches.insert(
+            (peer, new_tip),
+            BufferedBranch {
+                headers: combined_headers,
+                ancestor_height: branch.ancestor_height,
+                total_work: new_work,
+                arrived_at: Instant::now(),
+            },
+        );
+
+        Ok(BranchUpdate {
+            new_tip,
+            new_height,
+            new_work,
+        })
     }
 
     /// Drop branches older than `ttl`. Returns how many were evicted.
@@ -587,5 +695,134 @@ mod tests {
         buf.ingest(peer, &[fork_header], ancestor_height, ancestor, &active)
             .expect("min-difficulty fork header must be accepted");
         assert_eq!(buf.len(), 1);
+    }
+
+    /// Ingest a 1-header branch, then `extend_branch` with a second 1-header
+    /// continuation. The branch is re-keyed under the new tip with both
+    /// headers buffered and the cumulative work doubled.
+    #[test]
+    fn extend_branch_appends_single_header_continuation() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 1, ancestor.block_hash());
+        let first_tip = fork[0].block_hash();
+        buf.ingest(peer, &fork, ancestor_height, ancestor, &active).expect("ingest");
+        assert_eq!(buf.len(), 1);
+
+        let cont = build_chain(1_700_000_000 + 13 * 600, 1, first_tip);
+        let update =
+            buf.extend_branch(peer, first_tip, &cont, &active).expect("extend continuation");
+        assert_eq!(update.new_tip, cont[0].block_hash());
+        assert_eq!(update.new_height, ancestor_height + 2);
+        assert_eq!(buf.len(), 1, "branch is re-keyed in place, count unchanged");
+        assert!(!buf.branches.contains_key(&(peer, first_tip)), "old branch key must be removed");
+        assert!(buf.branches.contains_key(&(peer, update.new_tip)), "new branch key inserted");
+
+        // Branch now holds both headers.
+        let candidate = buf
+            .take_winning_candidate(ChainWork::zero())
+            .expect("extended branch must win against zero active work");
+        assert_eq!(candidate.headers.len(), 2);
+        assert_eq!(*candidate.headers[0].hash(), first_tip);
+        assert_eq!(*candidate.headers[1].hash(), update.new_tip);
+    }
+
+    /// Stream a 4-header reorg as four 1-header continuations, matching the
+    /// dashd `generatetoaddress` pattern. Final branch must hold all 4 headers
+    /// and beat the active chain on work.
+    #[test]
+    fn extend_branch_handles_multi_message_reorg_announcement() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        // Build a 4-header fork chain as a single sequence, then feed it
+        // header-by-header through ingest + 3 extend_branch calls.
+        let fork = build_chain(1_700_000_000 + 12 * 600, 4, ancestor.block_hash());
+        buf.ingest(peer, &fork[..1], ancestor_height, ancestor, &active).expect("first batch");
+
+        let mut current_tip = fork[0].block_hash();
+        for next in &fork[1..] {
+            let update = buf
+                .extend_branch(peer, current_tip, std::slice::from_ref(next), &active)
+                .expect("continuation must validate");
+            assert_eq!(update.new_tip, next.block_hash());
+            current_tip = update.new_tip;
+        }
+        assert_eq!(buf.len(), 1);
+
+        let candidate = buf
+            .take_winning_candidate(ChainWork::zero())
+            .expect("4-header branch must win against zero work");
+        assert_eq!(candidate.headers.len(), 4);
+        assert_eq!(candidate.ancestor_height, ancestor_height);
+    }
+
+    /// A continuation whose `prev_blockhash` does not chain off the buffered
+    /// branch tip returns `ForkChainBreak` and leaves the branch untouched.
+    #[test]
+    fn extend_branch_rejects_continuity_break() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 1, ancestor.block_hash());
+        let first_tip = fork[0].block_hash();
+        buf.ingest(peer, &fork, ancestor_height, ancestor, &active).expect("ingest");
+
+        // Build a header whose prev_blockhash points at the ancestor (the
+        // active-chain tip) instead of the branch tip — that is exactly the
+        // shape of a dashd headers2 message arriving for the next reorg block
+        // before the branch re-key happens. With `extend_branch`, this is a
+        // ForkChainBreak because the buffered tip is `first_tip`, not ancestor.
+        let bad = build_chain(1_700_000_000 + 13 * 600, 1, ancestor.block_hash());
+        let err = buf
+            .extend_branch(peer, first_tip, &bad, &active)
+            .expect_err("continuation off the wrong predecessor must fail");
+        assert!(
+            matches!(&err, SyncError::ForkChainBreak(_)),
+            "expected ForkChainBreak, got: {:?}",
+            err
+        );
+        assert_eq!(buf.len(), 1, "branch must be restored on failure");
+        assert!(buf.branches.contains_key(&(peer, first_tip)), "original key must be intact");
+    }
+
+    /// Continuation from a peer that did not own the branch must be rejected.
+    #[test]
+    fn extend_branch_rejects_wrong_peer() {
+        let peer_a: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let peer_b: SocketAddr = "5.6.7.8:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 1, ancestor.block_hash());
+        let first_tip = fork[0].block_hash();
+        buf.ingest(peer_a, &fork, ancestor_height, ancestor, &active).expect("ingest from a");
+
+        let cont = build_chain(1_700_000_000 + 13 * 600, 1, first_tip);
+        let err = buf
+            .extend_branch(peer_b, first_tip, &cont, &active)
+            .expect_err("wrong-peer continuation must fail");
+        assert!(
+            matches!(&err, SyncError::ForkChainBreak(_)),
+            "expected ForkChainBreak for missing branch, got: {:?}",
+            err
+        );
+        assert!(buf.branches.contains_key(&(peer_a, first_tip)), "peer_a branch must be untouched");
     }
 }

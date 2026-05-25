@@ -62,6 +62,20 @@ impl SyncManager for InstantSendManager {
         event: &SyncEvent,
         _requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                "InstantSendManager: cascading ChainReorg, dropping pending instantlocks"
+            );
+            self.pending_instantlocks.clear();
+            self.progress.update_pending(0);
+            return Ok(vec![]);
+        }
+
         // Drop buffered events that arrive between `stop_sync` and the next
         // `start_sync`. `pending_instantlocks` is cleared on disconnect, and
         // `MasternodesManager` re-emits `MasternodeStateUpdated` once it

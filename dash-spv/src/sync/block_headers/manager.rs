@@ -308,6 +308,81 @@ impl<
         Ok(())
     }
 
+    /// Extend a buffered fork branch with continuation headers from a
+    /// follow-up `headers2` batch. Used when a peer streams a reorg as one
+    /// header per message instead of a single multi-header batch.
+    async fn extend_fork(
+        &mut self,
+        peer: SocketAddr,
+        prev_tip_hash: BlockHash,
+        ancestor_height: u32,
+        headers: &[Header],
+    ) -> SyncResult<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        // Chainlock floor check still applies: a continuation that started below
+        // the floor is already side-listed, but re-check defensively in case the
+        // chainlock advanced between batches.
+        if let Some(cl_height) = self.best_chainlock_height() {
+            if is_below_chainlock_floor(ancestor_height, cl_height) {
+                tracing::warn!(
+                    "discarding chainlock-conflicting fork continuation from {} at ancestor {} (chainlock {})",
+                    peer,
+                    ancestor_height,
+                    cl_height
+                );
+                return Ok(());
+            }
+        }
+
+        let storage = self.header_storage.read().await;
+        let history_start = ancestor_height.saturating_sub(Self::DGW_HISTORY);
+        let history = storage.load_headers(history_start..ancestor_height + 1).await?;
+        let expected_len = (ancestor_height + 1 - history_start) as usize;
+        if history.len() != expected_len {
+            return Err(SyncError::Validation(format!(
+                "storage gap before ancestor at height {}: expected {} headers, got {}",
+                ancestor_height,
+                expected_len,
+                history.len()
+            )));
+        }
+        let tip_height = storage
+            .get_tip_height()
+            .await
+            .ok_or_else(|| SyncError::MissingDependency("no tip height".to_string()))?;
+        let active_extension = storage.load_headers(ancestor_height + 1..tip_height + 1).await?;
+        drop(storage);
+
+        let update = self.fork_buffer.extend_branch(peer, prev_tip_hash, headers, &history)?;
+
+        tracing::debug!(
+            "extended fork branch from peer {}: new_tip={} height={} added={} work_bytes={:?}",
+            peer,
+            update.new_tip,
+            update.new_height,
+            headers.len(),
+            update.new_work.as_bytes()
+        );
+
+        self.fork_tip_index.remove(&prev_tip_hash);
+        self.fork_tip_index.insert(update.new_tip, ancestor_height);
+
+        let active_extension_work = ChainWork::accumulate(ChainWork::zero(), &active_extension);
+        if let Some(candidate) = self.fork_buffer.take_winning_candidate(active_extension_work) {
+            tracing::info!(
+                "Fork candidate ready for promotion after continuation: ancestor={} headers={} (peer {})",
+                candidate.ancestor_height,
+                candidate.headers.len(),
+                peer
+            );
+            self.pending_fork_candidate = Some(candidate);
+            self.prune_fork_tip_index();
+        }
+        Ok(())
+    }
+
     /// Remove `fork_tip_index` entries whose branch no longer exists in the buffer.
     pub(super) fn prune_fork_tip_index(&mut self) {
         let live_tips: HashSet<BlockHash> = self.fork_buffer.branch_tip_hashes().copied().collect();
@@ -406,21 +481,11 @@ impl<
                 }
             } else if let Some(&ancestor_height) = self.fork_tip_index.get(&first.prev_blockhash) {
                 // prev_blockhash is a fork tip, not on the active chain.
-                // Route continuation batches to the fork buffer using the
-                // same ancestor_height as the first batch. Chain-break errors
-                // are swallowed because the second batch anchors at the
-                // active-chain ancestor rather than the buffered fork tip;
-                // proper re-anchoring is deferred to Phase 3.
-                match self.ingest_fork(peer, headers, ancestor_height).await {
-                    Ok(()) => {}
-                    Err(SyncError::ForkChainBreak(msg)) => {
-                        tracing::debug!(
-                            "fork continuation chain break (deferred to Phase 3): {}",
-                            msg
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
+                // Route continuation headers into the buffered branch via
+                // `extend_branch` so multi-message reorgs (one header per
+                // `headers2`) accumulate into a single candidate.
+                let prev_tip = first.prev_blockhash;
+                self.extend_fork(peer, prev_tip, ancestor_height, headers).await?;
                 return Ok(Vec::new());
             }
         }
@@ -562,7 +627,6 @@ mod tests {
         PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
         StorageManager,
     };
-    use crate::sync::block_headers::fork_buffer::MAX_FORK_HEADERS_PER_PEER;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::block::Version;
     use dashcore::network::message::NetworkMessage;
@@ -1071,22 +1135,26 @@ mod tests {
         }
         let second_fork_header = second_fork_header.expect("nonce space exhausted");
 
-        // The continuation batch is routed through fork_tip_index to ingest_fork.
-        // The ingest fails the chain-continuity check (second batch anchors at the
-        // active-chain ancestor, not the buffered fork tip), but the ForkChainBreak
-        // error is swallowed so the peer is not penalized. The fork buffer stays
-        // at one branch; proper multi-batch continuation is deferred to Phase 3.
+        // The continuation batch is routed through fork_tip_index into
+        // `extend_branch`, which appends it to the existing branch in place.
+        // The branch count stays at 1 but the branch now spans 2 headers, and
+        // `fork_tip_index` is re-keyed under the new tip.
+        let new_fork_tip = second_fork_header.block_hash();
         let result2 = manager.handle_headers_pipeline(&[second_fork_header], peer, &sender).await;
         assert!(result2.is_ok(), "continuation must not propagate error to caller: {:?}", result2);
-        assert_eq!(
-            manager.fork_buffer.len(),
-            1,
-            "fork buffer must not grow (second ingest fails chain-continuity)"
+        assert_eq!(manager.fork_buffer.len(), 1, "branch is extended in place, not duplicated");
+        assert!(
+            manager.fork_tip_index.contains_key(&new_fork_tip),
+            "fork_tip_index must now key under the new branch tip"
+        );
+        assert!(
+            !manager.fork_tip_index.contains_key(&fork_tip),
+            "old fork tip must be removed from fork_tip_index"
         );
     }
 
     #[tokio::test]
-    async fn fork_continuation_non_fork_chain_break_error_propagates() {
+    async fn fork_continuation_missing_branch_returns_chain_break() {
         use dashcore::{block::Version, CompactTarget, TxMerkleNode};
 
         let (mut manager, _chain) = create_regtest_manager_with_chain(5).await;
@@ -1096,14 +1164,14 @@ mod tests {
         manager.pipeline.mark_tip_complete();
         manager.progress.set_state(SyncState::Synced);
 
+        // `fork_tip_index` claims a branch tip the buffer does not actually
+        // hold (e.g., after the branch was evicted by TTL but the index was
+        // not yet pruned). `extend_branch` must surface this as a
+        // ForkChainBreak rather than silently dropping the headers.
         let fake_fork_tip = BlockHash::from_slice(&[0xAB; 32]).unwrap();
         manager.fork_tip_index.insert(fake_fork_tip, 1);
 
-        // Craft a batch that exceeds MAX_FORK_HEADERS_PER_PEER (4096) so
-        // fork_buffer.ingest returns SyncError::Validation("Fork branch too
-        // large") before the chain-break check. This is not a ForkChainBreak
-        // error and must reach the Err(e) => return Err(e) arm.
-        let oversized_header = Header {
+        let header = Header {
             version: Version::ONE,
             prev_blockhash: fake_fork_tip,
             merkle_root: TxMerkleNode::all_zeros(),
@@ -1111,15 +1179,14 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207fffff),
             nonce: 0,
         };
-        let oversized_batch = vec![oversized_header; MAX_FORK_HEADERS_PER_PEER + 1];
 
         let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
         let (sender, _rx) = create_test_request_sender();
 
-        let result = manager.handle_headers_pipeline(&oversized_batch, peer, &sender).await;
+        let result = manager.handle_headers_pipeline(&[header], peer, &sender).await;
         assert!(
-            matches!(&result, Err(SyncError::Validation(_))),
-            "non-ForkChainBreak error must propagate from fork continuation: {:?}",
+            matches!(&result, Err(SyncError::ForkChainBreak(_))),
+            "missing-branch continuation must surface as ForkChainBreak: {:?}",
             result
         );
     }
@@ -1443,5 +1510,75 @@ mod tests {
             initial_gen + 1,
             "generation must be bumped on successful reorg"
         );
+    }
+
+    /// Reorg announced as 4 separate `headers2` messages (one header each,
+    /// the dashd `generatetoaddress` pattern). The first batch enters the
+    /// buffer via `ingest_fork`, the remaining three extend it via
+    /// `extend_branch`. After the final batch the fork outweighs the
+    /// 3-header active extension and is staged as `pending_fork_candidate`.
+    #[tokio::test]
+    async fn multi_message_fork_announcement_extends_branch_and_promotes_candidate() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Ancestor at height 4: active extension is heights 5,6,7 (3 headers).
+        // Fork extension is 4 headers, so total work strictly exceeds active.
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<Header> = Vec::new();
+        for i in 0..4u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(h);
+        }
+        let final_fork_tip = fork_headers.last().unwrap().block_hash();
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+
+        // Feed the 4 headers as 4 separate batches, like dashd's headers2 stream.
+        for h in &fork_headers {
+            let events =
+                manager.handle_headers_pipeline(&[*h], peer, &sender).await.expect("ingest batch");
+            assert!(events.is_empty(), "fork path emits no events before promotion");
+        }
+
+        // After the 4th header the buffer compared 4-fork-work against
+        // 3-active-extension-work, promoted the candidate, and pruned the
+        // fork_tip_index entry that referenced the now-consumed branch.
+        assert_eq!(manager.fork_buffer.len(), 0, "winning candidate was removed from the buffer");
+        assert!(
+            !manager.fork_tip_index.contains_key(&final_fork_tip),
+            "prune_fork_tip_index must drop the promoted branch's entry"
+        );
+
+        let candidate =
+            manager.take_pending_fork_candidate().expect("4>3 must promote a candidate");
+        assert_eq!(candidate.ancestor_height, 4);
+        assert_eq!(candidate.headers.len(), 4);
+        assert_eq!(*candidate.headers.last().unwrap().hash(), final_fork_tip);
     }
 }

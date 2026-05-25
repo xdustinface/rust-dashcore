@@ -28,7 +28,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
 
     fn on_disconnect(&mut self) {
         self.requested_chainlocks.clear();
-        self.masternode_ready = false;
+        self.reset_for_disconnect();
     }
 
     async fn handle_message(
@@ -78,6 +78,19 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         event: &SyncEvent,
         _requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                "ChainLockManager: cascading ChainReorg, hard-blocking validation"
+            );
+            self.reset_for_reorg();
+            return Ok(vec![]);
+        }
+
         // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
         // update; the work below is strictly one-shot startup work, so
         // gate the entire branch on the not-ready transition. Also drop
@@ -86,7 +99,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         // peerless. `MasternodeStateUpdated` re-fires once `MasternodesManager`
         // completes a sync cycle after reconnect.
         if !matches!(event, SyncEvent::MasternodeStateUpdated { .. })
-            || self.masternode_ready
+            || self.is_masternode_ready()
             || self.state() == SyncState::WaitingForConnections
         {
             return Ok(vec![]);

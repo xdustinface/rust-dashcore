@@ -42,7 +42,7 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// ChainLock hashes that have been requested (to avoid duplicate requests).
     pub(super) requested_chainlocks: HashSet<ChainLockHash>,
     /// Whether masternode sync is complete and we can validate signatures.
-    pub(super) masternode_ready: bool,
+    masternode_ready: bool,
     /// Highest chainlock that arrived before `masternode_ready` and
     /// therefore could not be validated yet. Re-validated on the
     /// not-ready → ready transition (see [`Self::on_masternode_ready`])
@@ -119,6 +119,30 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         }
 
         self.best_chainlock.clone()
+    }
+
+    pub(super) fn is_masternode_ready(&self) -> bool {
+        self.masternode_ready
+    }
+
+    /// Reset state for a chain reorg, blocking validation until masternode data
+    /// is re-established on the new chain.
+    pub(super) fn reset_for_reorg(&mut self) {
+        self.masternode_ready = false;
+        self.pending_validation = None;
+    }
+
+    /// Reset state for a peer disconnect. `pending_validation` is intentionally
+    /// kept: a chainlock that arrived before `masternode_ready` remains valid on
+    /// the same chain and must be re-evaluated when `on_masternode_ready` fires
+    /// on the next reconnect.
+    ///
+    /// Safety invariant: correctness here relies on header sync always completing
+    /// (and emitting any `ChainReorg` → `reset_for_reorg`) before masternode sync
+    /// emits `MasternodeStateUpdated`. If those phases are ever parallelized, a
+    /// `ChainReorg` check must be added in this path.
+    pub(super) fn reset_for_disconnect(&mut self) {
+        self.masternode_ready = false;
     }
 
     /// Process an incoming ChainLock message.
@@ -305,7 +329,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for ChainLockMan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, RequestSender};
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
     };
@@ -314,6 +338,7 @@ mod tests {
     use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::hashes::Hash;
     use dashcore::BlockHash;
+    use tokio::sync::mpsc::unbounded_channel;
 
     type TestChainLockManager =
         ChainLockManager<PersistentBlockHeaderStorage, PersistentMetadataStorage>;
@@ -367,10 +392,6 @@ mod tests {
     /// sync cycle after reconnect, so dropping it here is safe.
     #[tokio::test]
     async fn test_handle_sync_event_drops_masternode_state_updated_in_waiting_for_connections() {
-        use crate::network::RequestSender;
-        use crate::sync::SyncEvent;
-        use tokio::sync::mpsc::unbounded_channel;
-
         let mut manager = create_test_manager().await;
         manager.set_state(SyncState::WaitingForConnections);
 
@@ -639,6 +660,112 @@ mod tests {
             let restored = manager.best_chainlock().expect("chainlock should be restored");
             assert_eq!(restored.block_height, 200);
         }
+    }
+
+    /// `ChainReorg` hard-blocks CL validation by flipping `masternode_ready`
+    /// back to `false` and dropping any `pending_validation`. After the
+    /// cascade, an incoming chainlock must take the pre-ready path again
+    /// (cached in `pending_validation`, not validated), waiting for the next
+    /// `MasternodeStateUpdated` to retry.
+    #[tokio::test]
+    async fn test_chain_reorg_hard_blocks_chainlock_validation() {
+        let mut manager = create_test_manager().await;
+        let _ = manager.on_masternode_ready().await;
+        manager.pending_validation = Some(create_test_chainlock(123));
+        assert!(manager.masternode_ready);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::all_zeros(),
+            new_tip: BlockHash::all_zeros(),
+            generation: 1,
+        };
+        manager.handle_sync_event(&event, &requests).await.expect("handle_sync_event succeeds");
+
+        assert!(!manager.masternode_ready, "ChainReorg must flip masternode_ready back to false");
+        assert!(manager.pending_validation.is_none(), "ChainReorg must drop pending_validation");
+
+        let _ = manager.process_chainlock(&create_test_chainlock(150)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+        assert_eq!(manager.progress.valid(), 0);
+        assert_eq!(manager.progress.invalid(), 0);
+    }
+
+    /// `reset_for_reorg` clears `pending_validation`, so a subsequent
+    /// `on_masternode_ready` cannot re-validate a chainlock that arrived on the
+    /// orphaned branch. This is the phase-ordering invariant documented on
+    /// `reset_for_disconnect`: `ChainReorg → reset_for_reorg` must fire before
+    /// `MasternodeStateUpdated → on_masternode_ready`.
+    #[tokio::test]
+    async fn test_reorg_prevents_stale_pending_validation_from_being_revalidated() {
+        let mut manager = create_test_manager().await;
+
+        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+
+        manager.reset_for_reorg();
+
+        assert!(
+            manager.pending_validation.is_none(),
+            "reset_for_reorg must drop pending_validation from the orphaned branch"
+        );
+        assert!(!manager.masternode_ready);
+
+        let returned = manager.on_masternode_ready().await;
+        assert!(
+            returned.is_none(),
+            "on_masternode_ready must not re-validate a stale chainlock cleared by reorg"
+        );
+        assert!(
+            manager.masternode_ready,
+            "on_masternode_ready must set masternode_ready=true even when pending_validation is None"
+        );
+        assert_eq!(
+            manager.progress.valid(),
+            0,
+            "no chainlock from the orphaned branch was validated"
+        );
+        assert_eq!(
+            manager.progress.invalid(),
+            0,
+            "dropped chainlock must not be counted as invalid"
+        );
+    }
+
+    /// `pending_validation` must survive a disconnect so the cached chainlock
+    /// can be re-evaluated after reconnect. `on_masternode_ready` must consume
+    /// it on the next ready transition rather than silently discarding it.
+    #[tokio::test]
+    async fn test_pending_validation_survives_disconnect_and_consumed_on_reconnect() {
+        let mut manager = create_test_manager().await;
+
+        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        assert!(manager.pending_validation.is_some());
+        assert!(!manager.masternode_ready);
+
+        manager.reset_for_disconnect();
+
+        assert!(
+            manager.pending_validation.is_some(),
+            "pending_validation must not be dropped on disconnect"
+        );
+        assert!(!manager.masternode_ready, "masternode_ready must be cleared on disconnect");
+
+        let returned = manager.on_masternode_ready().await;
+
+        assert!(
+            manager.pending_validation.is_none(),
+            "on_masternode_ready must consume pending_validation"
+        );
+        assert!(manager.masternode_ready);
+        // The empty engine cannot validate the signature, so the chainlock is
+        // counted as invalid and best_chainlock stays None — returned is None.
+        // The invariant is that pending_validation was consumed (not silently
+        // dropped), which is covered by the is_none() assertion above.
+        assert!(returned.is_none());
+        assert_eq!(manager.progress.invalid(), 1);
     }
 
     #[tokio::test]

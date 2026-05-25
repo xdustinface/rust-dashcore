@@ -558,6 +558,53 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         Ok(vec![])
     }
 
+    /// Rewind masternode state to `fork_height` after a chain reorg, then fire
+    /// a fresh `QRInfo` for the new tip so the engine catches up. The truncation
+    /// is the engine-side cleanup that complements the storage cascade run by
+    /// `BlockHeadersManager`. After this returns, the manager is in `Syncing`
+    /// with an in-flight QRInfo, and `MasternodeStateUpdated` will fire later
+    /// through the normal QRInfo response path.
+    pub(super) async fn rewind_to_height(
+        &mut self,
+        fork_height: u32,
+        new_tip: BlockHash,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
+        let engine_tip_height = {
+            let mut engine = self.engine.write().await;
+            engine.truncate_above(fork_height);
+            let tip_entry = engine.masternode_lists.iter().next_back();
+            self.sync_state.last_synced_block_hash = tip_entry.map(|(_, list)| list.block_hash);
+            tip_entry.map(|(h, _)| *h).unwrap_or(0)
+        };
+
+        self.sync_state.known_mn_list_heights.retain(|h| *h <= fork_height);
+        self.sync_state.validated_cycle_heights.retain(|h| *h <= fork_height);
+        self.sync_state.current_cycle_height = None;
+        self.sync_state.current_cycle_attempts = 0;
+        self.sync_state.last_window_qrinfo_tip = None;
+        self.sync_state.last_processed_qrinfo_tip = None;
+        self.sync_state.clear_pending();
+        self.sync_state.qrinfo_retry_count = 0;
+
+        self.progress.update_current_height(engine_tip_height);
+
+        self.set_state(SyncState::Syncing);
+
+        tracing::info!(
+            fork_height,
+            new_tip = %new_tip,
+            engine_tip_height,
+            "MasternodesManager: rewinding for reorg, dispatching QRInfo for new tip"
+        );
+
+        let result = self.send_qrinfo_for_tip(requests).await;
+        if result.is_err() {
+            self.set_state(SyncState::WaitForEvents);
+        }
+        result
+    }
+
     /// Verify quorums and mark complete.
     ///
     /// For initial sync (state == Syncing), emits MasternodeStateUpdated and logs completion.
@@ -1003,5 +1050,151 @@ mod tests {
             0,
             "no QRInfo must be requested when the gate picks Incremental"
         );
+    }
+
+    /// `rewind_to_height` must truncate engine state above the fork height,
+    /// prune the sync-state height sets, refresh `last_synced_block_hash` from
+    /// the engine's new tip, and fire a fresh `QRInfo` request via
+    /// `send_qrinfo_for_tip`. The catch-up dispatch is the entire reason the
+    /// rewind exists, so a successful call must surface as a queued
+    /// `GetQRInfo` and an in-flight marker.
+    #[tokio::test]
+    async fn test_rewind_to_height_truncates_engine_and_dispatches_qrinfo() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(60);
+        manager.sync_state.known_mn_list_heights.insert(96);
+        manager.sync_state.known_mn_list_heights.insert(120);
+        manager.sync_state.validated_cycle_heights.insert(48);
+        manager.sync_state.validated_cycle_heights.insert(96);
+        manager.sync_state.last_processed_qrinfo_tip = Some(BlockHash::from_byte_array([0xAA; 32]));
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(60, MasternodeList::empty(anchor_hash(60), 60));
+            engine.masternode_lists.insert(96, MasternodeList::empty(anchor_hash(96), 96));
+        }
+
+        let fork_height = 80;
+        let new_tip = BlockHash::from_byte_array([0xBB; 32]);
+        manager
+            .rewind_to_height(fork_height, new_tip, &requests)
+            .await
+            .expect("rewind_to_height must succeed");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(engine.masternode_lists.contains_key(&60));
+            assert!(!engine.masternode_lists.contains_key(&96));
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+
+        assert_eq!(
+            manager.sync_state.known_mn_list_heights.iter().copied().collect::<Vec<_>>(),
+            vec![60]
+        );
+        assert_eq!(
+            manager.sync_state.validated_cycle_heights.iter().copied().collect::<Vec<_>>(),
+            vec![48]
+        );
+        assert_eq!(manager.sync_state.last_synced_block_hash, Some(anchor_hash(60)));
+        assert!(manager.sync_state.last_processed_qrinfo_tip.is_none());
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        assert_eq!(manager.progress.qr_infos_requested(), 1);
+        assert_eq!(manager.state(), SyncState::Syncing);
+        let queued = rx.try_recv().expect("rewind_to_height must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// When every masternode list is above the fork height, truncation empties
+    /// the engine. `last_synced_block_hash` must become `None` and progress
+    /// must report height 0.
+    #[tokio::test]
+    async fn test_rewind_to_height_empty_engine_after_truncation() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.extend([100, 120]);
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(100, MasternodeList::empty(anchor_hash(100), 100));
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+
+        manager
+            .rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests)
+            .await
+            .expect("rewind_to_height must succeed");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(engine.masternode_lists.is_empty());
+        }
+        assert_eq!(manager.sync_state.last_synced_block_hash, None);
+        assert_eq!(manager.progress.current_height(), 0);
+        assert!(manager.sync_state.known_mn_list_heights.is_empty());
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        let queued = rx
+            .try_recv()
+            .expect("rewind_to_height must queue a GetQRInfo even when engine is empty");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// A `SyncEvent::ChainReorg` delivered to `handle_sync_event` must invoke
+    /// the rewind path. Engine state above the fork is gone, the manager
+    /// transitions to `Syncing`, and a fresh QRInfo is queued for the new tip.
+    #[tokio::test]
+    async fn test_handle_sync_event_chain_reorg_invokes_rewind() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(120);
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::from_byte_array([0xAA; 32]),
+            new_tip: BlockHash::from_byte_array([0xBB; 32]),
+            generation: 1,
+        };
+        manager.handle_sync_event(&event, &requests).await.expect("handle_sync_event succeeds");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+        assert_eq!(manager.state(), SyncState::Syncing);
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        let queued = rx.try_recv().expect("ChainReorg must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// When `send_qrinfo_for_tip` fails inside `rewind_to_height` (e.g. the
+    /// channel receiver is dropped), the manager must transition to
+    /// `WaitForEvents` rather than staying in `Syncing`, and must leave no
+    /// in-flight marker so the next `BlockHeaderSyncComplete` can retry.
+    #[tokio::test]
+    async fn test_rewind_to_height_sets_wait_for_events_on_send_failure() {
+        let (mut manager, requests, rx) = make_synced_incremental_manager(120).await;
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(30, MasternodeList::empty(anchor_hash(30), 30));
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+        drop(rx);
+
+        let result =
+            manager.rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests).await;
+        assert!(result.is_err(), "expected error when the channel is closed");
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+        assert!(manager.sync_state.qrinfo_in_flight.is_none());
+        {
+            let engine = manager.engine.read().await;
+            assert!(
+                engine.masternode_lists.contains_key(&30),
+                "entry below fork_height=50 must survive truncation even when send fails"
+            );
+            assert!(
+                !engine.masternode_lists.contains_key(&120),
+                "entry above fork_height=50 must be dropped even when send fails"
+            );
+        }
     }
 }

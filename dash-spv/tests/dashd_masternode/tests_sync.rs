@@ -10,8 +10,9 @@ use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::sml::llmq_type::LLMQType;
 
 use super::helpers::{
-    assert_all_rotated_quorums_verified, wait_for_chainlock_height_at_least,
-    wait_for_masternode_sync, wait_for_mn_state_event, wait_for_mn_state_event_above,
+    assert_all_rotated_quorums_verified, wait_for_chain_reorg_event,
+    wait_for_chainlock_height_at_least, wait_for_full_sync, wait_for_masternode_sync,
+    wait_for_mn_state_event, wait_for_mn_state_event_above,
     wait_for_mn_state_with_stored_cycle_above,
 };
 use super::setup::{
@@ -558,6 +559,180 @@ async fn test_masternode_list_sync_end_to_end() {
         cl_sync_height
     );
     tracing::info!("SPV synced to ChainLocked height {}", cl_sync_height);
+
+    client_handle.stop().await;
+}
+
+/// After a regtest DIP-3 reorg, the masternode engine must drop every list
+/// above the fork height and then re-sync via a fresh QRInfo. The post-reorg
+/// `MasternodeStateUpdated` proves the rewind path dispatched cleanly and the
+/// new list landed.
+#[tokio::test]
+async fn test_masternode_list_rewind_across_dip3_reorg() {
+    let Some(mut ctx) = TestContext::new(true).await else {
+        return;
+    };
+
+    let wallet = create_dummy_wallet();
+    let config =
+        create_mn_test_config(ctx.storage_path().to_path_buf(), ctx.mn_ctx.controller_addr);
+    let mut client_handle = create_and_start_client(&config, Arc::clone(&wallet)).await;
+
+    let initial =
+        wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    assert_eq!(initial.state(), SyncState::Synced);
+    let synced_height = initial.current_height();
+    tracing::info!("Initial sync complete at height {}", synced_height);
+
+    // Mine a few blocks so the SPV records masternode lists above the
+    // upcoming fork point, then orchestrate a reorg of depth 3.
+    ctx.mn_ctx.move_blocks(5);
+    let mid = wait_for_mn_state_event_above(
+        &mut client_handle.sync_event_receiver,
+        synced_height,
+        SYNC_TIMEOUT,
+    )
+    .await;
+    tracing::info!("Pre-reorg masternode tip at height {}", mid);
+
+    wait_for_full_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+
+    let reorg_depth = 3;
+    let pre_reorg_tip = ctx.mn_ctx.controller.get_block_count();
+    let fork_height = pre_reorg_tip - reorg_depth;
+    let (orphaned, replacement) = ctx.mn_ctx.mine_reorg(reorg_depth);
+    assert_eq!(orphaned.len(), reorg_depth as usize);
+    assert_eq!(replacement.len(), reorg_depth as usize + 1);
+
+    let (observed_fork, _new_tip) = wait_for_chain_reorg_event(
+        &mut client_handle.sync_event_receiver,
+        Some(fork_height),
+        SYNC_TIMEOUT,
+    )
+    .await;
+    assert_eq!(
+        observed_fork, fork_height,
+        "ChainReorg fork height should match orchestrated reorg"
+    );
+
+    // Confirm the engine actually dropped state above the fork before the
+    // post-rewind QRInfo response refills it. This is the rewind primitive
+    // doing its job. Then wait for the post-rewind `MasternodeStateUpdated`
+    // and assert the engine has caught back up past the fork.
+    {
+        let engine = client_handle.engine.read().await;
+        let highest = engine.masternode_lists.iter().next_back().map(|(h, _)| *h).unwrap_or(0);
+        assert!(
+            highest <= fork_height,
+            "Engine must have dropped masternode lists above fork_height={}, got highest={}",
+            fork_height,
+            highest
+        );
+    }
+
+    let post = wait_for_mn_state_event_above(
+        &mut client_handle.sync_event_receiver,
+        fork_height,
+        SYNC_TIMEOUT,
+    )
+    .await;
+    assert!(post > fork_height, "post-reorg masternode height must advance past the fork");
+
+    let final_tip = ctx.mn_ctx.controller.get_block_count();
+    {
+        let engine = client_handle.engine.read().await;
+        let highest = engine.masternode_lists.iter().next_back().map(|(h, _)| *h).unwrap_or(0);
+        assert!(
+            highest >= final_tip.saturating_sub(8),
+            "Engine should catch back up after rewind; tip {}, engine highest {}",
+            final_tip,
+            highest
+        );
+    }
+
+    client_handle.stop().await;
+}
+
+/// Mine a DKG cycle, then invalidate the commitment block so a competing
+/// branch's commitment replaces it. The rewind must drop the orphaned cycle's
+/// rotated quorums from `rotated_quorums_per_cycle` and the post-rewind
+/// QRInfo must refill the map with the new cycle's quorums. The orchestration
+/// requires a full live masternode network so the replacement DKG can actually
+/// complete; on infrastructure where that is flaky the test is marked
+/// `#[ignore]` and tracked under issue #142.
+#[tokio::test]
+#[ignore = "see #142: needs reliable replacement DKG on regtest masternode harness"]
+async fn test_qrinfo_refresh_across_dip24_cycle_reorg() {
+    let Some(mut ctx) = TestContext::new(false).await else {
+        return;
+    };
+
+    let wallet = create_dummy_wallet();
+    let config =
+        create_mn_test_config(ctx.storage_path().to_path_buf(), ctx.mn_ctx.controller_addr);
+    let mut client_handle = create_and_start_client(&config, Arc::clone(&wallet)).await;
+
+    let initial =
+        wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    assert_eq!(initial.state(), SyncState::Synced);
+
+    // Mine a DKG cycle and capture the cycle key for the freshly-mined cycle.
+    let original_cycle_hash = ctx.mn_ctx.mine_dkg_cycle().expect("DKG cycle should succeed");
+    let _ = wait_for_mn_state_with_stored_cycle_above(
+        &mut client_handle.sync_event_receiver,
+        initial.current_height(),
+        SYNC_TIMEOUT,
+    )
+    .await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            engine.rotated_quorums_per_cycle.contains_key(&original_cycle_hash),
+            "freshly-mined cycle should be stored under {}",
+            original_cycle_hash
+        );
+    }
+
+    // Roll back deeply enough to invalidate the cycle commitment block, then
+    // mine a replacement DKG cycle.
+    let dkg_interval = ctx.mn_ctx.metadata.dkg_interval;
+    let (_orphaned, _replacement) = ctx.mn_ctx.mine_reorg(dkg_interval);
+
+    let _ = wait_for_chain_reorg_event(&mut client_handle.sync_event_receiver, None, SYNC_TIMEOUT)
+        .await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            !engine.rotated_quorums_per_cycle.contains_key(&original_cycle_hash),
+            "orphaned cycle commitment {} must be dropped from rotated_quorums_per_cycle",
+            original_cycle_hash
+        );
+    }
+
+    // Drive a replacement DKG so the new cycle's commitment is mined.
+    let replacement_cycle_hash =
+        ctx.mn_ctx.mine_dkg_cycle().expect("replacement DKG cycle should succeed");
+    let _ = wait_for_mn_state_with_stored_cycle_above(
+        &mut client_handle.sync_event_receiver,
+        initial.current_height(),
+        SYNC_TIMEOUT,
+    )
+    .await;
+
+    {
+        let engine = client_handle.engine.read().await;
+        assert!(
+            engine.rotated_quorums_per_cycle.contains_key(&replacement_cycle_hash),
+            "replacement cycle {} should be stored after rewind",
+            replacement_cycle_hash
+        );
+        assert_ne!(
+            replacement_cycle_hash, original_cycle_hash,
+            "replacement DKG must mint a different cycle key"
+        );
+    }
 
     client_handle.stop().await;
 }

@@ -39,6 +39,47 @@ pub(super) fn assert_all_rotated_quorums_verified(engine: &MasternodeListEngine)
     }
 }
 
+/// Wait for all sync components (headers, filter headers, filters, blocks, masternodes)
+/// to reach `Synced` state. Callers should use this before triggering a reorg to ensure
+/// the filter pipeline has finished downloading filters for the current tip, which prevents
+/// the SPV from re-requesting orphaned block filters after the reorg and getting disconnected
+/// by dashd for requesting invalid block hashes.
+pub(super) async fn wait_for_full_sync(
+    progress_receiver: &mut watch::Receiver<SyncProgress>,
+    timeout_secs: u64,
+) {
+    {
+        let progress = progress_receiver.borrow_and_update();
+        if progress.is_synced() {
+            return;
+        }
+    }
+
+    let timeout = time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                let progress = progress_receiver.borrow();
+                panic!(
+                    "Timeout waiting for full sync. Current progress: {:?}",
+                    progress
+                );
+            }
+            result = progress_receiver.changed() => {
+                if result.is_err() {
+                    panic!("Progress channel closed");
+                }
+                let progress = progress_receiver.borrow_and_update().clone();
+                if progress.is_synced() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Wait for masternode sync to reach Synced state.
 pub(super) async fn wait_for_masternode_sync(
     progress_receiver: &mut watch::Receiver<SyncProgress>,
@@ -183,6 +224,45 @@ pub(super) async fn wait_for_mn_state_with_stored_cycle_above(
                             min_cycle_height,
                             qr_info_result.as_ref().map(|r| (r.stored_cycle_height, r.fully_verified_count, r.rotated_quorum_count)),
                         );
+                        continue;
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Event receiver lagged by {} messages", n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("Sync event channel closed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Wait for a `ChainReorg` sync event. If `expected_fork_height` is `Some`,
+/// only the first event whose `fork_height` matches is returned; non-matching
+/// events are skipped. Returns the `(fork_height, new_tip)` tuple.
+pub(super) async fn wait_for_chain_reorg_event(
+    event_receiver: &mut broadcast::Receiver<SyncEvent>,
+    expected_fork_height: Option<u32>,
+    timeout_secs: u64,
+) -> (u32, dashcore::BlockHash) {
+    let timeout = time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                panic!("Timeout waiting for ChainReorg event");
+            }
+            result = event_receiver.recv() => {
+                match result {
+                    Ok(SyncEvent::ChainReorg { fork_height, new_tip, .. }) => {
+                        if expected_fork_height.is_none_or(|e| e == fork_height) {
+                            tracing::info!("ChainReorg observed at fork_height={} new_tip={}", fork_height, new_tip);
+                            return (fork_height, new_tip);
+                        }
                         continue;
                     }
                     Ok(_) => continue,
