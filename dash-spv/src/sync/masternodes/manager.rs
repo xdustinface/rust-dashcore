@@ -558,6 +558,60 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
         Ok(vec![])
     }
 
+    /// Rewind masternode state to `fork_height` after a chain reorg, then fire
+    /// a fresh `QRInfo` for the new tip so the engine catches up. The truncation
+    /// is the engine-side cleanup that complements the storage cascade run by
+    /// `BlockHeadersManager`. After this returns, the manager is in `Syncing`
+    /// with an in-flight QRInfo, and `MasternodeStateUpdated` will fire later
+    /// through the normal QRInfo response path.
+    pub(super) async fn rewind_to_height(
+        &mut self,
+        fork_height: u32,
+        new_tip: BlockHash,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
+        {
+            let mut engine = self.engine.write().await;
+            engine.truncate_above(fork_height);
+            self.sync_state.last_synced_block_hash =
+                engine.masternode_lists.iter().next_back().map(|(_, list)| list.block_hash);
+        }
+
+        self.sync_state.known_mn_list_heights.retain(|h| *h <= fork_height);
+        self.sync_state.validated_cycle_heights.retain(|h| *h <= fork_height);
+        self.sync_state.current_cycle_height = None;
+        self.sync_state.current_cycle_attempts = 0;
+        self.sync_state.last_window_qrinfo_tip = None;
+        self.sync_state.last_processed_qrinfo_tip = None;
+        self.sync_state.clear_pending();
+        self.sync_state.qrinfo_retry_count = 0;
+
+        let engine_tip_height = {
+            let engine = self.engine.read().await;
+            engine.masternode_lists.iter().next_back().map(|(h, _)| *h).unwrap_or(0)
+        };
+        self.progress.update_current_height(engine_tip_height);
+
+        self.set_state(SyncState::Syncing);
+
+        tracing::info!(
+            fork_height,
+            new_tip = %new_tip,
+            engine_tip_height,
+            "MasternodesManager: rewinding for reorg, dispatching QRInfo for new tip"
+        );
+
+        self.send_qrinfo_for_tip(requests).await?;
+        Ok(vec![])
+    }
+
+    /// Returns `true` when the engine holds a masternode list at a height at
+    /// or above `h`. Used by the rewind path to detect whether the masternode
+    /// state has caught up to a target height after a reorg.
+    pub(super) fn is_synced_for_height(&self, h: u32) -> bool {
+        self.sync_state.known_mn_list_heights.iter().next_back().is_some_and(|tip| *tip >= h)
+    }
+
     /// Verify quorums and mark complete.
     ///
     /// For initial sync (state == Syncing), emits MasternodeStateUpdated and logs completion.
@@ -1003,5 +1057,88 @@ mod tests {
             0,
             "no QRInfo must be requested when the gate picks Incremental"
         );
+    }
+
+    /// `rewind_to_height` must truncate engine state above the fork height,
+    /// prune the sync-state height sets, refresh `last_synced_block_hash` from
+    /// the engine's new tip, and fire a fresh `QRInfo` request via
+    /// `send_qrinfo_for_tip`. The catch-up dispatch is the entire reason the
+    /// rewind exists, so a successful call must surface as a queued
+    /// `GetQRInfo` and an in-flight marker.
+    #[tokio::test]
+    async fn test_rewind_to_height_truncates_engine_and_dispatches_qrinfo() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        // Pre-populate sync-state height sets and engine state to mimic a fully
+        // synced run.
+        manager.sync_state.known_mn_list_heights.insert(60);
+        manager.sync_state.known_mn_list_heights.insert(96);
+        manager.sync_state.known_mn_list_heights.insert(120);
+        manager.sync_state.validated_cycle_heights.insert(48);
+        manager.sync_state.validated_cycle_heights.insert(96);
+        manager.sync_state.last_processed_qrinfo_tip = Some(BlockHash::from_byte_array([0xAA; 32]));
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(60, MasternodeList::empty(anchor_hash(60), 60));
+            engine.masternode_lists.insert(96, MasternodeList::empty(anchor_hash(96), 96));
+        }
+
+        let fork_height = 80;
+        let new_tip = BlockHash::from_byte_array([0xBB; 32]);
+        manager
+            .rewind_to_height(fork_height, new_tip, &requests)
+            .await
+            .expect("rewind_to_height must succeed");
+
+        // Engine state at heights > fork_height is gone; entries at or below
+        // are retained.
+        {
+            let engine = manager.engine.read().await;
+            assert!(engine.masternode_lists.contains_key(&60));
+            assert!(!engine.masternode_lists.contains_key(&96));
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+
+        // Sync-state height sets are pruned in lockstep with the engine.
+        assert_eq!(
+            manager.sync_state.known_mn_list_heights.iter().copied().collect::<Vec<_>>(),
+            vec![60]
+        );
+        assert_eq!(
+            manager.sync_state.validated_cycle_heights.iter().copied().collect::<Vec<_>>(),
+            vec![48]
+        );
+
+        // `last_synced_block_hash` is rebuilt from the engine's surviving tip.
+        assert_eq!(manager.sync_state.last_synced_block_hash, Some(anchor_hash(60)));
+        // Late-straggler dedup state is wiped so a fresh QRInfo round can begin.
+        assert!(manager.sync_state.last_processed_qrinfo_tip.is_none());
+
+        // The manager dispatched a QRInfo for the new tip and is now Syncing.
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        assert_eq!(manager.progress.qr_infos_requested(), 1);
+        assert_eq!(manager.state(), SyncState::Syncing);
+        let queued = rx.try_recv().expect("rewind_to_height must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// `is_synced_for_height` mirrors the engine's notion of "the masternode
+    /// list has caught up to height h". Immediately after a rewind the engine
+    /// tip is below the requested fork height, so the predicate is false;
+    /// after simulating the response by re-inserting a list at the fork height
+    /// (the same effect `MasternodeStateUpdated` carries) it must flip to true.
+    #[tokio::test]
+    async fn test_is_synced_for_height_tracks_engine_state() {
+        let (mut manager, requests, _rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(120);
+
+        manager.rewind_to_height(80, BlockHash::from_byte_array([0xCC; 32]), &requests).await.unwrap();
+        assert!(!manager.is_synced_for_height(80));
+
+        // Simulate the post-rewind QRInfo response settling: the manager's
+        // QRInfo handler is what normally records `known_mn_list_heights`,
+        // mirroring engine state. Re-populate to match.
+        manager.sync_state.known_mn_list_heights.insert(80);
+        assert!(manager.is_synced_for_height(80));
+        assert!(!manager.is_synced_for_height(81));
     }
 }
