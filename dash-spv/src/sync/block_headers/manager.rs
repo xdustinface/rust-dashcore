@@ -1227,4 +1227,77 @@ mod tests {
         assert_eq!(manager.side_headers[0].0, 2, "recorded height = ancestor_height + 1");
         assert_eq!(manager.side_headers[0].1, fork_header.block_hash());
     }
+
+    /// End-to-end shallow reorg via `drive_reorg`: storage truncates to the
+    /// fork ancestor, the fork headers replace the old tip, a `ChainReorg`
+    /// event surfaces, and the generation counter is bumped.
+    #[tokio::test]
+    async fn shallow_reorg_cascade_truncates_storage_and_emits_chain_reorg() {
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+        let old_tip_hash = chain.last().unwrap().block_hash();
+
+        // Build a 3-header fork extending chain[4]. Use `ingest_fork` so the
+        // candidate flows through the normal path and ends up in
+        // `pending_fork_candidate`.
+        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<Header> = Vec::new();
+        for i in 0..3u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(h);
+        }
+        let new_tip_hash = fork_headers.last().unwrap().block_hash();
+
+        // Drive `ingest_fork` directly so the candidate sits in `fork_buffer`.
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        manager.ingest_fork(peer, &fork_headers, 4).await.unwrap();
+        // The fork ingest doesn't yet declare a winner because the active
+        // extension is heavier in some cases, so force-promote via a higher
+        // total_work fork. Easier: directly take the candidate by triggering
+        // the buffer's `take_winning_candidate` with zero active work.
+        let candidate = manager
+            .fork_buffer
+            .take_winning_candidate(crate::chain::ChainWork::zero())
+            .expect("fork should win against zero active work");
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+        let event = manager.drive_reorg(candidate).await.unwrap().expect("ChainReorg event");
+        match event {
+            SyncEvent::ChainReorg {
+                fork_height,
+                old_tip,
+                new_tip,
+                generation,
+            } => {
+                assert_eq!(fork_height, 4);
+                assert_eq!(old_tip, old_tip_hash);
+                assert_eq!(new_tip, new_tip_hash);
+                assert_eq!(generation, initial_gen + 1);
+            }
+            other => panic!("expected ChainReorg, got {:?}", other),
+        }
+        assert_eq!(manager.reorg_generation.load(Ordering::Acquire), initial_gen + 1);
+        let new_tip = manager.tip().await.unwrap();
+        assert_eq!(new_tip.height(), 7);
+        assert_eq!(*new_tip.hash(), new_tip_hash);
+    }
 }

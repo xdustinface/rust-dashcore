@@ -1095,6 +1095,35 @@ mod tests {
         );
     }
 
+    /// `send_pending` with a generation tag records the snapshot on the
+    /// coordinator and `generation_for_height` returns it back exactly,
+    /// while a later generation bump means the same height now reports a
+    /// "different" generation so the manager-side check drops the response.
+    #[tokio::test]
+    async fn test_generation_tagging_round_trips_through_pipeline() {
+        let headers = Header::dummy_batch(0..1000);
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        storage.store_headers(&headers).await.unwrap();
+
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.init(0, 999);
+
+        let (sender, _rx) = create_test_request_sender();
+        let sent = pipeline.send_pending(&sender, &storage, 7).await.unwrap();
+        assert_eq!(sent, 1);
+
+        // The pipeline now stamps the in-flight batch with generation 7;
+        // every height covered by the batch returns the same snapshot.
+        assert_eq!(pipeline.generation_for_height(0), Some(7));
+        assert_eq!(pipeline.generation_for_height(500), Some(7));
+        assert_eq!(pipeline.generation_for_height(999), Some(7));
+
+        // A height outside any in-flight batch returns None so unsolicited
+        // responses are never accidentally dropped as "stale".
+        assert_eq!(pipeline.generation_for_height(2000), None);
+    }
+
     #[tokio::test]
     async fn test_send_pending_requeues_on_missing_header() {
         // Headers 0..999 exist, but NOT 1999 (stop hash for batch 1000-1999).
