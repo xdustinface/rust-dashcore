@@ -243,18 +243,6 @@ impl PeerNetworkManager {
         self.reputation_manager.record_connection_attempt(addr).await;
 
         let manager = self.clone();
-        let pool = self.pool.clone();
-        let network = self.network;
-        let addrv2_handler = self.addrv2_handler.clone();
-        let shutdown_token = self.shutdown_token.clone();
-        let reputation_manager = self.reputation_manager.clone();
-        let user_agent = self.user_agent.clone();
-        let required_services = self.required_services;
-        let capability_rejected = self.capability_rejected.clone();
-        let connected_peer_count = self.connected_peer_count.clone();
-        let headers2_disabled = self.headers2_disabled.clone();
-        let message_dispatcher = self.message_dispatcher.clone();
-        let network_event_sender = self.network_event_sender.clone();
 
         // Spawn connection task — use select to avoid blocking on the lock during shutdown
         let mut tasks = tokio::select! {
@@ -268,10 +256,10 @@ impl PeerNetworkManager {
             tracing::debug!("Attempting to connect to {}", addr);
 
             let connect_result = tokio::select! {
-                result = Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), network) => result,
-                _ = shutdown_token.cancelled() => {
+                result = Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), manager.network) => result,
+                _ = manager.shutdown_token.cancelled() => {
                     tracing::debug!("Connection to {} cancelled by shutdown", addr);
-                    pool.remove_peer(&addr).await;
+                    manager.pool.remove_peer(&addr).await;
                     return;
                 }
             };
@@ -279,28 +267,29 @@ impl PeerNetworkManager {
             match connect_result {
                 Ok(mut peer) => {
                     // Perform handshake
-                    let mut handshake_manager = HandshakeManager::new(network, user_agent);
+                    let mut handshake_manager = HandshakeManager::new(manager.network, manager.user_agent.clone());
                     match handshake_manager.perform_handshake(&mut peer).await {
                         Ok(_) => {
                             if PeerNetworkManager::should_reject_after_handshake(
-                                &pool,
+                                &manager.pool,
                                 &peer,
-                                required_services,
+                                manager.required_services,
                             )
                             .await
                             {
                                 tracing::info!(
                                     "Rejecting peer {} during handshake - missing required services ({}) while a capable peer is connected",
                                     addr,
-                                    required_services
+                                    manager.required_services
                                 );
                                 PeerNetworkManager::record_capability_rejection_in(
-                                    &capability_rejected,
+                                    &manager.capability_rejected,
                                     addr,
                                 )
                                 .await;
-                                pool.remove_peer(&addr).await;
-                                reputation_manager
+                                manager.pool.remove_peer(&addr).await;
+                                manager
+                                    .reputation_manager
                                     .record_disconnect(addr, DisconnectReason::CapabilityMismatch)
                                     .await;
                                 return;
@@ -317,7 +306,10 @@ impl PeerNetworkManager {
                                 handshake_manager.peer_services().unwrap_or(ServiceFlags::NETWORK);
 
                             // Record successful connection
-                            reputation_manager.record_successful_connection(addr).await;
+                            manager
+                                .reputation_manager
+                                .record_successful_connection(addr)
+                                .await;
 
                             // If the pool is at capacity, evict the worst-scored peer
                             // before adding so a fresh candidate with reputation 0 can
@@ -325,22 +317,22 @@ impl PeerNetworkManager {
                             manager.try_evict_for_incoming(addr).await;
 
                             // Add to pool
-                            if let Err(e) = pool.add_peer(addr, peer).await {
+                            if let Err(e) = manager.pool.add_peer(addr, peer).await {
                                 tracing::error!("Failed to add peer to pool: {}", e);
                                 return;
                             }
 
                             // Increment connected peer counter on successful add
-                            connected_peer_count.fetch_add(1, Ordering::Relaxed);
+                            manager.connected_peer_count.fetch_add(1, Ordering::Relaxed);
 
                             // Emit peer connected event
-                            let count = connected_peer_count.load(Ordering::Relaxed);
-                            let addresses = pool.get_connected_addresses().await;
-                            let best_height = pool.get_best_height().await;
-                            let _ = network_event_sender.send(NetworkEvent::PeerConnected {
+                            let count = manager.connected_peer_count.load(Ordering::Relaxed);
+                            let addresses = manager.pool.get_connected_addresses().await;
+                            let best_height = manager.pool.get_best_height().await;
+                            let _ = manager.network_event_sender.send(NetworkEvent::PeerConnected {
                                 address: addr,
                             });
-                            let _ = network_event_sender.send(NetworkEvent::PeersUpdated {
+                            let _ = manager.network_event_sender.send(NetworkEvent::PeersUpdated {
                                 connected_count: count,
                                 addresses,
                                 best_height,
@@ -348,34 +340,36 @@ impl PeerNetworkManager {
 
                             // Bump the AddrV2 time on direct observation, using the peer's
                             // actual advertised services from the version message.
-                            addrv2_handler.mark_seen(addr, peer_services).await;
+                            manager.addrv2_handler.mark_seen(addr, peer_services).await;
 
                             // // Start message reader for this peer
                             Self::start_peer_reader(
                                 addr,
-                                pool.clone(),
-                                addrv2_handler,
-                                shutdown_token,
-                                reputation_manager.clone(),
-                                connected_peer_count.clone(),
-                                headers2_disabled.clone(),
-                                message_dispatcher,
-                                network_event_sender.clone(),
+                                manager.pool.clone(),
+                                manager.addrv2_handler.clone(),
+                                manager.shutdown_token.clone(),
+                                manager.reputation_manager.clone(),
+                                manager.connected_peer_count.clone(),
+                                manager.headers2_disabled.clone(),
+                                manager.message_dispatcher.clone(),
+                                manager.network_event_sender.clone(),
                             )
                             .await;
                         }
                         Err(e) => {
                             tracing::warn!("Handshake failed with {}: {}", addr, e);
                             // Only clears connecting set. Peer was never added, so no count/event needed.
-                            pool.remove_peer(&addr).await;
-                            reputation_manager
+                            manager.pool.remove_peer(&addr).await;
+                            manager
+                                .reputation_manager
                                 .record_failure_with_penalty(
                                     addr,
                                     misbehavior_scores::INVALID_MESSAGE,
                                     "Handshake failed",
                                 )
                                 .await;
-                            reputation_manager
+                            manager
+                                .reputation_manager
                                 .record_disconnect(addr, DisconnectReason::HandshakeFailure)
                                 .await;
                             // For handshake failures, try again later
@@ -386,15 +380,17 @@ impl PeerNetworkManager {
                 Err(e) => {
                     tracing::debug!("Failed to connect to {}: {}", addr, e);
                     // Only clears connecting set. Peer was never added, so no count/event needed.
-                    pool.remove_peer(&addr).await;
-                    reputation_manager
+                    manager.pool.remove_peer(&addr).await;
+                    manager
+                        .reputation_manager
                         .record_failure_with_penalty(
                             addr,
                             misbehavior_scores::TIMEOUT / 2,
                             "Connection failed",
                         )
                         .await;
-                    reputation_manager
+                    manager
+                        .reputation_manager
                         .record_disconnect(addr, DisconnectReason::Timeout)
                         .await;
                 }
