@@ -28,7 +28,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
 
     fn on_disconnect(&mut self) {
         self.requested_chainlocks.clear();
-        self.reset_for_reorg();
+        self.reset_for_disconnect();
     }
 
     async fn handle_message(

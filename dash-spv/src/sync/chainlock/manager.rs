@@ -132,6 +132,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         self.pending_validation = None;
     }
 
+    /// Reset state for a peer disconnect. `pending_validation` is intentionally
+    /// kept: a chainlock that arrived before `masternode_ready` remains valid on
+    /// the same chain and must be re-evaluated when `on_masternode_ready` fires
+    /// on the next reconnect.
+    pub(super) fn reset_for_disconnect(&mut self) {
+        self.masternode_ready = false;
+    }
+
     /// Process an incoming ChainLock message.
     pub(super) async fn process_chainlock(
         &mut self,
