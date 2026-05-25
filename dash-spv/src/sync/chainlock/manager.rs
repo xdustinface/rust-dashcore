@@ -5,13 +5,16 @@
 //! (all blocks below the best ChainLock are implicitly locked), we only track
 //! the best validated ChainLock.
 
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::hash_types::ChainLockHash;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
-use std::collections::HashSet;
+use dashcore::BlockHash;
 use tokio::sync::RwLock;
 
 use crate::error::SyncResult;
@@ -20,6 +23,22 @@ use crate::sync::{ChainLockProgress, SyncEvent};
 
 /// Metadata key for persisting the best validated ChainLock.
 const BEST_CHAINLOCK_KEY: &str = "best_chainlock";
+
+/// How long a CLSig waiting on an unresolved header is kept before eviction.
+pub(super) const PENDING_UNKNOWN_HASH_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Result of matching a CLSig against the local header chain.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BlockHashVerification {
+    /// Local header at the chainlock's height matches the chainlock's hash.
+    Match,
+    /// Local header at the chainlock's height resolves to a different hash.
+    Mismatch {
+        local_header_hash: BlockHash,
+    },
+    /// No header at the chainlock's height in local storage yet.
+    Unknown,
+}
 
 /// ChainLock manager for the parallel sync coordinator.
 ///
@@ -49,6 +68,15 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// so we don't lose a chainlock that landed during the gap between
     /// the chainlock manager starting and masternode sync completing.
     pending_validation: Option<ChainLock>,
+    /// CLSigs that arrived for a block hash the local chain has not yet
+    /// resolved at the chainlock's claimed height. Re-evaluated when new
+    /// headers land. Keyed by the chainlock's block hash so duplicates
+    /// from the same announcement collapse. Entries past
+    /// [`PENDING_UNKNOWN_HASH_TTL`] are dropped on `tick`. The
+    /// `Option<SocketAddr>` is the peer that delivered the CLSig, used for
+    /// misbehavior reporting when the hash later resolves to a `Mismatch`.
+    pub(super) pending_unknown_hash:
+        HashMap<BlockHash, (ChainLock, Option<SocketAddr>, Instant)>,
     /// Shared snapshot of the best validated chainlock height. `0` means
     /// "no chainlock observed yet". Read by `BlockHeadersManager` as the
     /// floor for the reorg cascade.
@@ -72,6 +100,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
             requested_chainlocks: HashSet::new(),
             masternode_ready: false,
             pending_validation: None,
+            pending_unknown_hash: HashMap::new(),
             chainlock_height,
         };
 
@@ -106,7 +135,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         self.masternode_ready = true;
 
         if let Some(pending) = self.pending_validation.take() {
-            if self.verify_block_hash(&pending).await && self.validate_signature(&pending).await {
+            // `Mismatch` means the resolved header disagrees with the cached
+            // chainlock's claimed hash. Drop the chainlock rather than move
+            // the finality boundary onto a block the local chain doesn't
+            // match. `Match` and `Unknown` (header still missing) take the
+            // signature-validation path.
+            let header_ok =
+                !matches!(self.verify_block_hash(&pending).await, BlockHashVerification::Mismatch { .. });
+            if header_ok && self.validate_signature(&pending).await {
                 self.progress.add_valid(1);
                 self.progress.update_best_validated_height(pending.block_height);
                 let height = pending.block_height;
@@ -146,9 +182,13 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     }
 
     /// Process an incoming ChainLock message.
+    ///
+    /// `peer` is the address that delivered the CLSig, used for misbehavior
+    /// reporting when a `Mismatch` later resolves to an invalid signature.
     pub(super) async fn process_chainlock(
         &mut self,
         chainlock: &ChainLock,
+        peer: Option<SocketAddr>,
     ) -> SyncResult<Vec<SyncEvent>> {
         let height = chainlock.block_height;
         let block_hash = chainlock.block_hash;
@@ -167,16 +207,12 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
             }
         }
 
-        // Verify block hash matches our chain (if we have the header)
-        if !self.verify_block_hash(chainlock).await {
-            tracing::warn!("ChainLock hash mismatch at height {}, rejecting", height);
-            return Ok(vec![]);
-        }
-
         // Only validate if masternode sync is complete. Cache the
         // highest pre-ready chainlock so the masternode-ready
         // transition can retry validation rather than discarding it
-        // (`on_masternode_ready`).
+        // (`on_masternode_ready`). This cache is independent of the
+        // unknown-hash queue: header arrival is checked again on the
+        // ready transition.
         if !self.masternode_ready {
             tracing::debug!(
                 "Caching ChainLock at height {} for validation once masternode sync completes",
@@ -193,6 +229,35 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 chain_lock: chainlock.clone(),
                 validated: false,
             }]);
+        }
+
+        match self.verify_block_hash(chainlock).await {
+            BlockHashVerification::Match => {
+                // Fall through to the existing validated path below.
+            }
+            BlockHashVerification::Unknown => {
+                tracing::info!(
+                    "Queueing ChainLock for unresolved header at height {} hash {}",
+                    height,
+                    block_hash
+                );
+                self.pending_unknown_hash
+                    .insert(block_hash, (chainlock.clone(), peer, Instant::now()));
+                return Ok(vec![SyncEvent::PendingChainLockQueued {
+                    chainlock: chainlock.clone(),
+                }]);
+            }
+            BlockHashVerification::Mismatch {
+                local_header_hash,
+            } => {
+                tracing::warn!(
+                    "ChainLock hash mismatch at height {}: local {} vs CLSig {} (rejecting until forced-reorg path lands)",
+                    height,
+                    local_header_hash,
+                    block_hash
+                );
+                return Ok(vec![]);
+            }
         }
 
         // Validate with masternode engine
@@ -258,25 +323,39 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         }
     }
 
-    /// Verify that the ChainLock block hash matches our stored header.
-    /// Returns true if the hash matches or we don't have the header yet.
-    /// Returns false if we have the header and the hash doesn't match.
-    async fn verify_block_hash(&self, chainlock: &ChainLock) -> bool {
+    /// Match the ChainLock's claimed block hash against our stored header.
+    ///
+    /// - [`BlockHashVerification::Match`]: local header at this height has
+    ///   the same hash.
+    /// - [`BlockHashVerification::Mismatch`]: local header has a different
+    ///   hash. The chainlock either points at a fork branch we don't have or
+    ///   the signature is invalid; the caller decides which.
+    /// - [`BlockHashVerification::Unknown`]: no header yet. Caller queues the
+    ///   chainlock and re-checks once headers progress.
+    pub(super) async fn verify_block_hash(
+        &self,
+        chainlock: &ChainLock,
+    ) -> BlockHashVerification {
         let storage = self.header_storage.read().await;
         match storage.get_header(chainlock.block_height).await {
-            Ok(Some(header)) => header.block_hash() == chainlock.block_hash,
-            Ok(None) => {
-                // Don't reject if we don't have the header yet
-                true
+            Ok(Some(header)) => {
+                let local_header_hash = header.block_hash();
+                if local_header_hash == chainlock.block_hash {
+                    BlockHashVerification::Match
+                } else {
+                    BlockHashVerification::Mismatch {
+                        local_header_hash,
+                    }
+                }
             }
+            Ok(None) => BlockHashVerification::Unknown,
             Err(e) => {
                 tracing::warn!(
                     "Storage error checking ChainLock header at height {}: {}",
                     chainlock.block_height,
                     e
                 );
-                // Accept since we can't verify - will validate when header arrives
-                true
+                BlockHashVerification::Unknown
             }
         }
     }
@@ -302,6 +381,17 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 false
             }
         }
+    }
+
+    /// Drop entries from `pending_unknown_hash` whose age exceeds
+    /// [`PENDING_UNKNOWN_HASH_TTL`]. Returns the number of evicted entries.
+    pub(super) fn drain_expired_pending(&mut self) -> usize {
+        let before = self.pending_unknown_hash.len();
+        let now = Instant::now();
+        self.pending_unknown_hash.retain(|_, (_, _, queued_at)| {
+            now.duration_since(*queued_at) < PENDING_UNKNOWN_HASH_TTL
+        });
+        before - self.pending_unknown_hash.len()
     }
 
     /// Get the best validated ChainLock.
@@ -413,7 +503,7 @@ mod tests {
 
         // Before masternode sync, ChainLocks should not be validated
         let chainlock = create_test_chainlock(100);
-        let events = manager.process_chainlock(&chainlock).await.unwrap();
+        let events = manager.process_chainlock(&chainlock, None).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(manager.progress.valid(), 0);
@@ -431,9 +521,9 @@ mod tests {
         // Lower height first, then higher — pending_validation tracks
         // the highest seen pre-ready chainlock so the retry on
         // masternode-ready always validates the most recent.
-        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
-        let _ = manager.process_chainlock(&create_test_chainlock(200)).await.unwrap();
-        let _ = manager.process_chainlock(&create_test_chainlock(150)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(200), None).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(150), None).await.unwrap();
 
         assert_eq!(manager.pending_validation.as_ref().map(|cl| cl.block_height), Some(200));
     }
@@ -446,7 +536,7 @@ mod tests {
         // Cache a chainlock for height 100 BEFORE any header exists.
         // `process_chainlock`'s permissive `verify_block_hash` lets it
         // through and it lands in `pending_validation`.
-        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
         assert!(manager.pending_validation.is_some());
 
         // Header for height 100 resolves later with a hash that differs
@@ -473,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn test_on_masternode_ready_retries_pending_validation() {
         let mut manager = create_test_manager().await;
-        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
         assert!(manager.pending_validation.is_some());
 
         // With the default empty engine, validation fails — the
@@ -489,12 +579,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_chainlock_validates_after_masternode_ready() {
-        let mut manager = create_test_manager().await;
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let mut manager = create_test_manager_with_storage(&storage).await;
         let _ = manager.on_masternode_ready().await;
 
-        // After masternode sync, ChainLocks should be validated (will fail with empty engine)
-        let chainlock = create_test_chainlock(100);
-        let _ = manager.process_chainlock(&chainlock).await.unwrap();
+        // Store a header at height 100 and a chainlock with the same hash
+        // so `verify_block_hash` returns `Match` and the signature path runs
+        // (empty engine fails validation, counts invalid).
+        let header = dashcore::block::Header {
+            version: dashcore::block::Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: dashcore::TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        let chainlock = ChainLock {
+            block_height: 100,
+            block_hash: header.block_hash(),
+            signature: BLSSignature::from([0u8; 96]),
+        };
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 100)
+            .await
+            .expect("store header at 100");
+
+        let _ = manager.process_chainlock(&chainlock, None).await.unwrap();
 
         assert_eq!(manager.progress.invalid(), 1);
         assert_eq!(manager.progress.valid(), 0);
@@ -509,17 +622,17 @@ mod tests {
 
         // Lower height should be ignored
         let chainlock_lower = create_test_chainlock(150);
-        let events = manager.process_chainlock(&chainlock_lower).await.unwrap();
+        let events = manager.process_chainlock(&chainlock_lower, None).await.unwrap();
         assert_eq!(events.len(), 0);
 
         // Equal height should also be ignored
         let chainlock_equal = create_test_chainlock(200);
-        let events = manager.process_chainlock(&chainlock_equal).await.unwrap();
+        let events = manager.process_chainlock(&chainlock_equal, None).await.unwrap();
         assert_eq!(events.len(), 0);
 
         // Higher height should be processed
         let chainlock_higher = create_test_chainlock(300);
-        let events = manager.process_chainlock(&chainlock_higher).await.unwrap();
+        let events = manager.process_chainlock(&chainlock_higher, None).await.unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -622,7 +735,7 @@ mod tests {
 
         // Without masternode ready, chainlocks are not validated and not persisted
         let chainlock = create_test_chainlock(500);
-        manager.process_chainlock(&chainlock).await.unwrap();
+        manager.process_chainlock(&chainlock, None).await.unwrap();
         assert!(manager.best_chainlock().is_none());
 
         // Verify nothing was persisted
@@ -687,7 +800,7 @@ mod tests {
         assert!(!manager.masternode_ready, "ChainReorg must flip masternode_ready back to false");
         assert!(manager.pending_validation.is_none(), "ChainReorg must drop pending_validation");
 
-        let _ = manager.process_chainlock(&create_test_chainlock(150)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(150), None).await.unwrap();
         assert!(manager.pending_validation.is_some());
         assert_eq!(manager.progress.valid(), 0);
         assert_eq!(manager.progress.invalid(), 0);
@@ -702,7 +815,7 @@ mod tests {
     async fn test_reorg_prevents_stale_pending_validation_from_being_revalidated() {
         let mut manager = create_test_manager().await;
 
-        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
         assert!(manager.pending_validation.is_some());
 
         manager.reset_for_reorg();
@@ -741,7 +854,7 @@ mod tests {
     async fn test_pending_validation_survives_disconnect_and_consumed_on_reconnect() {
         let mut manager = create_test_manager().await;
 
-        let _ = manager.process_chainlock(&create_test_chainlock(100)).await.unwrap();
+        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
         assert!(manager.pending_validation.is_some());
         assert!(!manager.masternode_ready);
 
@@ -786,7 +899,7 @@ mod tests {
 
             // Try to process a lower chainlock
             let lower_chainlock = create_test_chainlock(100);
-            let events = manager.process_chainlock(&lower_chainlock).await.unwrap();
+            let events = manager.process_chainlock(&lower_chainlock, None).await.unwrap();
 
             // Should be rejected (no events)
             assert_eq!(events.len(), 0);
@@ -795,5 +908,139 @@ mod tests {
             let best = manager.best_chainlock().expect("should have best chainlock");
             assert_eq!(best.block_height, 200);
         }
+    }
+
+    /// `verify_block_hash` returns `Match` when the local header at the
+    /// chainlock's height equals the chainlock's claimed block hash.
+    #[tokio::test]
+    async fn test_verify_block_hash_match_branch() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let manager = create_test_manager_with_storage(&storage).await;
+
+        let header = dashcore::block::Header::dummy(50);
+        let hash = header.block_hash();
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 50)
+            .await
+            .expect("store header at 50");
+
+        let chainlock = ChainLock {
+            block_height: 50,
+            block_hash: hash,
+            signature: BLSSignature::from([0u8; 96]),
+        };
+
+        assert_eq!(manager.verify_block_hash(&chainlock).await, BlockHashVerification::Match);
+    }
+
+    /// `verify_block_hash` returns `Unknown` when no header at the chainlock's
+    /// height is stored locally.
+    #[tokio::test]
+    async fn test_verify_block_hash_unknown_branch() {
+        let manager = create_test_manager().await;
+        let chainlock = create_test_chainlock(100);
+
+        assert_eq!(manager.verify_block_hash(&chainlock).await, BlockHashVerification::Unknown);
+    }
+
+    /// `verify_block_hash` returns `Mismatch` when the local header at the
+    /// chainlock's height resolves to a different hash, carrying that hash so
+    /// the caller can drive the forced-reorg path.
+    #[tokio::test]
+    async fn test_verify_block_hash_mismatch_branch() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let manager = create_test_manager_with_storage(&storage).await;
+
+        let header = dashcore::block::Header::dummy(75);
+        let local_hash = header.block_hash();
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 75)
+            .await
+            .expect("store header at 75");
+
+        let chainlock = ChainLock {
+            block_height: 75,
+            block_hash: BlockHash::from_byte_array([0xAA; 32]),
+            signature: BLSSignature::from([0u8; 96]),
+        };
+
+        assert_eq!(
+            manager.verify_block_hash(&chainlock).await,
+            BlockHashVerification::Mismatch {
+                local_header_hash: local_hash,
+            }
+        );
+    }
+
+    /// `process_chainlock` for an unknown-hash CLSig queues the entry and
+    /// emits `PendingChainLockQueued` instead of validating immediately.
+    /// The queued entry preserves the delivering peer for misbehavior
+    /// reporting on a later mismatch.
+    #[tokio::test]
+    async fn test_process_chainlock_queues_unknown_hash() {
+        let mut manager = create_test_manager().await;
+        manager.masternode_ready = true;
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        // No header at height 200 → `Unknown` branch.
+        let chainlock = ChainLock {
+            block_height: 200,
+            block_hash: BlockHash::from_byte_array([0xCC; 32]),
+            signature: BLSSignature::from([0u8; 96]),
+        };
+        let events = manager.process_chainlock(&chainlock, Some(peer)).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SyncEvent::PendingChainLockQueued { .. }));
+        assert_eq!(manager.pending_unknown_hash.len(), 1);
+        let (queued_cl, queued_peer, _queued_at) =
+            manager.pending_unknown_hash.get(&chainlock.block_hash).unwrap();
+        assert_eq!(queued_cl.block_height, 200);
+        assert_eq!(*queued_peer, Some(peer));
+    }
+
+    /// `drain_expired_pending` removes entries past
+    /// [`PENDING_UNKNOWN_HASH_TTL`] and keeps fresh ones.
+    #[tokio::test]
+    async fn test_drain_expired_pending_evicts_only_stale_entries() {
+        let mut manager = create_test_manager().await;
+
+        let fresh_hash = BlockHash::from_byte_array([0x01; 32]);
+        let stale_hash = BlockHash::from_byte_array([0x02; 32]);
+        manager.pending_unknown_hash.insert(
+            fresh_hash,
+            (
+                ChainLock {
+                    block_height: 1,
+                    block_hash: fresh_hash,
+                    signature: BLSSignature::from([0u8; 96]),
+                },
+                None,
+                Instant::now(),
+            ),
+        );
+        manager.pending_unknown_hash.insert(
+            stale_hash,
+            (
+                ChainLock {
+                    block_height: 2,
+                    block_hash: stale_hash,
+                    signature: BLSSignature::from([0u8; 96]),
+                },
+                None,
+                Instant::now() - PENDING_UNKNOWN_HASH_TTL - Duration::from_secs(1),
+            ),
+        );
+
+        let evicted = manager.drain_expired_pending();
+        assert_eq!(evicted, 1);
+        assert!(manager.pending_unknown_hash.contains_key(&fresh_hash));
+        assert!(!manager.pending_unknown_hash.contains_key(&stale_hash));
     }
 }

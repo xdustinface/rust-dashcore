@@ -36,8 +36,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         msg: Message,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        let peer = msg.peer_address();
         match msg.inner() {
-            NetworkMessage::CLSig(chainlock) => self.process_chainlock(chainlock).await,
+            NetworkMessage::CLSig(chainlock) => self.process_chainlock(chainlock, Some(peer)).await,
             NetworkMessage::Inv(inv) => {
                 // Check for ChainLock inventory items, filtering out already-requested ones
                 let chainlocks_to_request: Vec<Inventory> = inv
@@ -126,7 +127,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     }
 
     async fn tick(&mut self, _requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
-        // No periodic work needed
+        let evicted = self.drain_expired_pending();
+        if evicted > 0 {
+            tracing::debug!("Evicted {} expired pending-unknown-hash chainlocks", evicted);
+        }
         Ok(vec![])
     }
 
