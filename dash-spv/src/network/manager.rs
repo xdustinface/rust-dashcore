@@ -1192,7 +1192,7 @@ impl PeerNetworkManager {
             _ => None,
         };
 
-        let (addr, peer) = if let Some((flags, required)) = preferred_service {
+        let selected = if let Some((flags, required)) = preferred_service {
             let capable = self
                 .reputation_manager
                 .filter_unbanned(self.pool.peers_with_service(flags).await)
@@ -1214,6 +1214,9 @@ impl PeerNetworkManager {
         } else {
             self.next_peer(&peers).await
         };
+
+        let (addr, peer) = selected
+            .ok_or_else(|| NetworkError::ConnectionFailed("No eligible peers".to_string()))?;
 
         self.send_message_to_peer(&addr, &peer, message).await
     }
@@ -1273,7 +1276,10 @@ impl PeerNetworkManager {
             };
         }
 
-        let (addr, peer) = self.next_peer(&selected_peers).await;
+        let (addr, peer) = self
+            .next_peer(&selected_peers)
+            .await
+            .ok_or_else(|| NetworkError::ConnectionFailed("No eligible peers".to_string()))?;
 
         tracing::debug!("Distributing {} request to peer {}", message.cmd(), addr);
 
@@ -1283,17 +1289,14 @@ impl PeerNetworkManager {
     async fn next_peer(
         &self,
         peers: &[(SocketAddr, Arc<RwLock<Peer>>)],
-    ) -> (SocketAddr, Arc<RwLock<Peer>>) {
+    ) -> Option<(SocketAddr, Arc<RwLock<Peer>>)> {
         let weights = self.reputation_manager.selection_weights(peers).await;
         let mut rng = thread_rng();
         let idx = match WeightedIndex::new(&weights) {
             Ok(dist) => dist.sample(&mut rng),
-            Err(e) => unreachable!(
-                "selection_weights returned all-zero weights; `filter_unbanned` must be called before `next_peer`: {}",
-                e
-            ),
+            Err(_) => return None,
         };
-        (peers[idx].0, peers[idx].1.clone())
+        Some((peers[idx].0, peers[idx].1.clone()))
     }
 
     /// Send a message to the given peer.
@@ -1670,17 +1673,31 @@ impl PeerNetworkManager {
         &self.reputation_manager
     }
 
-    pub(crate) async fn test_get_all_peers(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
-        self.pool.get_all_peers().await
+    /// Test-only helper that runs the pool-at-capacity eviction logic for `incoming`.
+    ///
+    /// Returns `true` when the worst existing peer was evicted to make room, `false`
+    /// when the pool was not at capacity or the incoming peer was not strictly better
+    /// than the current worst (so no eviction occurred).
+    pub(crate) async fn test_try_evict_for_incoming(&self, incoming: SocketAddr) -> bool {
+        if self.pool.peer_count().await < TARGET_PEERS {
+            return false;
+        }
+        let candidates = self.pool.get_all_peers().await;
+        let incoming_score = self.reputation_manager.get_score(&incoming).await;
+        if let Some(victim) = self.reputation_manager.pick_worst(&candidates).await {
+            let victim_score = self.reputation_manager.get_score(&victim).await;
+            if victim_score > incoming_score && self.pool.remove_peer(&victim).await.is_some() {
+                self.reputation_manager.record_disconnect(victim, DisconnectReason::PoolFull).await;
+                return true;
+            }
+        }
+        false
     }
 
     /// Test-only wrapper that filters banned peers from the pool then samples
     /// one with the same reputation-weighted policy `send_to_single_peer` uses.
     pub(crate) async fn test_next_peer_from_pool(&self) -> Option<SocketAddr> {
         let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
-        if peers.is_empty() {
-            return None;
-        }
-        Some(self.next_peer(&peers).await.0)
+        self.next_peer(&peers).await.map(|(addr, _)| addr)
     }
 }
