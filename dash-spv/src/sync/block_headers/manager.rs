@@ -267,14 +267,17 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             } else if let Some(&ancestor_height) = self.fork_tip_index.get(&first.prev_blockhash) {
                 // prev_blockhash is a fork tip, not on the active chain.
                 // Route continuation batches to the fork buffer using the
-                // same ancestor_height as the first batch. Validation errors
+                // same ancestor_height as the first batch. Chain-break errors
                 // are swallowed because the second batch anchors at the
                 // active-chain ancestor rather than the buffered fork tip;
                 // proper re-anchoring is deferred to Phase 3.
                 match self.ingest_fork(peer, headers, ancestor_height).await {
                     Ok(()) => {}
-                    Err(SyncError::Validation(msg)) => {
-                        tracing::debug!("fork continuation validation error: {}", msg);
+                    Err(SyncError::ForkChainBreak(msg)) => {
+                        tracing::debug!(
+                            "fork continuation chain break (deferred to Phase 3): {}",
+                            msg
+                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -899,7 +902,7 @@ mod tests {
 
         // The continuation batch is routed through fork_tip_index to ingest_fork.
         // The ingest fails the chain-continuity check (second batch anchors at the
-        // active-chain ancestor, not the buffered fork tip), but the Validation
+        // active-chain ancestor, not the buffered fork tip), but the ForkChainBreak
         // error is swallowed so the peer is not penalized. The fork buffer stays
         // at one branch; proper multi-batch continuation is deferred to Phase 3.
         let result2 = manager.handle_headers_pipeline(&[second_fork_header], peer, &sender).await;
@@ -908,6 +911,45 @@ mod tests {
             manager.fork_buffer.len(),
             1,
             "fork buffer must not grow (second ingest fails chain-continuity)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_continuation_non_fork_chain_break_error_propagates() {
+        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
+
+        let (mut manager, _chain) = create_regtest_manager_with_chain(5).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        let fake_fork_tip = BlockHash::from_slice(&[0xAB; 32]).unwrap();
+        manager.fork_tip_index.insert(fake_fork_tip, 1);
+
+        // Craft a batch that exceeds MAX_FORK_HEADERS_PER_PEER (4096) so
+        // fork_buffer.ingest returns SyncError::Validation("Fork branch too
+        // large") before the chain-break check. This is not a ForkChainBreak
+        // error and must reach the Err(e) => return Err(e) arm.
+        let oversized_header = Header {
+            version: Version::ONE,
+            prev_blockhash: fake_fork_tip,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        let oversized_batch = vec![oversized_header; 4097];
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+
+        let result = manager.handle_headers_pipeline(&oversized_batch, peer, &sender).await;
+        assert!(
+            matches!(&result, Err(SyncError::Validation(_))),
+            "non-ForkChainBreak error must propagate from fork continuation: {:?}",
+            result
         );
     }
 

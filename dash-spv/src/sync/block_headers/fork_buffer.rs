@@ -96,8 +96,8 @@ impl ForkBuffer {
         for (offset, header) in headers.iter().enumerate() {
             let height = ancestor_height + offset as u32 + 1;
             if header.prev_blockhash != prev.block_hash() {
-                return Err(SyncError::Validation(format!(
-                    "Fork header chain break: expected prev {}, got {}",
+                return Err(SyncError::ForkChainBreak(format!(
+                    "expected prev {}, got {}",
                     prev.block_hash(),
                     header.prev_blockhash
                 )));
