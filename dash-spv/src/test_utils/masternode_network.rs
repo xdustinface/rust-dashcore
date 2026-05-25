@@ -288,6 +288,47 @@ impl MasternodeTestContext {
         self.wait_for_sync();
     }
 
+    /// Roll back `depth` blocks via `invalidateblock` and mine `depth + 1`
+    /// replacement blocks so the new branch outweighs the orphaned one. Used
+    /// to drive a real reorg through a regtest controller. The orphaned
+    /// branch is the slice `[H - depth + 1 .. H]` of the pre-invalidate tip.
+    ///
+    /// Returns `(orphaned_hashes, new_hashes)`. The orphaned vector is ordered
+    /// oldest-to-newest, as is the new vector. Both have length `depth + 1`
+    /// for the new chain and `depth` for the orphaned branch.
+    pub fn mine_reorg(&mut self, depth: u32) -> (Vec<BlockHash>, Vec<BlockHash>) {
+        assert!(depth >= 1, "mine_reorg depth must be at least 1");
+
+        let tip_height = self
+            .controller
+            .try_rpc_call("getblockcount", &[])
+            .and_then(|v| v.as_u64())
+            .expect("getblockcount on controller") as u32;
+        assert!(tip_height >= depth, "controller tip {} is below reorg depth {}", tip_height, depth);
+
+        let first_invalidate_height = tip_height - depth + 1;
+        let mut orphaned = Vec::with_capacity(depth as usize);
+        for height in first_invalidate_height..=tip_height {
+            let hash_str = self
+                .controller
+                .try_rpc_call("getblockhash", &[height.into()])
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| panic!("getblockhash {} failed", height));
+            orphaned.push(hash_str.parse::<BlockHash>().expect("parse orphaned block hash"));
+        }
+
+        let invalidate_target = orphaned[0].to_string();
+        self.controller
+            .try_rpc_call("invalidateblock", &[invalidate_target.clone().into()])
+            .unwrap_or_else(|| panic!("invalidateblock {} failed", invalidate_target));
+
+        self.bump_mocktime(1);
+        let addr = self.controller.get_new_address();
+        let new_hashes = self.controller.generate_blocks((depth + 1) as u64, &addr);
+        self.wait_for_sync();
+        (orphaned, new_hashes)
+    }
+
     /// Wait for all masternode nodes to reach the same height as the controller.
     fn wait_for_sync(&self) {
         let target_height = self

@@ -199,6 +199,42 @@ pub(super) async fn wait_for_mn_state_with_stored_cycle_above(
     }
 }
 
+/// Wait for a `ChainReorg` sync event whose `fork_height` matches the given
+/// value. Returns the `(fork_height, new_tip)` tuple after the match. Used
+/// after triggering a regtest reorg via `MasternodeTestContext::mine_reorg`
+/// to confirm the SPV header pipeline picked up the change.
+pub(super) async fn wait_for_chain_reorg_event(
+    event_receiver: &mut broadcast::Receiver<SyncEvent>,
+    timeout_secs: u64,
+) -> (u32, dashcore::BlockHash) {
+    let timeout = time::sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                panic!("Timeout waiting for ChainReorg event");
+            }
+            result = event_receiver.recv() => {
+                match result {
+                    Ok(SyncEvent::ChainReorg { fork_height, new_tip, .. }) => {
+                        tracing::info!("ChainReorg observed at fork_height={} new_tip={}", fork_height, new_tip);
+                        return (fork_height, new_tip);
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Event receiver lagged by {} messages", n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        panic!("Sync event channel closed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Wait for an `InstantLockReceived` sync event for `txid` with the desired validation state.
 ///
 /// Returns the received `InstantLock`. Ignores events for unrelated txids and events
