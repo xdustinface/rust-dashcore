@@ -226,6 +226,25 @@ pub type OnManagerErrorCallback =
 pub type OnSyncCompleteCallback =
     Option<extern "C" fn(header_tip: u32, cycle: u32, user_data: *mut c_void)>;
 
+/// Callback for `SyncEvent::ChainReorg`.
+///
+/// The `old_tip` and `new_tip` pointers are borrowed and only valid for the
+/// duration of the callback. Callers must memcpy them if they need to retain
+/// the values after the callback returns.
+pub type OnChainReorgCallback = Option<
+    extern "C" fn(
+        fork_height: u32,
+        old_tip: *const [u8; 32],
+        new_tip: *const [u8; 32],
+        generation: u64,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// Callback for `SyncEvent::DeepReorgDetected`.
+pub type OnDeepReorgDetectedCallback =
+    Option<extern "C" fn(fork_height: u32, depth: u32, user_data: *mut c_void)>;
+
 /// Sync event callbacks - one callback per SyncEvent variant.
 ///
 /// Set only the callbacks you're interested in; unset callbacks will be ignored.
@@ -250,6 +269,8 @@ pub struct FFISyncEventCallbacks {
     pub on_instantlock_received: OnInstantLockReceivedCallback,
     pub on_manager_error: OnManagerErrorCallback,
     pub on_sync_complete: OnSyncCompleteCallback,
+    pub on_chain_reorg: OnChainReorgCallback,
+    pub on_deep_reorg_detected: OnDeepReorgDetectedCallback,
     pub user_data: *mut c_void,
 }
 
@@ -282,6 +303,8 @@ impl Default for FFISyncEventCallbacks {
             on_instantlock_received: None,
             on_manager_error: None,
             on_sync_complete: None,
+            on_chain_reorg: None,
+            on_deep_reorg_detected: None,
             user_data: std::ptr::null_mut(),
         }
     }
@@ -436,6 +459,32 @@ impl FFISyncEventCallbacks {
             } => {
                 if let Some(cb) = self.on_sync_complete {
                     cb(*header_tip, *cycle, self.user_data);
+                }
+            }
+            SyncEvent::ChainReorg {
+                fork_height,
+                old_tip,
+                new_tip,
+                generation,
+            } => {
+                if let Some(cb) = self.on_chain_reorg {
+                    let old_bytes = old_tip.as_byte_array();
+                    let new_bytes = new_tip.as_byte_array();
+                    cb(
+                        *fork_height,
+                        old_bytes as *const [u8; 32],
+                        new_bytes as *const [u8; 32],
+                        *generation,
+                        self.user_data,
+                    );
+                }
+            }
+            SyncEvent::DeepReorgDetected {
+                fork_height,
+                depth,
+            } => {
+                if let Some(cb) = self.on_deep_reorg_detected {
+                    cb(*fork_height, *depth, self.user_data);
                 }
             }
         }

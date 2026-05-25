@@ -128,11 +128,14 @@ impl FiltersPipeline {
         }
     }
 
-    /// Send pending filter requests up to the concurrency limit.
+    /// Send pending filter requests up to the concurrency limit, tagging each
+    /// in-flight slot with the current reorg generation so stale responses
+    /// can be dropped.
     pub(super) async fn send_pending(
         &mut self,
         requests: &RequestSender,
         storage: &impl BlockHeaderStorage,
+        generation: u64,
     ) -> SyncResult<usize> {
         let count = self.coordinator.available_to_send();
         if count == 0 {
@@ -180,19 +183,28 @@ impl FiltersPipeline {
 
             requests.request_filters(start_height, header.block_hash())?;
 
-            self.coordinator.mark_sent(&[start_height]);
+            self.coordinator.mark_sent_with_generation(&[start_height], generation);
 
             tracing::debug!(
-                "Sent GetCFilters: {} to {} ({} active batches)",
+                "Sent GetCFilters: {} to {} ({} active batches, generation {})",
                 start_height,
                 batch_end,
-                self.coordinator.active_count()
+                self.coordinator.active_count(),
+                generation
             );
 
             sent += 1;
         }
 
         Ok(sent)
+    }
+
+    /// Look up the generation snapshot recorded when the batch containing
+    /// `height` was sent. Returns `None` when no in-flight batch covers the
+    /// height (e.g. the response is unsolicited).
+    pub(super) fn generation_for_height(&self, height: u32) -> Option<u64> {
+        let batch_start = self.find_batch_for_height(height)?;
+        self.coordinator.generation_for(&batch_start)
     }
 
     /// Handle a received CFilter message with filter data.
@@ -438,7 +450,7 @@ mod tests {
         pipeline.extend_target(5000);
 
         let (sender, _rx) = create_test_request_sender();
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         let mut ranges: Vec<(u32, u32)> = pipeline
             .batch_trackers
@@ -836,7 +848,7 @@ mod tests {
 
         let (sender, mut rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(pipeline.coordinator.active_count(), 1);
@@ -870,7 +882,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         // 25 batches needed, but only 20 can be in-flight at once
         assert_eq!(count, MAX_CONCURRENT_FILTER_BATCHES);
@@ -892,7 +904,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(count, 2);
 
@@ -917,7 +929,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         // Should send all 3 batches: 0-999, 1000-1999, 2000-2500
         assert_eq!(count, 3);
@@ -938,11 +950,11 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // First send exhausts the queue
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(count, 1);
 
         // Second send has nothing to do
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -963,7 +975,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Send request
-        let sent = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(sent, 1);
         assert_eq!(pipeline.coordinator.active_count(), 1);
 
@@ -998,7 +1010,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Send initial request
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 1);
         assert_eq!(pipeline.coordinator.pending_count(), 0);
 
@@ -1014,7 +1026,7 @@ mod tests {
         assert!(pipeline.batch_trackers.contains_key(&0));
 
         // Can retry by sending again
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 1);
 
         // Existing tracker is reused (not replaced)
@@ -1062,7 +1074,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Only 2 batches sent, batch 2000 stays queued
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 2);
         assert_eq!(pipeline.coordinator.pending_count(), 1);
 
@@ -1074,13 +1086,42 @@ mod tests {
             let hash = headers[h as usize].block_hash();
             pipeline.receive_with_data(h, hash, &dummy_filter_data(h));
         }
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(
             pipeline.batch_trackers.get(&2000).unwrap().end_height(),
             2500,
             "deferred batch should use its original end height"
         );
+    }
+
+    /// `send_pending` with a generation tag records the snapshot on the
+    /// coordinator and `generation_for_height` returns it back exactly,
+    /// while a later generation bump means the same height now reports a
+    /// "different" generation so the manager-side check drops the response.
+    #[tokio::test]
+    async fn test_generation_tagging_round_trips_through_pipeline() {
+        let headers = Header::dummy_batch(0..1000);
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        storage.store_headers(&headers).await.unwrap();
+
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.init(0, 999);
+
+        let (sender, _rx) = create_test_request_sender();
+        let sent = pipeline.send_pending(&sender, &storage, 7).await.unwrap();
+        assert_eq!(sent, 1);
+
+        // The pipeline now stamps the in-flight batch with generation 7;
+        // every height covered by the batch returns the same snapshot.
+        assert_eq!(pipeline.generation_for_height(0), Some(7));
+        assert_eq!(pipeline.generation_for_height(500), Some(7));
+        assert_eq!(pipeline.generation_for_height(999), Some(7));
+
+        // A height outside any in-flight batch returns None so unsolicited
+        // responses are never accidentally dropped as "stale".
+        assert_eq!(pipeline.generation_for_height(2000), None);
     }
 
     #[tokio::test]
@@ -1098,7 +1139,7 @@ mod tests {
         let (sender, mut rx) = create_test_request_sender();
 
         // Batch 0 succeeds (header 999 exists), batch 1000 re-queued (header 1999 missing)
-        let sent = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(sent, 1);
         assert_eq!(pipeline.coordinator.active_count(), 1);
         assert_eq!(pipeline.coordinator.pending_count(), 1);
@@ -1116,7 +1157,7 @@ mod tests {
         let more_headers = Header::dummy_batch(1000..2000);
         storage.store_headers(&more_headers).await.unwrap();
 
-        let sent = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(sent, 1);
         assert_eq!(pipeline.coordinator.active_count(), 2);
         assert_eq!(pipeline.coordinator.pending_count(), 0);

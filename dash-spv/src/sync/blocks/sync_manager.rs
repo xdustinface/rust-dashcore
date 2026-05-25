@@ -73,6 +73,19 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
 
         let hashed_block = HashedBlock::from(block);
 
+        let current_gen = self.current_generation();
+        if let Some(req_gen) = self.pipeline.generation_for_hash(hashed_block.hash()) {
+            if req_gen != current_gen {
+                tracing::debug!(
+                    "dropping stale Block {}: generation {} != {}",
+                    hashed_block.hash(),
+                    req_gen,
+                    current_gen
+                );
+                return Ok(vec![]);
+            }
+        }
+
         // Check if this is a block we requested (pipeline handles buffering with height)
         if !self.pipeline.receive_block(block) {
             tracing::debug!("Received unrequested block {}", hashed_block.hash());
@@ -172,6 +185,23 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface + 'static> SyncM
 
             // Process any blocks we loaded from storage
             return self.process_buffered_blocks().await;
+        }
+
+        // React to a cascade-driven reorg: drop all in-flight block work so the
+        // truncated chain's filter pipeline can re-issue downloads from scratch.
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                "BlocksManager: cascading ChainReorg, resetting pipeline at {}",
+                fork_height
+            );
+            self.pipeline = super::pipeline::BlocksPipeline::new();
+            self.filters_sync_complete = false;
+            self.set_state(SyncState::WaitForEvents);
+            return Ok(vec![]);
         }
 
         // React to FiltersSyncComplete - filters are done, no more BlocksNeeded events coming

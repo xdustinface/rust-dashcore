@@ -8,15 +8,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+use tokio::sync::Mutex;
 
 use crate::chain::{ChainWork, CheckpointManager, ForkCandidate};
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
-use crate::storage::{BlockHeaderStorage, BlockHeaderTip, MetadataStorage};
+use crate::storage::{
+    BlockHeaderStorage, BlockHeaderTip, BlockStorage, FilterHeaderStorage, FilterStorage,
+    MetadataStorage,
+};
 use crate::sync::block_headers::fork_buffer::ForkBuffer;
 use crate::sync::block_headers::HeadersPipeline;
+use crate::sync::reorg::{handle_reorg, is_below_chainlock_floor, ReorgState, ReorgStorages};
 use crate::sync::{BlockHeadersProgress, ProgressPercentage, SyncEvent, SyncManager, SyncState};
 use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
@@ -32,14 +39,33 @@ use tokio::sync::RwLock;
 /// - Initial header sync using parallel pipeline (checkpoint-based segments)
 /// - Post-sync header updates via inventory announcements
 ///
-/// Generic over `H: BlockHeaderStorage` to allow different storage implementations.
-pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
+/// Generic over the four storage types to allow different storage
+/// implementations and to give the manager direct handles for the reorg
+/// cascade.
+pub struct BlockHeadersManager<
+    H: BlockHeaderStorage,
+    FH: FilterHeaderStorage,
+    F: FilterStorage,
+    B: BlockStorage,
+    M: MetadataStorage,
+> {
     /// Current progress of the manager.
     pub(super) progress: BlockHeadersProgress,
     /// Block header storage.
     pub(super) header_storage: Arc<RwLock<H>>,
     /// Metadata storage for persisting the best peer tip height.
     pub(super) metadata_storage: Arc<RwLock<M>>,
+    /// Filter header storage, truncated by the reorg cascade. `None` when
+    /// filter sync is disabled.
+    pub(super) filter_header_storage: Option<Arc<RwLock<FH>>>,
+    /// Filter storage, truncated by the reorg cascade. `None` when filter
+    /// sync is disabled.
+    pub(super) filter_storage: Option<Arc<RwLock<F>>>,
+    /// Block storage, truncated by the reorg cascade. `None` when filter
+    /// sync is disabled.
+    pub(super) block_storage: Option<Arc<RwLock<B>>>,
+    /// Checkpoint manager, consulted by the cascade's checkpoint floor.
+    pub(super) checkpoint_manager: Arc<CheckpointManager>,
     /// Pipeline for parallel header downloads (used for both initial sync and post-sync).
     pub(super) pipeline: HeadersPipeline,
     /// Pending block announcements waiting for headers message (post-sync).
@@ -56,9 +82,31 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Populated whenever a fork batch is buffered so that subsequent batches
     /// extending the same branch are routed to `ingest_fork` correctly.
     fork_tip_index: HashMap<BlockHash, u32>,
+    /// Shared generation counter bumped by `handle_reorg` once a cascade
+    /// commits, used to invalidate stale in-flight responses in downstream
+    /// managers.
+    pub(super) reorg_generation: Arc<AtomicU64>,
+    /// Best validated chainlock height. `0` means "no chainlock observed
+    /// yet". Updated by `ChainLockManager` and read by the cascade as the
+    /// floor below which a fork ancestor cannot land.
+    pub(super) chainlock_height: Arc<AtomicU32>,
+    /// Single-flight reorg state plus the deny-list of fork tip hashes that
+    /// have been rejected by a guard (checkpoint floor, chainlock floor,
+    /// depth cap).
+    pub(super) reorg_state: Arc<Mutex<ReorgState>>,
+    /// Headers seen on a chainlocked-conflicting fork. Recorded for
+    /// monitoring without penalizing the peer.
+    pub(super) side_headers: Vec<(u32, BlockHash)>,
 }
 
-impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
+impl<
+        H: BlockHeaderStorage,
+        FH: FilterHeaderStorage,
+        F: FilterStorage,
+        B: BlockStorage,
+        M: MetadataStorage,
+    > std::fmt::Debug for BlockHeadersManager<H, FH, F, B, M>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockHeadersManager")
             .field("progress", &self.progress)
@@ -67,13 +115,26 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeaders
     }
 }
 
-impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
+impl<
+        H: BlockHeaderStorage,
+        FH: FilterHeaderStorage,
+        F: FilterStorage,
+        B: BlockStorage,
+        M: MetadataStorage,
+    > BlockHeadersManager<H, FH, F, B, M>
+{
     /// Create a new headers manager with the given storage and checkpoint manager.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         header_storage: Arc<RwLock<H>>,
         metadata_storage: Arc<RwLock<M>>,
+        filter_header_storage: Option<Arc<RwLock<FH>>>,
+        filter_storage: Option<Arc<RwLock<F>>>,
+        block_storage: Option<Arc<RwLock<B>>>,
         checkpoint_manager: Arc<CheckpointManager>,
         network: Network,
+        reorg_generation: Arc<AtomicU64>,
+        chainlock_height: Arc<AtomicU32>,
     ) -> SyncResult<Self> {
         let tip = header_storage
             .read()
@@ -97,17 +158,65 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             progress: initial_progress,
             header_storage,
             metadata_storage,
+            filter_header_storage,
+            filter_storage,
+            block_storage,
+            checkpoint_manager: checkpoint_manager.clone(),
             pipeline: HeadersPipeline::new(checkpoint_manager),
             pending_announcements: HashMap::new(),
             announced_peers: HashSet::new(),
             fork_buffer: ForkBuffer::new(Params::new(network)),
             pending_fork_candidate: None,
             fork_tip_index: HashMap::new(),
+            reorg_generation,
+            chainlock_height,
+            reorg_state: Arc::new(Mutex::new(ReorgState::default())),
+            side_headers: Vec::new(),
         })
+    }
+
+    /// Best chainlock height as `Option<u32>`. `0` is mapped to `None`
+    /// (no chainlock yet).
+    pub(super) fn best_chainlock_height(&self) -> Option<u32> {
+        match self.chainlock_height.load(Ordering::Acquire) {
+            0 => None,
+            h => Some(h),
+        }
+    }
+
+    /// Drive the reorg cascade for a buffered fork candidate.
+    pub(super) async fn drive_reorg(
+        &mut self,
+        candidate: ForkCandidate,
+    ) -> SyncResult<Option<SyncEvent>> {
+        let current_tip = self.tip().await?;
+        let current_tip_height = current_tip.height();
+        let current_tip_hash = *current_tip.hash();
+        let storages: ReorgStorages<'_, H, FH, F, B> = ReorgStorages {
+            block_header_storage: &self.header_storage,
+            filter_header_storage: self.filter_header_storage.as_ref(),
+            filter_storage: self.filter_storage.as_ref(),
+            block_storage: self.block_storage.as_ref(),
+        };
+        handle_reorg(
+            candidate,
+            &self.reorg_state,
+            &self.reorg_generation,
+            storages,
+            &self.checkpoint_manager,
+            self.best_chainlock_height(),
+            current_tip_height,
+            current_tip_hash,
+        )
+        .await
     }
 
     /// Number of ancestor headers DGW v3 requires to compute next bits.
     const DGW_HISTORY: u32 = 24;
+
+    /// Maximum number of entries kept in `side_headers`. Oldest entries are
+    /// evicted when the cap is reached to bound memory usage.
+    const MAX_SIDE_HEADERS: usize = 10_000;
 
     /// Consume the fork candidate set when a buffered branch overtook the
     /// active chain. The sync coordinator calls this to perform the actual reorg.
@@ -123,6 +232,37 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         headers: &[Header],
         ancestor_height: u32,
     ) -> SyncResult<()> {
+        // Accept-and-flag: a fork whose ancestor is strictly below the best
+        // chainlock height rewrites at least one finalised block and cannot
+        // become canonical, so route the headers to a side-list for monitoring
+        // instead of pulling them through the fork buffer. A fork that shares
+        // the chainlocked block as its last common ancestor (ancestor_height ==
+        // cl_height) diverges at cl_height+1 and does not rewrite any
+        // finalized block, so it is still eligible for the normal fork path.
+        // The peer is not banned, just observed.
+        if let Some(cl_height) = self.best_chainlock_height() {
+            if is_below_chainlock_floor(ancestor_height, cl_height) {
+                tracing::warn!(
+                    "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
+                    peer,
+                    ancestor_height,
+                    cl_height
+                );
+                let incoming = headers.len();
+                let cap = Self::MAX_SIDE_HEADERS;
+                if self.side_headers.len() + incoming > cap {
+                    let excess = (self.side_headers.len() + incoming)
+                        .saturating_sub(cap)
+                        .min(self.side_headers.len());
+                    self.side_headers.drain(..excess);
+                }
+                for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
+                    self.side_headers.push((height, h.block_hash()));
+                }
+                return Ok(());
+            }
+        }
+
         let storage = self.header_storage.read().await;
         let history_start = ancestor_height.saturating_sub(Self::DGW_HISTORY);
         let history = storage.load_headers(history_start..ancestor_height + 1).await?;
@@ -418,16 +558,25 @@ mod tests {
     use crate::chain::checkpoints::testnet_checkpoints;
     use crate::network::{MessageType, NetworkEvent, NetworkRequest, RequestSender};
     use crate::storage::{
-        DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
+        DiskStorageManager, PersistentBlockHeaderStorage, PersistentBlockStorage,
+        PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
+        StorageManager,
     };
     use crate::sync::block_headers::fork_buffer::MAX_FORK_HEADERS_PER_PEER;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
+    use dashcore::block::Version;
     use dashcore::network::message::NetworkMessage;
+    use dashcore::{CompactTarget, TxMerkleNode};
     use dashcore_hashes::Hash;
     use tokio::sync::mpsc::unbounded_channel;
 
-    type TestBlockHeadersManager =
-        BlockHeadersManager<PersistentBlockHeaderStorage, PersistentMetadataStorage>;
+    type TestBlockHeadersManager = BlockHeadersManager<
+        PersistentBlockHeaderStorage,
+        PersistentFilterHeaderStorage,
+        PersistentFilterStorage,
+        PersistentBlockStorage,
+        PersistentMetadataStorage,
+    >;
 
     fn create_test_checkpoint_manager() -> Arc<CheckpointManager> {
         Arc::new(CheckpointManager::new(testnet_checkpoints()))
@@ -439,11 +588,22 @@ mod tests {
         let genesis = Header::dummy_batch(0..1);
         storage.store_headers(&genesis).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        BlockHeadersManager::new(
+        BlockHeadersManager::<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+            PersistentMetadataStorage,
+        >::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Testnet,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .expect("Failed to create BlockHeadersManager")
@@ -738,11 +898,16 @@ mod tests {
         // First header in dummy_chain has prev = all_zeros (treat as genesis).
         storage.store_headers(&chain).await.unwrap();
         let checkpoint_manager = create_test_checkpoint_manager();
-        let manager = BlockHeadersManager::new(
+        let manager: TestBlockHeadersManager = BlockHeadersManager::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Testnet,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .unwrap();
@@ -820,11 +985,16 @@ mod tests {
         }
         storage.store_headers(&chain).await.unwrap();
         let checkpoint_manager = Arc::new(CheckpointManager::new(vec![]));
-        let manager = BlockHeadersManager::new(
+        let manager: TestBlockHeadersManager = BlockHeadersManager::new(
             storage.block_headers(),
             storage.metadata(),
+            None,
+            None,
+            None,
             checkpoint_manager,
             Network::Regtest,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
         )
         .await
         .expect("failed to create regtest manager");
@@ -1018,5 +1188,260 @@ mod tests {
             }
             other => panic!("expected GetHeaders, got {:?}", other),
         }
+    }
+
+    /// A fork whose ancestor sits at or below the best chainlock height
+    /// gets routed to `side_headers` instead of the fork buffer. The peer
+    /// is observed, not banned.
+    #[tokio::test]
+    async fn chainlock_conflicting_fork_is_flagged_without_banning_peer() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+
+        let (mut manager, chain) = create_regtest_manager_with_chain(5).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Publish a chainlock at height 3 so a fork ancestor at height 1
+        // conflicts with it.
+        manager.chainlock_height.store(3, Ordering::Release);
+
+        let ancestor = chain[1];
+        let fork_time = ancestor.time + 11 * 600 + 1;
+        let mut fork_header = None;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: fork_time,
+                bits: easy_bits,
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce space exhausted");
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+
+        let events = manager.handle_headers_pipeline(&[fork_header], peer, &sender).await.unwrap();
+        assert!(events.is_empty(), "chainlock-conflicting fork produces no events");
+        assert_eq!(manager.fork_buffer.len(), 0, "fork buffer must stay empty");
+        assert_eq!(manager.side_headers.len(), 1, "side_headers must record the header");
+        assert_eq!(manager.side_headers[0].0, 2, "recorded height = ancestor_height + 1");
+        assert_eq!(manager.side_headers[0].1, fork_header.block_hash());
+    }
+
+    /// End-to-end shallow reorg via `drive_reorg`: storage truncates to the
+    /// fork ancestor, the fork headers replace the old tip, a `ChainReorg`
+    /// event surfaces, and the generation counter is bumped.
+    #[tokio::test]
+    async fn shallow_reorg_cascade_truncates_storage_and_emits_chain_reorg() {
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+        let old_tip_hash = chain.last().unwrap().block_hash();
+
+        // Build a 3-header fork extending chain[4]. Use `ingest_fork` so the
+        // candidate flows through the normal path and ends up in
+        // `pending_fork_candidate`.
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<Header> = Vec::new();
+        for i in 0..3u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(h);
+        }
+        let new_tip_hash = fork_headers.last().unwrap().block_hash();
+
+        // Drive `ingest_fork` directly so the candidate sits in `fork_buffer`.
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        manager.ingest_fork(peer, &fork_headers, 4).await.unwrap();
+        // The fork ingest doesn't yet declare a winner because the active
+        // extension is heavier in some cases, so force-promote via a higher
+        // total_work fork. Easier: directly take the candidate by triggering
+        // the buffer's `take_winning_candidate` with zero active work.
+        let candidate = manager
+            .fork_buffer
+            .take_winning_candidate(crate::chain::ChainWork::zero())
+            .expect("fork should win against zero active work");
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+        let event = manager.drive_reorg(candidate).await.unwrap().expect("ChainReorg event");
+        match event {
+            SyncEvent::ChainReorg {
+                fork_height,
+                old_tip,
+                new_tip,
+                generation,
+            } => {
+                assert_eq!(fork_height, 4);
+                assert_eq!(old_tip, old_tip_hash);
+                assert_eq!(new_tip, new_tip_hash);
+                assert_eq!(generation, initial_gen + 1);
+            }
+            other => panic!("expected ChainReorg, got {:?}", other),
+        }
+        assert_eq!(manager.reorg_generation.load(Ordering::Acquire), initial_gen + 1);
+        let new_tip = manager.tip().await.unwrap();
+        assert_eq!(new_tip.height(), 7);
+        assert_eq!(*new_tip.hash(), new_tip_hash);
+
+        // Verify the old-chain headers at the reorged heights are gone and the
+        // fork headers now occupy those slots.
+        let storage = manager.header_storage.read().await;
+        let old_hashes: Vec<BlockHash> = chain[5..].iter().map(|h| h.block_hash()).collect();
+        for old_hash in &old_hashes {
+            let height_opt = storage.get_header_height_by_hash(old_hash).await.unwrap();
+            assert!(
+                height_opt.is_none(),
+                "old-chain header {} should not be indexed after reorg",
+                old_hash
+            );
+        }
+        for (i, fork_h) in fork_headers.iter().enumerate() {
+            let stored = storage.get_header(5 + i as u32).await.unwrap();
+            assert!(stored.is_some(), "fork header at height {} must be stored", 5 + i as u32);
+            assert_eq!(
+                stored.unwrap().block_hash(),
+                fork_h.block_hash(),
+                "stored header at height {} must match fork header",
+                5 + i as u32
+            );
+        }
+    }
+
+    /// `drive_reorg` must return `Ok(None)` when a guard rejects the candidate
+    /// without panicking or looping. Uses the chainlock floor guard: ancestor
+    /// strictly below the best chainlock height is denied.
+    #[tokio::test]
+    async fn drive_reorg_returns_none_when_guard_rejects_candidate() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+
+        // Set chainlock at height 6 so a fork whose ancestor is at height 4 is
+        // below the floor and must be rejected.
+        manager.chainlock_height.store(6, Ordering::Release);
+
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<crate::types::HashedBlockHeader> = Vec::new();
+        for i in 0..2u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = dashcore::block::Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(crate::types::HashedBlockHeader::from(&h));
+        }
+
+        let candidate = ForkCandidate {
+            ancestor_height: 4,
+            headers: fork_headers,
+            total_work: crate::chain::ChainWork::zero(),
+        };
+
+        let result = manager.drive_reorg(candidate).await.unwrap();
+        assert!(result.is_none(), "guard-rejected candidate must return None");
+        assert_eq!(
+            manager.reorg_generation.load(Ordering::Acquire),
+            initial_gen,
+            "generation must not change on guard rejection"
+        );
+    }
+
+    /// A fork whose ancestor is exactly at the chainlocked height must pass
+    /// the chainlock floor guard (`ancestor_height < cl_height` is false when
+    /// equal) and drive a successful reorg cascade.
+    #[tokio::test]
+    async fn drive_reorg_accepts_candidate_anchored_at_chainlock_height() {
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+
+        // Chainlock at height 4 — a fork anchored exactly at 4 must be accepted
+        // because it only diverges at height 5 and does not rewrite block 4.
+        manager.chainlock_height.store(4, Ordering::Release);
+
+        let ancestor = chain[4];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<crate::types::HashedBlockHeader> = Vec::new();
+        for i in 0..3u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = dashcore::block::Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(crate::types::HashedBlockHeader::from(&h));
+        }
+
+        let candidate = ForkCandidate {
+            ancestor_height: 4,
+            headers: fork_headers,
+            total_work: crate::chain::ChainWork::zero(),
+        };
+
+        let result = manager.drive_reorg(candidate).await.unwrap();
+        assert!(
+            result.is_some(),
+            "fork anchored at chainlocked height must not be rejected by the chainlock floor guard"
+        );
+        assert_eq!(
+            manager.reorg_generation.load(Ordering::Acquire),
+            initial_gen + 1,
+            "generation must be bumped on successful reorg"
+        );
     }
 }

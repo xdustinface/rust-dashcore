@@ -12,6 +12,7 @@ mod instantsend;
 mod masternodes;
 mod mempool;
 mod progress;
+pub(crate) mod reorg;
 mod sync_coordinator;
 mod sync_manager;
 

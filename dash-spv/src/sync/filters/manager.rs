@@ -5,6 +5,7 @@
 //! Emits FiltersStored, FiltersSyncComplete and BlocksNeeded events.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashcore::bip158::BlockFilter;
@@ -71,6 +72,9 @@ pub struct FiltersManager<
     /// `BlockProcessed` and the per-wallet record of which wallets already
     /// have a given processed block applied.
     pub(super) tracker: BlockMatchTracker,
+    /// Shared generation counter used to invalidate stale `CFilter`
+    /// responses delivered after a reorg cascade.
+    pub(super) reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -82,6 +86,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         header_storage: Arc<RwLock<H>>,
         filter_header_storage: Arc<RwLock<FH>>,
         filter_storage: Arc<RwLock<F>>,
+        reorg_generation: Arc<AtomicU64>,
     ) -> Self {
         let committed_height = wallet.read().await.synced_height();
         let stored_height = filter_storage.read().await.filter_tip_height().await.unwrap_or(0);
@@ -115,7 +120,13 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             active_batches: BTreeMap::new(),
             processing_height: 0,
             tracker: BlockMatchTracker::new(),
+            reorg_generation,
         }
+    }
+
+    /// Current reorg generation counter snapshot.
+    pub(super) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
     }
 
     /// Returns true if there is no in-flight processing state.
@@ -136,6 +147,18 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         self.tracker.clear();
         self.pending_batches.clear();
         self.filter_pipeline = FiltersPipeline::new();
+    }
+
+    /// Reset all sync state to begin again at `fork_height` after a reorg
+    /// cascade. Clears in-flight batches and rewinds the per-batch
+    /// processing cursors so the next `FilterHeadersStored` event drives a
+    /// fresh download starting at the truncated ancestor.
+    pub(super) fn reset_for_reorg(&mut self, fork_height: u32) {
+        self.reset_for_rescan();
+        self.next_batch_to_store = fork_height;
+        self.processing_height = fork_height;
+        self.progress.update_committed_height(fork_height);
+        self.progress.update_stored_height(fork_height);
     }
 
     async fn load_filters(
@@ -234,7 +257,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         if download_start <= self.progress.filter_header_tip_height() {
             self.filter_pipeline.init(download_start, self.progress.filter_header_tip_height());
             let header_storage = self.header_storage.read().await;
-            self.filter_pipeline.send_pending(requests, &*header_storage).await?;
+            self.filter_pipeline
+                .send_pending(requests, &*header_storage, self.current_generation())
+                .await?;
             drop(header_storage);
         } else {
             // No new filters to download, scanning stored filters only
@@ -890,7 +915,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 self.filter_pipeline.extend_target(tip_height);
                 if self.progress.stored_height() < self.progress.filter_header_tip_height() {
                     let header_storage = self.header_storage.read().await;
-                    self.filter_pipeline.send_pending(requests, &*header_storage).await?;
+                    self.filter_pipeline
+                        .send_pending(requests, &*header_storage, self.current_generation())
+                        .await?;
                 }
 
                 if self.active_batches.is_empty() {
@@ -962,6 +989,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
     }
@@ -975,6 +1003,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
     }
@@ -1041,6 +1070,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await;
 
