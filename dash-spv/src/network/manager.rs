@@ -1668,4 +1668,20 @@ impl PeerNetworkManager {
     pub(crate) async fn test_should_reject_after_handshake(&self, peer: &Peer) -> bool {
         Self::should_reject_after_handshake(&self.pool, peer, self.required_services).await
     }
+
+    /// Test-only access to the reputation manager for seeding scores before
+    /// exercising selection paths.
+    pub(crate) fn test_reputation_manager(&self) -> &PeerReputationManager {
+        &self.reputation_manager
+    }
+
+    /// Test-only wrapper that filters banned peers from the pool then samples
+    /// one with the same reputation-weighted policy `send_to_single_peer` uses.
+    pub(crate) async fn test_next_peer_from_pool(&self) -> Option<SocketAddr> {
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
+        if peers.is_empty() {
+            return None;
+        }
+        Some(self.next_peer(&peers).await.0)
+    }
 }
