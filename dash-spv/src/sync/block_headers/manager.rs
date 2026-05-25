@@ -283,13 +283,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
 
         // Send more requests during initial sync or active post-sync catch-up
         // before processing ready batches so network and storage work overlap.
-        // The storage-derived locator only takes effect when the segment is
-        // caught up to storage; mid-sync, `send_pending` falls back to a
-        // single-entry locator so the next batch can ship without waiting for
-        // disk writes.
+        // During initial sync the segment tip has already advanced past storage
+        // so the storage-derived locator would never be selected; pass an empty
+        // slice and let `send_pending` use the single-entry fallback directly.
         if was_syncing || !tip_was_complete {
-            let locator = self.build_locator().await?;
-            let sent = self.pipeline.send_pending(requests, &locator)?;
+            let sent = self.pipeline.send_pending(requests, &[])?;
             if sent > 0 {
                 tracing::debug!("Pipeline sent {} more requests", sent);
             }

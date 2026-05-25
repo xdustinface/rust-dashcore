@@ -142,10 +142,12 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
             );
         }
 
-        // During initial sync, send more requests and log progress
+        // During initial sync, send more requests and log progress.
+        // The segment tip is always ahead of storage during active sync so the
+        // storage-derived locator would never be selected; pass an empty slice
+        // and let `send_pending` use the single-entry fallback directly.
         if self.state() == SyncState::Syncing {
-            let locator = self.build_locator().await?;
-            let sent = self.pipeline.send_pending(requests, &locator)?;
+            let sent = self.pipeline.send_pending(requests, &[])?;
             if sent > 0 {
                 tracing::debug!("Tick: pipeline sent {} more requests", sent);
             }
