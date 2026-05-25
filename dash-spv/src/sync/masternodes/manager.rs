@@ -1179,9 +1179,8 @@ mod tests {
         }
         drop(rx);
 
-        let result = manager
-            .rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests)
-            .await;
+        let result =
+            manager.rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests).await;
         assert!(result.is_err(), "expected error when the channel is closed");
         assert_eq!(manager.state(), SyncState::WaitForEvents);
         assert!(manager.sync_state.qrinfo_in_flight.is_none());
