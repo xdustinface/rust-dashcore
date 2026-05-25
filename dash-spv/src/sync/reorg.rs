@@ -163,9 +163,9 @@ where
     // Chainlock floor or fresh-client fallback.
     match best_chainlock_height {
         Some(cl_height) => {
-            if candidate.ancestor_height <= cl_height {
+            if candidate.ancestor_height < cl_height {
                 tracing::warn!(
-                    "rejecting reorg: ancestor {} at or below best chainlock {}",
+                    "rejecting reorg: ancestor {} below best chainlock {}",
                     candidate.ancestor_height,
                     cl_height
                 );
