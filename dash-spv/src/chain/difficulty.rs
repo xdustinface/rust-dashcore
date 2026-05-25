@@ -5,6 +5,8 @@
 //! forks at heights well past `nPowDGWHeight` on every network (34140 on
 //! mainnet, 4001/4002 on testnet/regtest/devnet).
 
+use std::cmp::Ordering;
+
 use dashcore::consensus::Params;
 use dashcore::{CompactTarget, Header, Network, Target};
 
@@ -120,20 +122,20 @@ struct U256 {
 }
 
 impl Ord for U256 {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         // Compare from most significant limb down.
         for i in (0..4).rev() {
             match self.limbs[i].cmp(&other.limbs[i]) {
-                std::cmp::Ordering::Equal => continue,
+                Ordering::Equal => continue,
                 ord => return ord,
             }
         }
-        std::cmp::Ordering::Equal
+        Ordering::Equal
     }
 }
 
 impl PartialOrd for U256 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }

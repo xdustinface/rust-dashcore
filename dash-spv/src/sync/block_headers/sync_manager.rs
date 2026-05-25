@@ -131,12 +131,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
             tracing::debug!("Expired {} stale fork branches", evicted);
         }
         if let Some(candidate) = self.take_pending_fork_candidate() {
-            // Phase 3 consumes pending candidates from the sync coordinator.
-            // Until that ships, log them here so an operator can confirm
-            // staged forks are being detected and validated end-to-end.
+            // Reorg promotion is not yet wired into the coordinator. Log here
+            // so detection can be confirmed end-to-end before that lands.
             tracing::warn!(
                 "Fork candidate ready (ancestor={} headers={} work_bytes={:?}), \
-                 Phase 3 promotion not yet wired",
+                 reorg promotion not yet wired",
                 candidate.ancestor_height,
                 candidate.headers.len(),
                 candidate.total_work.as_bytes()

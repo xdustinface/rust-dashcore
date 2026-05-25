@@ -36,8 +36,8 @@ impl ChainTip {
 ///
 /// Carries the common-ancestor height in the active chain, the validated
 /// headers that extend past that ancestor, and the resulting cumulative work
-/// at the fork tip. Phase 3 promotes a candidate once its `total_work`
-/// strictly exceeds the active chain's work.
+/// at the fork tip. A candidate is promoted once its `total_work` strictly
+/// exceeds the active chain's work.
 #[derive(Debug, Clone)]
 pub(crate) struct ForkCandidate {
     pub(crate) ancestor_height: u32,

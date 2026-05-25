@@ -50,8 +50,7 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Per-peer buffer of fork branches awaiting promotion.
     pub(super) fork_buffer: ForkBuffer,
     /// Fork branch that has beaten the active chain on work and is ready for
-    /// Phase 3 to promote. Set inside `handle_headers_pipeline`, taken via
-    /// `take_pending_fork_candidate`.
+    /// promotion by the sync coordinator.
     pending_fork_candidate: Option<ForkCandidate>,
 }
 
@@ -105,17 +104,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
     /// Number of ancestor headers DGW v3 requires to compute next bits.
     const DGW_HISTORY: u32 = 24;
 
-    /// Consume the fork candidate set by `handle_headers_pipeline` when a
-    /// buffered branch overtook the active chain. Phase 3 (`#140`) calls this
-    /// from the sync coordinator to perform the actual reorg.
+    /// Consume the fork candidate set when a buffered branch overtook the
+    /// active chain. The sync coordinator calls this to perform the actual reorg.
     pub(crate) fn take_pending_fork_candidate(&mut self) -> Option<ForkCandidate> {
         self.pending_fork_candidate.take()
     }
 
     /// Buffer a fork extension whose ancestor is on the active chain at a
-    /// height strictly below the current tip. Sets
-    /// `pending_fork_candidate` when the branch's work overtakes the active
-    /// extension past the ancestor.
+    /// height strictly below the current tip.
     async fn ingest_fork(
         &mut self,
         peer: SocketAddr,
