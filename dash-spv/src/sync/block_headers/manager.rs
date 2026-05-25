@@ -233,6 +233,25 @@ impl<
         headers: &[Header],
         ancestor_height: u32,
     ) -> SyncResult<()> {
+        // Accept-and-flag: a fork whose ancestor is at or below the best
+        // chainlock height cannot become canonical, so route the headers to
+        // a side-list for monitoring instead of pulling them through the
+        // fork buffer. The peer is NOT banned, just observed.
+        if let Some(cl_height) = self.best_chainlock_height() {
+            if ancestor_height <= cl_height {
+                tracing::warn!(
+                    "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
+                    peer, ancestor_height, cl_height
+                );
+                let mut height = ancestor_height + 1;
+                for h in headers {
+                    self.side_headers.push((height, h.block_hash()));
+                    height += 1;
+                }
+                return Ok(());
+            }
+        }
+
         let storage = self.header_storage.read().await;
         let history_start = ancestor_height.saturating_sub(Self::DGW_HISTORY);
         let history = storage.load_headers(history_start..ancestor_height + 1).await?;
@@ -1156,5 +1175,56 @@ mod tests {
             }
             other => panic!("expected GetHeaders, got {:?}", other),
         }
+    }
+
+    /// A fork whose ancestor sits at or below the best chainlock height
+    /// gets routed to `side_headers` instead of the fork buffer. The peer
+    /// is observed, not banned.
+    #[tokio::test]
+    async fn chainlock_conflicting_fork_is_flagged_without_banning_peer() {
+        use dashcore::{block::Version, CompactTarget, TxMerkleNode};
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+
+        let (mut manager, chain) = create_regtest_manager_with_chain(5).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Publish a chainlock at height 3 so a fork ancestor at height 1
+        // conflicts with it.
+        manager.chainlock_height.store(3, Ordering::Release);
+
+        let ancestor = chain[1];
+        let fork_time = ancestor.time + 11 * 600 + 1;
+        let mut fork_header = None;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: fork_time,
+                bits: easy_bits,
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce space exhausted");
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+
+        let events =
+            manager.handle_headers_pipeline(&[fork_header], peer, &sender).await.unwrap();
+        assert!(events.is_empty(), "chainlock-conflicting fork produces no events");
+        assert_eq!(manager.fork_buffer.len(), 0, "fork buffer must stay empty");
+        assert_eq!(manager.side_headers.len(), 1, "side_headers must record the header");
+        assert_eq!(manager.side_headers[0].0, 2, "recorded height = ancestor_height + 1");
+        assert_eq!(manager.side_headers[0].1, fork_header.block_hash());
     }
 }
