@@ -305,7 +305,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for ChainLockMan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, RequestSender};
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
     };
@@ -314,6 +314,7 @@ mod tests {
     use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::hashes::Hash;
     use dashcore::BlockHash;
+    use tokio::sync::mpsc::unbounded_channel;
 
     type TestChainLockManager =
         ChainLockManager<PersistentBlockHeaderStorage, PersistentMetadataStorage>;
@@ -367,10 +368,6 @@ mod tests {
     /// sync cycle after reconnect, so dropping it here is safe.
     #[tokio::test]
     async fn test_handle_sync_event_drops_masternode_state_updated_in_waiting_for_connections() {
-        use crate::network::RequestSender;
-        use crate::sync::SyncEvent;
-        use tokio::sync::mpsc::unbounded_channel;
-
         let mut manager = create_test_manager().await;
         manager.set_state(SyncState::WaitingForConnections);
 
@@ -648,10 +645,6 @@ mod tests {
     /// `MasternodeStateUpdated` to retry.
     #[tokio::test]
     async fn test_chain_reorg_hard_blocks_chainlock_validation() {
-        use crate::network::RequestSender;
-        use crate::sync::SyncEvent;
-        use tokio::sync::mpsc::unbounded_channel;
-
         let mut manager = create_test_manager().await;
         let _ = manager.on_masternode_ready().await;
         manager.pending_validation = Some(create_test_chainlock(123));
@@ -670,8 +663,6 @@ mod tests {
         assert!(!manager.masternode_ready, "ChainReorg must flip masternode_ready back to false");
         assert!(manager.pending_validation.is_none(), "ChainReorg must drop pending_validation");
 
-        // A new chainlock arriving while the cascade is active must be cached
-        // for validation once masternode sync catches up, not validated.
         let _ = manager.process_chainlock(&create_test_chainlock(150)).await.unwrap();
         assert!(manager.pending_validation.is_some());
         assert_eq!(manager.progress.valid(), 0);

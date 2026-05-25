@@ -1525,6 +1525,7 @@ mod tests {
         crate::hash_types::QuorumVVecHash,
         crate::network::message_qrinfo::{MNSkipListMode, QuorumSnapshot},
         crate::transaction::special_transaction::quorum_commitment::QuorumEntry,
+        std::ops::Range,
     };
 
     #[cfg(feature = "quorum_validation")]
@@ -2240,7 +2241,7 @@ mod tests {
     #[cfg(feature = "quorum_validation")]
     fn build_cycle_quorum_map_for_test(
         rotation_type: LLMQType,
-        indices: std::ops::Range<i16>,
+        indices: Range<i16>,
     ) -> BTreeMap<u16, QualifiedQuorumEntry> {
         let entries: Vec<QualifiedQuorumEntry> =
             indices.map(|i| make_qualified_quorum_entry(rotation_type, Some(i))).collect();

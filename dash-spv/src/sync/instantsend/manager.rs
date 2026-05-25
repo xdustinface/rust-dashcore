@@ -284,13 +284,14 @@ impl std::fmt::Debug for InstantSendManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, RequestSender};
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress, SyncState};
     use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::hash_types::CycleHash;
     use dashcore::hashes::Hash;
     use dashcore::BlockHash;
     use dashcore::OutPoint;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn create_test_instantlock(txid: Txid) -> InstantLock {
         InstantLock {
@@ -323,10 +324,6 @@ mod tests {
     /// `MasternodesManager` re-emits the event after reconnect.
     #[tokio::test]
     async fn test_handle_sync_event_drops_masternode_state_updated_in_waiting_for_connections() {
-        use crate::network::RequestSender;
-        use crate::sync::SyncEvent;
-        use tokio::sync::mpsc::unbounded_channel;
-
         let mut manager = create_test_manager();
         manager.set_state(SyncState::WaitingForConnections);
 
@@ -448,14 +445,8 @@ mod tests {
     /// `MasternodeStateUpdated` picks those up.
     #[tokio::test]
     async fn test_chain_reorg_drops_pending_instantlocks() {
-        use crate::network::RequestSender;
-        use crate::sync::SyncEvent;
-        use tokio::sync::mpsc::unbounded_channel;
-
         let mut manager = create_test_manager();
 
-        // Queue a pending instantlock by feeding one through the normal path
-        // while no engine state is available to validate it.
         let txid = Txid::from_byte_array([1u8; 32]);
         let _ = manager.process_instantlock(&create_test_instantlock(txid)).await.unwrap();
         assert_eq!(manager.pending_count(), 1);

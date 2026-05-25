@@ -1061,8 +1061,6 @@ mod tests {
     #[tokio::test]
     async fn test_rewind_to_height_truncates_engine_and_dispatches_qrinfo() {
         let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
-        // Pre-populate sync-state height sets and engine state to mimic a fully
-        // synced run.
         manager.sync_state.known_mn_list_heights.insert(60);
         manager.sync_state.known_mn_list_heights.insert(96);
         manager.sync_state.known_mn_list_heights.insert(120);
@@ -1082,8 +1080,6 @@ mod tests {
             .await
             .expect("rewind_to_height must succeed");
 
-        // Engine state at heights > fork_height is gone; entries at or below
-        // are retained.
         {
             let engine = manager.engine.read().await;
             assert!(engine.masternode_lists.contains_key(&60));
@@ -1091,7 +1087,6 @@ mod tests {
             assert!(!engine.masternode_lists.contains_key(&120));
         }
 
-        // Sync-state height sets are pruned in lockstep with the engine.
         assert_eq!(
             manager.sync_state.known_mn_list_heights.iter().copied().collect::<Vec<_>>(),
             vec![60]
@@ -1100,13 +1095,8 @@ mod tests {
             manager.sync_state.validated_cycle_heights.iter().copied().collect::<Vec<_>>(),
             vec![48]
         );
-
-        // `last_synced_block_hash` is rebuilt from the engine's surviving tip.
         assert_eq!(manager.sync_state.last_synced_block_hash, Some(anchor_hash(60)));
-        // Late-straggler dedup state is wiped so a fresh QRInfo round can begin.
         assert!(manager.sync_state.last_processed_qrinfo_tip.is_none());
-
-        // The manager dispatched a QRInfo for the new tip and is now Syncing.
         assert!(manager.sync_state.qrinfo_in_flight.is_some());
         assert_eq!(manager.progress.qr_infos_requested(), 1);
         assert_eq!(manager.state(), SyncState::Syncing);
