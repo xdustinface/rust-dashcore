@@ -185,9 +185,13 @@ impl<
     }
 
     /// Drive the reorg cascade for a buffered fork candidate.
+    ///
+    /// `force` skips the depth cap. Used by the `ChainLockForcedReorg` path so
+    /// a validated CLSig can override a deeper-than-`MAX_REORG_DEPTH` rewrite.
     pub(super) async fn drive_reorg(
         &mut self,
         candidate: ForkCandidate,
+        force: bool,
     ) -> SyncResult<Option<SyncEvent>> {
         let current_tip = self.tip().await?;
         let current_tip_height = current_tip.height();
@@ -207,6 +211,7 @@ impl<
             self.best_chainlock_height(),
             current_tip_height,
             current_tip_hash,
+            force,
         )
         .await
     }
@@ -1357,7 +1362,8 @@ mod tests {
             .expect("fork should win against zero active work");
 
         let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
-        let event = manager.drive_reorg(candidate).await.unwrap().expect("ChainReorg event");
+        let event =
+            manager.drive_reorg(candidate, false).await.unwrap().expect("ChainReorg event");
         match event {
             SyncEvent::ChainReorg {
                 fork_height,
@@ -1446,7 +1452,7 @@ mod tests {
             total_work: crate::chain::ChainWork::zero(),
         };
 
-        let result = manager.drive_reorg(candidate).await.unwrap();
+        let result = manager.drive_reorg(candidate, false).await.unwrap();
         assert!(result.is_none(), "guard-rejected candidate must return None");
         assert_eq!(
             manager.reorg_generation.load(Ordering::Acquire),
@@ -1500,7 +1506,7 @@ mod tests {
             total_work: crate::chain::ChainWork::zero(),
         };
 
-        let result = manager.drive_reorg(candidate).await.unwrap();
+        let result = manager.drive_reorg(candidate, false).await.unwrap();
         assert!(
             result.is_some(),
             "fork anchored at chainlocked height must not be rejected by the chainlock floor guard"

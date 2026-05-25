@@ -155,7 +155,7 @@ impl<
                 candidate.headers.len(),
                 candidate.total_work.as_bytes()
             );
-            if let Some(event) = self.drive_reorg(candidate).await? {
+            if let Some(event) = self.drive_reorg(candidate, false).await? {
                 events.push(event);
             }
         }

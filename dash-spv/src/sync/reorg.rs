@@ -83,6 +83,10 @@ where
 /// the fork's headers starting at `ancestor_height + 1`. Returns a
 /// `ChainReorg` event on success, a `DeepReorgDetected` event when the depth
 /// cap fires, or `Ok(None)` when an earlier guard short-circuits.
+///
+/// When `force` is `true`, the depth cap is skipped (a valid
+/// `ChainLockForcedReorg` overrides it). Checkpoint floor, chainlock floor,
+/// single-flight, and deny-list guards still apply.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_reorg<H, FH, F, B>(
     candidate: ForkCandidate,
@@ -93,6 +97,7 @@ pub(crate) async fn handle_reorg<H, FH, F, B>(
     best_chainlock_height: Option<u32>,
     current_tip_height: u32,
     current_tip_hash: BlockHash,
+    force: bool,
 ) -> SyncResult<Option<SyncEvent>>
 where
     H: BlockHeaderStorage,
@@ -129,6 +134,7 @@ where
         best_chainlock_height,
         current_tip_height,
         current_tip_hash,
+        force,
     )
     .await;
 
@@ -149,6 +155,7 @@ async fn run_guards_and_cascade<H, FH, F, B>(
     best_chainlock_height: Option<u32>,
     current_tip_height: u32,
     current_tip_hash: BlockHash,
+    force: bool,
 ) -> SyncResult<Option<SyncEvent>>
 where
     H: BlockHeaderStorage,
@@ -197,15 +204,17 @@ where
         }
     }
 
-    // Depth cap.
-    let depth = current_tip_height.saturating_sub(candidate.ancestor_height);
-    if depth > MAX_REORG_DEPTH {
-        tracing::warn!("rejecting reorg: depth {} exceeds cap {}", depth, MAX_REORG_DEPTH);
-        state.lock().await.deny_list.insert(candidate_tip_hash, u32::MAX);
-        return Ok(Some(SyncEvent::DeepReorgDetected {
-            fork_height: candidate.ancestor_height,
-            depth,
-        }));
+    // Depth cap. Bypassed when `force` is set (a validated CLSig overrides it).
+    if !force {
+        let depth = current_tip_height.saturating_sub(candidate.ancestor_height);
+        if depth > MAX_REORG_DEPTH {
+            tracing::warn!("rejecting reorg: depth {} exceeds cap {}", depth, MAX_REORG_DEPTH);
+            state.lock().await.deny_list.insert(candidate_tip_hash, u32::MAX);
+            return Ok(Some(SyncEvent::DeepReorgDetected {
+                fork_height: candidate.ancestor_height,
+                depth,
+            }));
+        }
     }
 
     // Cascade. Bump the generation first so any response that races with the
@@ -357,6 +366,7 @@ mod tests {
             Some(0),
             9,
             old_tip_hash,
+            false,
         )
         .await
         .unwrap()
@@ -426,6 +436,7 @@ mod tests {
             Some(0),
             4,
             chain[4].block_hash(),
+            false,
         )
         .await
         .unwrap();
@@ -473,6 +484,7 @@ mod tests {
             Some(5),
             9,
             chain[9].block_hash(),
+            false,
         )
         .await
         .unwrap();
@@ -523,6 +535,7 @@ mod tests {
             Some(0),
             119,
             chain[119].block_hash(),
+            false,
         )
         .await
         .unwrap()
@@ -592,11 +605,79 @@ mod tests {
             Some(0),
             9,
             chain[9].block_hash(),
+            false,
         )
         .await
         .unwrap();
         assert!(result.is_none());
         assert_eq!(generation.load(Ordering::SeqCst), 0);
+    }
+
+    /// `force: true` bypasses the depth cap so a validated `ChainLockForcedReorg`
+    /// can override a rewrite deeper than `MAX_REORG_DEPTH`. The cascade
+    /// still runs, the generation counter still bumps, and a `ChainReorg`
+    /// event is emitted instead of `DeepReorgDetected`.
+    #[tokio::test]
+    async fn force_bypasses_depth_cap_and_cascades() {
+        let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let chain = mined_chain(120, 1_700_000_000);
+        storage.store_headers(&chain).await.unwrap();
+        let block_headers = storage.block_headers();
+        let filter_headers = storage.filter_headers();
+        let filters = storage.filters();
+        let blocks = storage.blocks();
+
+        // ancestor at 10, tip at 119 → depth 109 > MAX_REORG_DEPTH.
+        let candidate = fork_candidate_from(10, chain[10].block_hash(), 3, 1_700_100_000);
+        let candidate_tip = candidate.tip_hash();
+
+        let state = Mutex::new(ReorgState::default());
+        let generation = AtomicU64::new(0);
+        let checkpoint_manager = CheckpointManager::new(vec![]);
+
+        let storages: ReorgStorages<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+        > = ReorgStorages {
+            block_header_storage: &block_headers,
+            filter_header_storage: Some(&filter_headers),
+            filter_storage: Some(&filters),
+            block_storage: Some(&blocks),
+        };
+
+        let event = handle_reorg(
+            candidate,
+            &state,
+            &generation,
+            storages,
+            &checkpoint_manager,
+            Some(0),
+            119,
+            chain[119].block_hash(),
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("forced reorg must produce a ChainReorg event");
+
+        match event {
+            SyncEvent::ChainReorg {
+                fork_height,
+                new_tip,
+                ..
+            } => {
+                assert_eq!(fork_height, 10);
+                assert_eq!(new_tip, candidate_tip);
+            }
+            other => panic!("expected ChainReorg, got {:?}", other),
+        }
+        assert_eq!(generation.load(Ordering::SeqCst), 1, "forced cascade must bump generation");
+        assert!(
+            !state.lock().await.deny_list.contains_key(&candidate_tip),
+            "forced reorg must not land on the deny-list"
+        );
     }
 
     #[test]
