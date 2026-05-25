@@ -100,6 +100,36 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             .ok_or_else(|| SyncError::MissingDependency("storage not initialized".to_string()))
     }
 
+    /// Build a Dash Core style block locator from the current storage tip.
+    ///
+    /// First 10 entries step back by 1, then the step doubles each entry, and
+    /// genesis is always the final entry. Used as the `getheaders` locator so
+    /// peers on a fork can find the most recent common ancestor.
+    pub(super) async fn build_locator(&self) -> SyncResult<Vec<BlockHash>> {
+        let storage = self.header_storage.read().await;
+        let tip_height = storage
+            .get_tip_height()
+            .await
+            .ok_or_else(|| SyncError::MissingDependency("storage not initialized".to_string()))?;
+
+        let mut locator = Vec::with_capacity(32);
+        let mut step: u32 = 1;
+        let mut height = tip_height;
+        loop {
+            if let Some(header) = storage.get_header(height).await? {
+                locator.push(header.block_hash());
+            }
+            if height == 0 {
+                break;
+            }
+            height = height.saturating_sub(step);
+            if locator.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+        Ok(locator)
+    }
+
     /// Validate and store headers batch.
     async fn store_headers(&mut self, headers: &[HashedBlockHeader]) -> SyncResult<BlockHeaderTip> {
         debug_assert!(!headers.is_empty());
@@ -144,16 +174,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             );
         }
 
-        // Send more requests during initial sync or active post-sync catch-up.
-        // Skip for unsolicited headers.
-        if was_syncing || !tip_was_complete {
-            let sent = self.pipeline.send_pending(requests)?;
-            if sent > 0 {
-                tracing::debug!("Pipeline sent {} more requests", sent);
-            }
-        }
-
-        // Process ready-to-store segments
+        // Process ready-to-store segments first so the storage tip is
+        // up-to-date when we build the locator for follow-up requests.
         let mut events = Vec::new();
         let ready_batches = self.pipeline.take_ready_to_store();
 
@@ -185,6 +207,16 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             }
         }
 
+        // Send more requests during initial sync or active post-sync catch-up.
+        // Skip for unsolicited headers.
+        if was_syncing || !tip_was_complete {
+            let locator = self.build_locator().await?;
+            let sent = self.pipeline.send_pending(requests, &locator)?;
+            if sent > 0 {
+                tracing::debug!("Pipeline sent {} more requests", sent);
+            }
+        }
+
         // After storing unsolicited post-sync headers, mark the tip complete so the next header goes through
         // the clean reset path. Don't mark complete during active catch-up.
         if !was_syncing && tip_was_complete && !events.is_empty() {
@@ -199,7 +231,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
                     self.pending_announcements.len()
                 );
                 self.pipeline.reset_tip_segment();
-                self.pipeline.send_pending(requests)?;
+                let locator = self.build_locator().await?;
+                self.pipeline.send_pending(requests, &locator)?;
             } else {
                 // Synced to the tip and no pending announcements, finalize and emit event
                 let tip = self.tip().await?;
@@ -264,6 +297,7 @@ mod tests {
     };
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::network::message::NetworkMessage;
+    use dashcore_hashes::Hash;
     use tokio::sync::mpsc::unbounded_channel;
 
     type TestBlockHeadersManager =
@@ -421,7 +455,8 @@ mod tests {
         // Active catch-up: peer connect skipped while pipeline has pending request
         let mut manager = create_synced_manager().await;
         manager.pipeline.reset_tip_segment();
-        manager.pipeline.send_pending(&requests).unwrap();
+        let locator = manager.build_locator().await.unwrap();
+        manager.pipeline.send_pending(&requests, &locator).unwrap();
         rx.try_recv().unwrap(); // drain the pipeline GetHeaders
 
         manager.handle_network_event(&connect, &requests).await.unwrap();
@@ -532,6 +567,60 @@ mod tests {
         };
         assert_eq!(resumed_locator, synced_hash);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_locator_shape_matches_dashd_algorithm() {
+        // Build a 10K-block chain in storage and verify the locator follows
+        // the dashd algorithm: first 10 entries step back by 1, then the step
+        // doubles, and genesis is always included.
+        let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let chain = Header::dummy_chain(10_000, BlockHash::all_zeros());
+        // First header in dummy_chain has prev = all_zeros (treat as genesis).
+        storage.store_headers(&chain).await.unwrap();
+        let checkpoint_manager = create_test_checkpoint_manager();
+        let manager =
+            BlockHeadersManager::new(storage.block_headers(), storage.metadata(), checkpoint_manager)
+                .await
+                .unwrap();
+
+        let locator = manager.build_locator().await.unwrap();
+        let tip_height = (chain.len() - 1) as u32;
+
+        // First entry equals the tip hash.
+        assert_eq!(locator[0], chain[tip_height as usize].block_hash());
+
+        // Reconstruct expected heights with the dashd algorithm.
+        let mut expected_heights: Vec<u32> = Vec::new();
+        let mut step: u32 = 1;
+        let mut height = tip_height;
+        loop {
+            expected_heights.push(height);
+            if height == 0 {
+                break;
+            }
+            height = height.saturating_sub(step);
+            if expected_heights.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+
+        assert_eq!(locator.len(), expected_heights.len(), "locator length");
+        for (i, h) in expected_heights.iter().enumerate() {
+            assert_eq!(
+                locator[i],
+                chain[*h as usize].block_hash(),
+                "locator[{}] should be hash at height {}",
+                i,
+                h
+            );
+        }
+
+        // Genesis is the final entry.
+        assert_eq!(*locator.last().unwrap(), chain[0].block_hash());
+
+        // Stays under the dashd ~32 entry bound.
+        assert!(locator.len() <= 32, "locator should not exceed 32 entries, got {}", locator.len());
     }
 
     #[tokio::test]

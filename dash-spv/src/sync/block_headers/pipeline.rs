@@ -118,16 +118,28 @@ impl HeadersPipeline {
     }
 
     /// Send pending requests for active segments.
+    ///
+    /// `tip_locator` is used for the tip segment (target_height = None) so the
+    /// peer can find a common ancestor when its chain has forked. Checkpoint
+    /// segments use a single-entry locator anchored at their current tip hash.
     /// Returns the number of requests sent.
-    pub fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<usize> {
+    pub fn send_pending(
+        &mut self,
+        requests: &RequestSender,
+        tip_locator: &[BlockHash],
+    ) -> SyncResult<usize> {
         let mut sent = 0;
         for segment in &mut self.segments {
-            // Skip completed segments
             if segment.complete {
                 continue;
             }
             while segment.can_send() {
-                segment.send_request(requests)?;
+                let locator = if segment.target_height.is_none() && !tip_locator.is_empty() {
+                    tip_locator.to_vec()
+                } else {
+                    vec![segment.current_tip_hash]
+                };
+                segment.send_request(requests, locator)?;
                 sent += 1;
             }
         }
@@ -407,7 +419,7 @@ mod tests {
 
         let (sender, mut rx) = create_test_request_sender();
 
-        let sent = pipeline.send_pending(&sender).unwrap();
+        let sent = pipeline.send_pending(&sender, &[]).unwrap();
 
         // Should send at least one request per segment
         assert!(sent >= pipeline.segment_count());

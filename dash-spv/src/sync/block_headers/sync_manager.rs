@@ -78,7 +78,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
         }
 
         // Send initial batch of requests
-        let sent = self.pipeline.send_pending(requests)?;
+        let locator = self.build_locator().await?;
+        let sent = self.pipeline.send_pending(requests, &locator)?;
         tracing::info!("Pipeline: sent {} initial requests", sent);
 
         Ok(vec![SyncEvent::SyncStart {
@@ -124,7 +125,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
 
         // During initial sync, send more requests and log progress
         if self.state() == SyncState::Syncing {
-            let sent = self.pipeline.send_pending(requests)?;
+            let locator = self.build_locator().await?;
+            let sent = self.pipeline.send_pending(requests, &locator)?;
             if sent > 0 {
                 tracing::debug!("Tick: pipeline sent {} more requests", sent);
             }
@@ -152,7 +154,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
 
                 // Reset tip segment and send requests via pipeline
                 self.pipeline.reset_tip_segment();
-                self.pipeline.send_pending(requests)?;
+                let locator = self.build_locator().await?;
+                self.pipeline.send_pending(requests, &locator)?;
 
                 for hash in stale {
                     self.pending_announcements.remove(&hash);
@@ -182,8 +185,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
                     && !self.pipeline.tip_segment_has_pending_request()
                 {
                     let tip = self.tip().await?;
+                    let locator = self.build_locator().await?;
                     tracing::info!("Announcing tip {} to new peer {}", tip.height(), address);
-                    requests.request_block_headers_from_peer(*tip.hash(), *address)?;
+                    requests.request_block_headers_from_peer(locator, *address)?;
                     self.announced_peers.insert(*address);
                 }
             }
@@ -221,7 +225,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for BlockHeadersMana
                                 );
                                 // Reset tip segment and send requests via pipeline
                                 self.pipeline.reset_tip_segment();
-                                self.pipeline.send_pending(requests)?;
+                                let locator = self.build_locator().await?;
+                                self.pipeline.send_pending(requests, &locator)?;
                             }
                         }
                     }
