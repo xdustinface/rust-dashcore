@@ -1134,7 +1134,7 @@ impl PeerNetworkManager {
 
     /// Send a message to a single peer selected by message type requirements.
     async fn send_to_single_peer(&self, message: NetworkMessage) -> NetworkResult<()> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
 
         if peers.is_empty() {
             return Err(NetworkError::ConnectionFailed("No connected peers".to_string()));
@@ -1154,7 +1154,11 @@ impl PeerNetworkManager {
         };
 
         let (addr, peer) = if let Some((flags, required)) = preferred_service {
-            match self.pool.peer_with_service(flags).await {
+            let capable = self
+                .reputation_manager
+                .filter_unbanned(self.pool.peers_with_service(flags).await)
+                .await;
+            match capable.first() {
                 Some((address, peer)) => {
                     tracing::debug!(
                         "Selected peer {} with {} for {}",
@@ -1162,16 +1166,16 @@ impl PeerNetworkManager {
                         flags,
                         message.cmd()
                     );
-                    (address, peer)
+                    (*address, peer.clone())
                 }
                 None if required => {
                     tracing::warn!("No peers support {}, cannot send {}", flags, message.cmd());
                     return Err(NetworkError::ProtocolError(format!("No peers support {}", flags)));
                 }
-                None => self.next_peer(&peers),
+                None => self.next_peer(&peers).await,
             }
         } else {
-            self.next_peer(&peers)
+            self.next_peer(&peers).await
         };
 
         self.send_message_to_peer(&addr, &peer, message).await
@@ -1184,7 +1188,7 @@ impl PeerNetworkManager {
     /// - Headers (GetHeaders/GetHeaders2): prefers headers2 peers, upgrades GetHeaders if supported
     /// - Other (blocks, masternode data, etc.): uses all connected peers
     async fn send_distributed(&self, message: NetworkMessage) -> NetworkResult<()> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
 
         if peers.is_empty() {
             return Err(NetworkError::ConnectionFailed("No connected peers".to_string()));
@@ -1193,15 +1197,23 @@ impl PeerNetworkManager {
         // Select eligible peers based on message type
         let (selected_peers, require_capability) = match &message {
             NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFilters(_) => {
-                let filter_peers =
-                    self.pool.peers_with_service(ServiceFlags::COMPACT_FILTERS).await;
+                let filter_peers = self
+                    .reputation_manager
+                    .filter_unbanned(
+                        self.pool.peers_with_service(ServiceFlags::COMPACT_FILTERS).await,
+                    )
+                    .await;
                 (filter_peers, true)
             }
             NetworkMessage::GetHeaders(_) | NetworkMessage::GetHeaders2(_) => {
                 // Prefer headers2 peers (excluding disabled), fall back to all
                 let disabled = self.headers2_disabled.lock().await;
-                let mut headers2_peers =
-                    self.pool.peers_with_service(ServiceFlags::NODE_HEADERS_COMPRESSED).await;
+                let mut headers2_peers = self
+                    .reputation_manager
+                    .filter_unbanned(
+                        self.pool.peers_with_service(ServiceFlags::NODE_HEADERS_COMPRESSED).await,
+                    )
+                    .await;
                 headers2_peers.retain(|(addr, _)| !disabled.contains(addr));
                 drop(disabled);
                 if headers2_peers.is_empty() {
@@ -1224,7 +1236,7 @@ impl PeerNetworkManager {
             };
         }
 
-        let (addr, peer) = self.next_peer(&selected_peers);
+        let (addr, peer) = self.next_peer(&selected_peers).await;
 
         tracing::debug!("Distributing {} request to peer {}", message.cmd(), addr);
 
@@ -1232,7 +1244,7 @@ impl PeerNetworkManager {
     }
 
     /// Pick the next peer from `peers` using round-robin rotation.
-    fn next_peer(
+    async fn next_peer(
         &self,
         peers: &[(SocketAddr, Arc<RwLock<Peer>>)],
     ) -> (SocketAddr, Arc<RwLock<Peer>>) {
@@ -1270,7 +1282,7 @@ impl PeerNetworkManager {
 
     /// Broadcast a message to all connected peers
     pub async fn broadcast(&self, message: NetworkMessage) -> Vec<Result<(), Error>> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
         let mut handles = Vec::new();
 
         // Spawn tasks for concurrent sending

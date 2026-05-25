@@ -447,6 +447,23 @@ impl PeerReputationManager {
         }
     }
 
+    /// Remove banned peers from `peers`. Applies decay so a ban that has just
+    /// expired is no longer enforced. Returns the surviving subset preserving
+    /// the input order.
+    pub async fn filter_unbanned<T>(&self, peers: Vec<(SocketAddr, T)>) -> Vec<(SocketAddr, T)> {
+        let mut reputations = self.reputations.write().await;
+        peers
+            .into_iter()
+            .filter(|(addr, _)| {
+                let Some(rep) = reputations.get_mut(addr) else {
+                    return true;
+                };
+                rep.apply_decay();
+                !rep.is_banned()
+            })
+            .collect()
+    }
+
     /// Check if a peer is banned
     pub async fn is_banned(&self, peer: &SocketAddr) -> bool {
         let mut reputations = self.reputations.write().await;
