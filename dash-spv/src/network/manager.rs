@@ -242,6 +242,7 @@ impl PeerNetworkManager {
         // Record connection attempt
         self.reputation_manager.record_connection_attempt(addr).await;
 
+        let manager = self.clone();
         let pool = self.pool.clone();
         let network = self.network;
         let addrv2_handler = self.addrv2_handler.clone();
@@ -321,41 +322,7 @@ impl PeerNetworkManager {
                             // If the pool is at capacity, evict the worst-scored peer
                             // before adding so a fresh candidate with reputation 0 can
                             // displace a peer whose score has drifted into negative territory.
-                            if pool.peer_count().await >= TARGET_PEERS {
-                                let candidates = pool.get_all_peers().await;
-                                let new_peer_score =
-                                    reputation_manager.get_score(&addr).await;
-                                if let Some(victim) =
-                                    reputation_manager.pick_worst(&candidates).await
-                                {
-                                    let victim_score =
-                                        reputation_manager.get_score(&victim).await;
-                                    if victim_score > new_peer_score {
-                                        tracing::info!(
-                                            "Pool at capacity, evicting peer {} (score {}) for incoming peer {} (score {})",
-                                            victim,
-                                            victim_score,
-                                            addr,
-                                            new_peer_score
-                                        );
-                                        if pool.remove_peer(&victim).await.is_some() {
-                                            Self::notify_peer_removed(
-                                                &pool,
-                                                &victim,
-                                                &connected_peer_count,
-                                                &network_event_sender,
-                                            )
-                                            .await;
-                                            reputation_manager
-                                                .record_disconnect(
-                                                    victim,
-                                                    DisconnectReason::PoolFull,
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
+                            manager.try_evict_for_incoming(addr).await;
 
                             // Add to pool
                             if let Err(e) = pool.add_peer(addr, peer).await {
@@ -1601,6 +1568,45 @@ impl NetworkManager for PeerNetworkManager {
     }
 }
 
+impl PeerNetworkManager {
+    /// Evict the worst-scored peer from the pool if the pool is at capacity and
+    /// the incoming peer's score is strictly better than the worst existing peer.
+    /// Returns `true` when an eviction occurred, `false` otherwise.
+    pub(crate) async fn try_evict_for_incoming(&self, incoming_addr: SocketAddr) -> bool {
+        if self.pool.peer_count().await < TARGET_PEERS {
+            return false;
+        }
+        let candidates = self.pool.get_all_peers().await;
+        let incoming_score = self.reputation_manager.get_score(&incoming_addr).await;
+        if let Some(victim) = self.reputation_manager.pick_worst(&candidates).await {
+            let victim_score = self.reputation_manager.get_score(&victim).await;
+            if victim_score > incoming_score {
+                tracing::info!(
+                    "Pool at capacity, evicting peer {} (score {}) for incoming peer {} (score {})",
+                    victim,
+                    victim_score,
+                    incoming_addr,
+                    incoming_score
+                );
+                if self.pool.remove_peer(&victim).await.is_some() {
+                    Self::notify_peer_removed(
+                        &self.pool,
+                        &victim,
+                        &self.connected_peer_count,
+                        &self.network_event_sender,
+                    )
+                    .await;
+                    self.reputation_manager
+                        .record_disconnect(victim, DisconnectReason::PoolFull)
+                        .await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 impl PeerNetworkManager {
     pub(crate) async fn new_for_test(required_services: ServiceFlags) -> Self {
@@ -1671,27 +1677,6 @@ impl PeerNetworkManager {
     /// exercising selection paths.
     pub(crate) fn test_reputation_manager(&self) -> &PeerReputationManager {
         &self.reputation_manager
-    }
-
-    /// Test-only helper that runs the pool-at-capacity eviction logic for `incoming`.
-    ///
-    /// Returns `true` when the worst existing peer was evicted to make room, `false`
-    /// when the pool was not at capacity or the incoming peer was not strictly better
-    /// than the current worst (so no eviction occurred).
-    pub(crate) async fn test_try_evict_for_incoming(&self, incoming: SocketAddr) -> bool {
-        if self.pool.peer_count().await < TARGET_PEERS {
-            return false;
-        }
-        let candidates = self.pool.get_all_peers().await;
-        let incoming_score = self.reputation_manager.get_score(&incoming).await;
-        if let Some(victim) = self.reputation_manager.pick_worst(&candidates).await {
-            let victim_score = self.reputation_manager.get_score(&victim).await;
-            if victim_score > incoming_score && self.pool.remove_peer(&victim).await.is_some() {
-                self.reputation_manager.record_disconnect(victim, DisconnectReason::PoolFull).await;
-                return true;
-            }
-        }
-        false
     }
 
     /// Test-only wrapper that filters banned peers from the pool then samples

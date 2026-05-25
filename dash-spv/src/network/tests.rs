@@ -148,6 +148,29 @@ mod pool_tests {
     }
 
     #[tokio::test]
+    async fn test_next_peer_returns_none_when_all_peers_banned() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let a = test_socket_address(14);
+        let b = test_socket_address(15);
+
+        manager.insert_test_peer(a, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(b, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        for _ in 0..10 {
+            reputation.update_reputation(a, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+            reputation.update_reputation(b, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(reputation.is_banned(&a).await);
+        assert!(reputation.is_banned(&b).await);
+
+        assert!(
+            manager.test_next_peer_from_pool().await.is_none(),
+            "next_peer must return None when all peers are banned"
+        );
+    }
+
+    #[tokio::test]
     async fn test_next_peer_weighted_selection_distribution() {
         let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
         let high = test_socket_address(21);
@@ -202,7 +225,7 @@ mod pool_tests {
 
         // Incoming peer with score 0 is better: eviction must fire and remove `worst`.
         let incoming = test_socket_address(99);
-        let evicted = manager.test_try_evict_for_incoming(incoming).await;
+        let evicted = manager.try_evict_for_incoming(incoming).await;
         assert!(evicted, "better incoming peer must trigger eviction");
         assert_eq!(manager.test_peer_count().await, TARGET_PEERS - 1, "pool must shrink by one");
         assert!(!manager.test_is_connected(&worst).await, "worst peer must be gone after eviction");
@@ -215,7 +238,7 @@ mod pool_tests {
         // Incoming peer with high score (worse than all existing peers): no eviction.
         let bad_incoming = test_socket_address(101);
         reputation.update_reputation(bad_incoming, 80, "newcomer is bad").await;
-        let evicted = manager.test_try_evict_for_incoming(bad_incoming).await;
+        let evicted = manager.try_evict_for_incoming(bad_incoming).await;
         assert!(!evicted, "incoming peer worse than the worst must not trigger eviction");
         assert_eq!(manager.test_peer_count().await, TARGET_PEERS, "pool size must not change");
     }
