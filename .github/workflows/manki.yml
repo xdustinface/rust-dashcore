@@ -1,29 +1,36 @@
-name: Manki Review
+name: Manki
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created]
   issue_comment:
     types: [created, edited]
-  pull_request_review:
-    types: [submitted]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
   id-token: write
-
-concurrency:
-  group: manki-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: false
+  actions: read
 
 jobs:
   review:
+    if: github.actor != 'manki-review[bot]'
+    concurrency:
+      group: manki-${{ (github.event_name == 'issue_comment' && github.event.comment.id) || format('pr-{0}', github.event.pull_request.number || github.event.issue.number) }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: manki-review/manki@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Manki Review
+        uses: manki-review/manki@v5
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
