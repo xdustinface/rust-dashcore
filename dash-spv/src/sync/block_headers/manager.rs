@@ -251,7 +251,9 @@ impl<
                 let incoming = headers.len();
                 let cap = Self::MAX_SIDE_HEADERS;
                 if self.side_headers.len() + incoming > cap {
-                    let excess = (self.side_headers.len() + incoming).saturating_sub(cap);
+                    let excess = (self.side_headers.len() + incoming)
+                        .saturating_sub(cap)
+                        .min(self.side_headers.len());
                     self.side_headers.drain(..excess);
                 }
                 for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
