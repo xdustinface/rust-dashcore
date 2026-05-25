@@ -28,7 +28,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
 
     fn on_disconnect(&mut self) {
         self.requested_chainlocks.clear();
-        self.masternode_ready = false;
+        self.reset_for_reorg();
     }
 
     async fn handle_message(
@@ -87,8 +87,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
                 fork_height,
                 "ChainLockManager: cascading ChainReorg, hard-blocking validation"
             );
-            self.masternode_ready = false;
-            self.pending_validation = None;
+            self.reset_for_reorg();
             return Ok(vec![]);
         }
 
@@ -100,7 +99,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         // peerless. `MasternodeStateUpdated` re-fires once `MasternodesManager`
         // completes a sync cycle after reconnect.
         if !matches!(event, SyncEvent::MasternodeStateUpdated { .. })
-            || self.masternode_ready
+            || self.is_masternode_ready()
             || self.state() == SyncState::WaitingForConnections
         {
             return Ok(vec![]);

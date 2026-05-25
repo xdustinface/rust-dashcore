@@ -42,13 +42,13 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// ChainLock hashes that have been requested (to avoid duplicate requests).
     pub(super) requested_chainlocks: HashSet<ChainLockHash>,
     /// Whether masternode sync is complete and we can validate signatures.
-    pub(super) masternode_ready: bool,
+    masternode_ready: bool,
     /// Highest chainlock that arrived before `masternode_ready` and
     /// therefore could not be validated yet. Re-validated on the
     /// not-ready → ready transition (see [`Self::on_masternode_ready`])
     /// so we don't lose a chainlock that landed during the gap between
     /// the chainlock manager starting and masternode sync completing.
-    pub(super) pending_validation: Option<ChainLock>,
+    pending_validation: Option<ChainLock>,
     /// Shared snapshot of the best validated chainlock height. `0` means
     /// "no chainlock observed yet". Read by `BlockHeadersManager` as the
     /// floor for the reorg cascade.
@@ -119,6 +119,17 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         }
 
         self.best_chainlock.clone()
+    }
+
+    pub(super) fn is_masternode_ready(&self) -> bool {
+        self.masternode_ready
+    }
+
+    /// Reset state for a chain reorg, blocking validation until masternode data
+    /// is re-established on the new chain.
+    pub(super) fn reset_for_reorg(&mut self) {
+        self.masternode_ready = false;
+        self.pending_validation = None;
     }
 
     /// Process an incoming ChainLock message.
