@@ -388,4 +388,47 @@ mod tests {
         assert!(!manager.pipeline.is_complete(), "downloaded buffer must survive on_disconnect");
         assert!(manager.filters_sync_complete);
     }
+
+    /// `SyncEvent::ChainReorg` must reset the pipeline, clear
+    /// `filters_sync_complete`, and move the manager back to `WaitForEvents`.
+    #[tokio::test]
+    async fn chain_reorg_event_resets_pipeline_and_state() {
+        use dashcore::block::Header;
+        use dashcore::{Block, TxMerkleNode};
+        use dashcore_hashes::Hash;
+
+        let mut manager = create_test_manager().await;
+        manager.filters_sync_complete = true;
+        manager.progress.set_state(SyncState::Syncing);
+
+        let header = Header {
+            version: dashcore::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: dashcore::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![],
+        };
+        manager.pipeline.add_from_storage(block, 100, BTreeSet::from([MOCK_WALLET_ID]));
+        assert!(!manager.pipeline.is_complete(), "pipeline must have pending work before reorg");
+
+        let network = MockNetworkManager::new();
+        let requests = network.request_sender();
+        let event = SyncEvent::ChainReorg {
+            fork_height: 50,
+            old_tip: dashcore::BlockHash::all_zeros(),
+            new_tip: dashcore::BlockHash::all_zeros(),
+            generation: 1,
+        };
+
+        let events = manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert!(events.is_empty());
+        assert!(manager.pipeline.is_complete(), "pipeline must be empty after ChainReorg");
+        assert!(!manager.filters_sync_complete, "filters_sync_complete must be cleared");
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+    }
 }
