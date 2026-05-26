@@ -216,19 +216,29 @@ mod tests {
 
     fn create_test_manager(
     ) -> (MempoolManager<MockWallet>, RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
+        let (manager, _wallet, requests, rx) = create_test_manager_with_wallet();
+        (manager, requests, rx)
+    }
+
+    fn create_test_manager_with_wallet() -> (
+        MempoolManager<MockWallet>,
+        Arc<RwLock<MockWallet>>,
+        RequestSender,
+        mpsc::UnboundedReceiver<NetworkRequest>,
+    ) {
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
         let manager = MempoolManager::new(
-            wallet,
+            wallet.clone(),
             MempoolStrategy::FetchAll,
             1000,
             0,
             Arc::new(AtomicU32::new(0)),
         );
 
-        (manager, requests, rx)
+        (manager, wallet, requests, rx)
     }
 
     #[test]
@@ -373,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_processed_removes_confirmed_txids() {
-        let (mut manager, requests, _rx) = create_test_manager();
+        let (mut manager, wallet, requests, _rx) = create_test_manager_with_wallet();
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
 
@@ -383,7 +393,9 @@ mod tests {
         };
         manager.handle_sync_event(&sync, &requests).await.unwrap();
 
-        // Add transactions to mempool
+        // Add transactions to mempool, and stage the first one as a
+        // pending rebroadcast so we can assert the BlockProcessed handler
+        // wipes it on confirmation.
         let mut txids = Vec::new();
         for i in 0..2u32 {
             let tx = dashcore::Transaction {
@@ -395,6 +407,7 @@ mod tests {
             };
             let txid = tx.txid();
             txids.push(txid);
+            wallet.write().await.insert_stored_transaction(tx.clone());
             manager.transactions.insert(
                 txid,
                 crate::types::UnconfirmedTransaction::new(
@@ -407,6 +420,16 @@ mod tests {
                 ),
             );
         }
+        manager
+            .enqueue_demoted_for_rebroadcast(
+                key_wallet_manager::test_utils::MOCK_WALLET_ID,
+                &[txids[0]],
+            )
+            .await;
+        assert!(
+            manager.pending_rebroadcast.contains_key(&txids[0]),
+            "seed step must place the demoted tx into pending_rebroadcast"
+        );
 
         let event = SyncEvent::BlockProcessed {
             block_hash: dashcore::BlockHash::all_zeros(),
@@ -419,6 +442,10 @@ mod tests {
         assert!(events.is_empty());
 
         assert!(manager.transactions.is_empty());
+        assert!(
+            !manager.pending_rebroadcast.contains_key(&txids[0]),
+            "confirmed txid must be removed from pending_rebroadcast"
+        );
     }
 
     #[tokio::test]

@@ -585,7 +585,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    async fn enqueue_demoted_for_rebroadcast(
+    pub(super) async fn enqueue_demoted_for_rebroadcast(
         &mut self,
         wallet_id: WalletId,
         demoted_txids: &[Txid],
@@ -2130,6 +2130,55 @@ mod tests {
         }
         assert!(found_broadcast, "expected first attempt to broadcast the demoted tx");
         assert_eq!(manager.pending_rebroadcast.get(&txid).unwrap().attempts, 1);
+
+        // A second immediate tick must not produce another broadcast: the
+        // exponential backoff sets `next_attempt` ahead, so the entry
+        // should be skipped without bumping `attempts`.
+        manager.drive_reorg_rebroadcast(&requests).await;
+        let second_broadcast = std::iter::from_fn(|| rx.try_recv().ok()).any(
+            |m| matches!(m, NetworkRequest::BroadcastMessage(NetworkMessage::Tx(t)) if t.txid() == txid),
+        );
+        assert!(!second_broadcast, "backoff must suppress a second immediate rebroadcast");
+        assert_eq!(manager.pending_rebroadcast.get(&txid).unwrap().attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_chainlock_floor_prevents_enqueue() {
+        // Chainlock floor strictly above the current tip must skip enqueue
+        // entirely, since a tx confirmed in a chainlocked block can never
+        // be a candidate for rebroadcast.
+        let wallet = Arc::new(RwLock::new(MockWallet::new()));
+        let (tx_chan, _rx) = mpsc::unbounded_channel::<NetworkRequest>();
+        let _requests = RequestSender::new(tx_chan);
+        let chainlock_height = Arc::new(AtomicU32::new(150));
+        let mut manager = MempoolManager::new(
+            wallet.clone(),
+            MempoolStrategy::FetchAll,
+            1000,
+            0,
+            chainlock_height,
+        );
+        let wallet_event_rx = wallet.read().await.subscribe_events();
+        manager.set_wallet_event_subscription(wallet_event_rx);
+
+        let prev = OutPoint {
+            txid: Txid::from_byte_array([0xee; 32]),
+            vout: 0,
+        };
+        let demoted = build_demoted_tx(prev, 0, 1_000);
+        let txid = demoted.txid();
+        wallet.write().await.insert_stored_transaction(demoted);
+
+        manager.enqueue_demoted_for_rebroadcast(MOCK_WALLET_ID, &[txid]).await;
+
+        assert!(
+            !manager.pending_rebroadcast.contains_key(&txid),
+            "chainlock floor above tip must prevent enqueue"
+        );
+        assert!(
+            !manager.transactions.contains_key(&txid),
+            "skipped enqueue must not leave a stray transactions entry"
+        );
     }
 
     #[tokio::test]
@@ -2181,6 +2230,70 @@ mod tests {
         assert!(
             !manager.pending_rebroadcast.contains_key(&demoted_txid),
             "input-conflicting demoted tx must be dropped from rebroadcast queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_input_conflict_via_channel_evicts_rebroadcast() {
+        // Exercises the production path: `WalletEvent::BlockProcessed` is
+        // delivered through the broadcast channel and `drain_wallet_events`
+        // must route `inserted`/`updated` records into the eviction check.
+        let (mut manager, wallet, _requests, _rx) = manager_with_wallet_events().await;
+
+        let prev = OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let demoted = build_demoted_tx(prev, 0, 1_000);
+        let demoted_txid = demoted.txid();
+        wallet.write().await.insert_stored_transaction(demoted);
+
+        let _ = wallet.read().await.event_sender().send(WalletEvent::Reorg {
+            wallet_id: MOCK_WALLET_ID,
+            fork_height: 100,
+            demoted_txids: vec![demoted_txid],
+            conflicted_txids: vec![],
+            balance: key_wallet::WalletCoreBalance::default(),
+        });
+        manager.drain_wallet_events().await;
+        assert!(manager.pending_rebroadcast.contains_key(&demoted_txid));
+
+        let conflicting_tx = build_demoted_tx(prev, 0, 2_000);
+        let conflicting_record =
+            key_wallet::managed_account::transaction_record::TransactionRecord::new(
+                conflicting_tx,
+                key_wallet::account::AccountType::Standard {
+                    index: 0,
+                    standard_account_type: key_wallet::account::StandardAccountType::BIP44Account,
+                },
+                TransactionContext::InBlock(key_wallet::transaction_checking::BlockInfo::new(
+                    110,
+                    BlockHash::all_zeros(),
+                    0,
+                )),
+                key_wallet::transaction_checking::TransactionType::Standard,
+                key_wallet::managed_account::transaction_record::TransactionDirection::Incoming,
+                vec![],
+                vec![],
+                0,
+            );
+
+        let _ = wallet.read().await.event_sender().send(WalletEvent::BlockProcessed {
+            wallet_id: MOCK_WALLET_ID,
+            height: 110,
+            chain_lock: None,
+            inserted: vec![conflicting_record],
+            updated: vec![],
+            matured: vec![],
+            balance: key_wallet::WalletCoreBalance::default(),
+            account_balances: Default::default(),
+            addresses_derived: vec![],
+        });
+        manager.drain_wallet_events().await;
+
+        assert!(
+            !manager.pending_rebroadcast.contains_key(&demoted_txid),
+            "BlockProcessed routed through the channel must evict input-conflicting demoted tx"
         );
     }
 
