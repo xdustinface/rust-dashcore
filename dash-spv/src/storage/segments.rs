@@ -497,11 +497,22 @@ impl<I: Persistable> SegmentCache<I> {
 
     /// Queue all segments for deletion and reset the cache to the empty state.
     pub fn clear_all(&mut self) {
-        let all_ids: Vec<u32> = self.segments.keys().chain(self.evicted.keys()).copied().collect();
-        for id in all_ids {
-            self.segments.remove(&id);
-            self.evicted.remove(&id);
-            self.to_delete.insert(id);
+        if let (Some(start), Some(tip)) = (self.start_height, self.tip_height) {
+            let start_seg = Self::height_to_segment_id(start);
+            let end_seg = Self::height_to_segment_id(tip);
+            for id in start_seg..=end_seg {
+                self.segments.remove(&id);
+                self.evicted.remove(&id);
+                self.to_delete.insert(id);
+            }
+        } else {
+            let all_ids: Vec<u32> =
+                self.segments.keys().chain(self.evicted.keys()).copied().collect();
+            for id in all_ids {
+                self.segments.remove(&id);
+                self.evicted.remove(&id);
+                self.to_delete.insert(id);
+            }
         }
         self.tip_height = None;
         self.start_height = None;
@@ -1113,6 +1124,39 @@ mod tests {
             reloaded.get_items(ITEMS_PER_SEGMENT + 6..ITEMS_PER_SEGMENT + 16).await.unwrap(),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_deletes_all_segment_files_across_multiple_segments() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT * 2 + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        // Verify all three segment files exist on disk before clearing.
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(0)).exists());
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(1)).exists());
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
+
+        // Reload so segments 1 is evicted and only boundary segments (0 and 2)
+        // are in memory, leaving segment 1 as on-disk-only.
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT * 2 + 4));
+
+        cache.clear_all();
+        cache.persist(tmp_dir.path()).await;
+
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(0)).exists());
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(1)).exists());
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
+
+        let reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded.tip_height(), None, "cache must be empty after clear_all + persist + reload");
+        assert_eq!(reloaded.start_height(), None);
     }
 
     /// A corrupted highest segment is logged and dropped; the cache reopens
