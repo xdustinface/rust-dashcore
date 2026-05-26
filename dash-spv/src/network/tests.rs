@@ -243,6 +243,25 @@ mod pool_tests {
         assert_eq!(manager.test_peer_count().await, TARGET_PEERS, "pool size must not change");
     }
 
+    #[tokio::test]
+    async fn test_broadcast_targets_skip_banned_peers() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let good = test_socket_address(51);
+        let banned = test_socket_address(52);
+
+        manager.insert_test_peer(good, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(banned, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        for _ in 0..10 {
+            reputation.update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(reputation.is_banned(&banned).await);
+
+        let targets = manager.test_broadcast_targets().await;
+        assert_eq!(targets, vec![good], "broadcast must skip banned peers");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_capability_rejection_cache_expires() {
         let manager = PeerNetworkManager::new_for_test(ServiceFlags::COMPACT_FILTERS).await;

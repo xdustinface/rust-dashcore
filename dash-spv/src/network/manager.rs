@@ -1294,9 +1294,15 @@ impl PeerNetworkManager {
             .map_err(|e| NetworkError::ProtocolError(format!("Failed to send to {}: {}", addr, e)))
     }
 
+    /// Peers eligible for a broadcast: every connected peer minus those banned
+    /// by the reputation manager.
+    pub(crate) async fn broadcast_targets(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
+        self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await
+    }
+
     /// Broadcast a message to all connected peers
     pub async fn broadcast(&self, message: NetworkMessage) -> Vec<Result<(), Error>> {
-        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
+        let peers = self.broadcast_targets().await;
         let mut handles = Vec::new();
 
         // Spawn tasks for concurrent sending
@@ -1680,6 +1686,12 @@ impl PeerNetworkManager {
     /// exercising selection paths.
     pub(crate) fn test_reputation_manager(&self) -> &PeerReputationManager {
         &self.reputation_manager
+    }
+
+    /// Test-only wrapper that exposes the addresses `broadcast` would target,
+    /// so a regression in the underlying filtering is observable from tests.
+    pub(crate) async fn test_broadcast_targets(&self) -> Vec<SocketAddr> {
+        self.broadcast_targets().await.into_iter().map(|(addr, _)| addr).collect()
     }
 
     /// Test-only wrapper that filters banned peers from the pool then samples
