@@ -307,13 +307,16 @@ impl ManagedCoreFundsAccount {
             );
             if tx_record.context != context {
                 let was_confirmed = tx_record.context.confirmed();
+                let going_inactive = context.is_inactive();
                 tx_record.update_context(context.clone());
                 // Confirm-time upgrades within the confirmed state (e.g.
                 // InBlock → InChainLockedBlock) are not signaled here.
                 // Chainlock-driven promotions go through the dedicated
                 // `apply_chain_lock` path which emits a single batched
-                // ChainLockProcessed event.
-                changed = !was_confirmed;
+                // ChainLockProcessed event. A transition from a confirmed
+                // state to an inactive one (Conflicted/Abandoned) must
+                // still be signaled so callers can refresh balances.
+                changed = !was_confirmed || going_inactive;
             }
         }
 
