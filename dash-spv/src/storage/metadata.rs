@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     error::StorageResult,
@@ -39,7 +39,7 @@ pub trait MetadataStorage: Send + Sync + 'static {
     async fn clear_reorg_sentinel(&mut self) -> StorageResult<()>;
 
     /// `true` when the reorg-in-progress sentinel marker is present on disk.
-    fn is_reorg_sentinel_set(&self) -> bool;
+    async fn is_reorg_sentinel_set(&self) -> bool;
 }
 
 pub struct PersistentMetadataStorage {
@@ -49,12 +49,16 @@ pub struct PersistentMetadataStorage {
 impl PersistentMetadataStorage {
     pub(crate) const FOLDER_NAME: &str = "metadata";
 
+    pub(crate) fn sentinel_path_for(storage_path: &Path) -> PathBuf {
+        storage_path.join(Self::FOLDER_NAME).join(REORG_SENTINEL_FILE)
+    }
+
     fn metadata_folder(&self) -> PathBuf {
         self.storage_path.join(Self::FOLDER_NAME)
     }
 
     fn reorg_sentinel_path(&self) -> PathBuf {
-        self.metadata_folder().join(REORG_SENTINEL_FILE)
+        Self::sentinel_path_for(&self.storage_path)
     }
 }
 
@@ -159,7 +163,7 @@ impl MetadataStorage for PersistentMetadataStorage {
         }
     }
 
-    fn is_reorg_sentinel_set(&self) -> bool {
-        self.reorg_sentinel_path().exists()
+    async fn is_reorg_sentinel_set(&self) -> bool {
+        tokio::fs::try_exists(self.reorg_sentinel_path()).await.unwrap_or(false)
     }
 }

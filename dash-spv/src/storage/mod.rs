@@ -34,7 +34,6 @@ pub use crate::storage::blocks::{BlockStorage, PersistentBlockStorage};
 pub use crate::storage::filter_headers::{FilterHeaderStorage, PersistentFilterHeaderStorage};
 pub use crate::storage::filters::{FilterStorage, PersistentFilterStorage};
 pub use crate::storage::masternode::{MasternodeStateStorage, PersistentMasternodeStateStorage};
-use crate::storage::metadata::REORG_SENTINEL_FILE;
 pub use crate::storage::metadata::{MetadataStorage, PersistentMetadataStorage};
 pub use crate::storage::peers::{PeerStorage, PersistentPeerStorage};
 
@@ -434,11 +433,10 @@ impl metadata::MetadataStorage for DiskStorageManager {
         self.metadata.write().await.clear_reorg_sentinel().await
     }
 
-    fn is_reorg_sentinel_set(&self) -> bool {
-        self.storage_path
-            .join(PersistentMetadataStorage::FOLDER_NAME)
-            .join(REORG_SENTINEL_FILE)
-            .exists()
+    async fn is_reorg_sentinel_set(&self) -> bool {
+        tokio::fs::try_exists(PersistentMetadataStorage::sentinel_path_for(&self.storage_path))
+            .await
+            .unwrap_or(false)
     }
 }
 

@@ -264,14 +264,15 @@ impl BlockHeaderStorage for PersistentBlockHeaderStorage {
 }
 
 impl PersistentBlockHeaderStorage {
-    /// Highest height `h` such that every header in `[start, h]` chains
-    /// correctly via `prev_blockhash` to its parent in `header_hash_index`.
-    ///
-    /// Walks backward from the current tip, returning the first height whose
-    /// parent hash maps to the immediately preceding height. Returns `None`
-    /// when the storage is empty. Used by the startup consistency check to
-    /// recover a safe tip after a crash mid-cascade.
-    pub(crate) async fn highest_valid_tip(&self) -> Option<u32> {
+    /// Highest height `h` for which the immediate parent link
+    /// (`header_hash_index[prev_blockhash_of(h)] == h - 1`) is found in the
+    /// index and the header at `h` is present in storage. Walks backward from
+    /// the current tip, returning the first height that satisfies these two
+    /// conditions. Returns `None` when the storage is empty. Mid-chain gaps
+    /// are not detected; callers must not assume that `[start, result]` is
+    /// fully contiguous. Used by the startup consistency check to recover a
+    /// safe tip after a crash mid-cascade.
+    pub(crate) async fn highest_valid_tip(&mut self) -> Option<u32> {
         let mut headers = self.block_headers.write().await;
         let tip = headers.tip_height()?;
         let start = headers.start_height()?;

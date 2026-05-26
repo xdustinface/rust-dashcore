@@ -134,6 +134,7 @@ impl<I: Persistable> SegmentCache<I> {
                                 id,
                                 e
                             );
+                            cache.to_delete.insert(*id);
                         }
                     }
                 }
@@ -1134,7 +1135,7 @@ mod tests {
         // `StorageError::ReadFailed`.
         tokio::fs::write(&corrupt_path, [0xFDu8, 0x01, 0x00]).await.unwrap();
 
-        let reloaded = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+        let mut reloaded = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
 
         assert_eq!(
             reloaded.tip_height(),
@@ -1142,6 +1143,14 @@ mod tests {
             "tip should fall back to the last readable segment"
         );
         assert_eq!(reloaded.start_height(), Some(0));
+
+        // The corrupt segment must be queued for deletion and removed on
+        // persist so subsequent startups do not emit the warning again.
+        reloaded.persist(tmp_dir.path()).await;
+        assert!(!corrupt_path.exists(), "corrupt segment file must be deleted on persist");
+
+        let reloaded2 = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded2.tip_height(), Some(9));
     }
 
     #[test]

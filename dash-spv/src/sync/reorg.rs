@@ -261,7 +261,12 @@ where
         bs.write().await.truncate_above(candidate.ancestor_height).await?;
     }
 
-    metadata_storage.write().await.clear_reorg_sentinel().await?;
+    if let Err(e) = metadata_storage.write().await.clear_reorg_sentinel().await {
+        tracing::error!(
+            "reorg cascade succeeded but sentinel clear failed ({}); next startup will re-run recovery",
+            e
+        );
+    }
 
     tracing::info!(
         "reorg cascade complete: fork_height={} new_tip={} generation={}",
@@ -838,7 +843,7 @@ mod tests {
         let blocks = storage.blocks();
         let metadata = storage.metadata();
 
-        assert!(!metadata.read().await.is_reorg_sentinel_set());
+        assert!(!metadata.read().await.is_reorg_sentinel_set().await);
 
         let candidate = fork_candidate_from(5, chain[5].block_hash(), 3, 1_700_010_000);
         let state = Mutex::new(ReorgState::default());
@@ -874,7 +879,7 @@ mod tests {
         .expect("ChainReorg event");
 
         assert!(
-            !metadata.read().await.is_reorg_sentinel_set(),
+            !metadata.read().await.is_reorg_sentinel_set().await,
             "sentinel must be cleared after a successful cascade"
         );
     }
