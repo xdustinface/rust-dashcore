@@ -1269,3 +1269,190 @@ async fn test_block_processed_chainlocked_flag_matches_record_context() {
         assert!(matches!(inserted[0].context, TransactionContext::InBlock(_)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reorg path
+// ---------------------------------------------------------------------------
+
+/// Build a transaction that spends a specific outpoint of a previous
+/// transaction (mimicking a child) paying back to one of the wallet's
+/// addresses. Used to exercise the descendant-cascade demotion path.
+fn spend_from(parent_txid: Txid, parent_vout: u32, addr: &Address, value: u64) -> Transaction {
+    Transaction {
+        version: 2,
+        lock_time: 0,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent_txid,
+                vout: parent_vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value,
+            script_pubkey: addr.script_pubkey(),
+        }],
+        special_transaction_payload: None,
+    }
+}
+
+#[tokio::test]
+async fn test_rewind_demotes_single_above_cut_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xb0);
+    let block = make_block(vec![tx.clone()], 0xb0, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 11, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    let result = manager.rewind_to_height(10).await.expect("rewind below cut succeeds");
+    assert_eq!(result.demoted_txids, vec![tx.txid()]);
+    assert!(result.conflicted_txids.is_empty());
+
+    let events = drain_events(&mut rx);
+    let reorg = events
+        .iter()
+        .find_map(|e| match e {
+            WalletEvent::Reorg {
+                fork_height,
+                demoted_txids,
+                conflicted_txids,
+                balance,
+                ..
+            } => Some((*fork_height, demoted_txids.clone(), conflicted_txids.clone(), *balance)),
+            _ => None,
+        })
+        .expect("Reorg event must be emitted for a wallet whose state changed");
+    assert_eq!(reorg.0, 10);
+    assert_eq!(reorg.1, vec![tx.txid()]);
+    assert!(reorg.2.is_empty());
+    assert_eq!(reorg.3.confirmed(), 0, "demoted record must drop out of confirmed balance");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+}
+
+#[tokio::test]
+async fn test_rewind_cascades_to_descendant_in_same_account() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx_a = create_tx_paying_to(&addr, 0xc1);
+    let block_a = make_block(vec![tx_a.clone()], 0xc1, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block_a, 11, &wallets).await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    let block_b = make_block(vec![tx_b.clone()], 0xc2, 200);
+    manager.process_block_for_wallets(&block_b, 12, &wallets).await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    assert!(demoted.contains(&tx_a.txid()), "parent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "child spending parent must cascade");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+}
+
+#[tokio::test]
+async fn test_rewind_retains_instant_send_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xd3);
+
+    // First sighting is an IS-locked mempool tx.
+    let islock = dummy_instant_lock(tx.txid());
+    manager.process_mempool_transaction(&tx, Some(islock.clone())).await;
+
+    let _ = manager.rewind_to_height(0).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let mut found = false;
+    for account in info.accounts().all_accounts() {
+        if let Some(record) = account.transactions().get(&tx.txid()) {
+            assert!(
+                matches!(record.context, TransactionContext::InstantSend(_)),
+                "IS-locked record must be retained as InstantSend after rewind, got {:?}",
+                record.context,
+            );
+            found = true;
+        }
+    }
+    assert!(found, "the IS-locked transaction record must still be present after rewind");
+}
+
+#[tokio::test]
+async fn test_rewind_refuses_below_chainlock_floor() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    manager.apply_chain_lock(ChainLock::dummy(50));
+
+    let err = manager
+        .rewind_to_height(49)
+        .await
+        .expect_err("rewind below chainlock floor must be rejected");
+    match err {
+        crate::wallet_interface::RewindError::BelowChainLockFloor {
+            requested,
+            floor,
+            wallet_id: rejecting,
+        } => {
+            assert_eq!(requested, 49);
+            assert_eq!(floor, 50);
+            assert_eq!(rejecting, wallet_id);
+        }
+    }
+
+    // Rewinding to the floor itself is allowed.
+    manager.rewind_to_height(50).await.expect("rewind at the floor is allowed");
+}
+
+#[tokio::test]
+async fn test_rewind_rolls_back_last_processed_and_synced_height() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xee, 100);
+    manager.process_block_for_wallets(&block, 500, &wallets).await;
+    manager.update_wallet_synced_height(&wallet_id, 500);
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 500);
+    assert_eq!(info.synced_height(), 500);
+
+    manager.rewind_to_height(250).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 250);
+    assert_eq!(info.synced_height(), 250);
+}
+
+#[tokio::test]
+async fn test_rewind_below_current_does_not_advance_heights_upward() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xef, 100);
+    manager.process_block_for_wallets(&block, 100, &wallets).await;
+
+    manager.rewind_to_height(1000).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(
+        info.last_processed_height(),
+        100,
+        "rewinding to a height above current must not advance the wallet forward",
+    );
+}
+
+#[tokio::test]
+async fn test_get_transaction_returns_stored_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xa9);
+    let block = make_block(vec![tx.clone()], 0xa9, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 50, &wallets).await;
+
+    let fetched = manager.get_transaction(&tx.txid()).await.expect("tx must be retrievable");
+    assert_eq!(fetched.txid(), tx.txid());
+
+    let missing = manager.get_transaction(&Txid::from_byte_array([0xff; 32])).await;
+    assert!(missing.is_none(), "unknown txid must return None");
+}
