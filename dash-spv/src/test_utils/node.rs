@@ -461,6 +461,27 @@ impl DashCoreNode {
         client.get_best_block_hash().expect("getbestblockhash failed")
     }
 
+    /// Get the block hash at the given height.
+    pub fn get_block_hash(&self, height: u32) -> BlockHash {
+        let client = self.rpc_client();
+        client.get_block_hash(height).expect("getblockhash failed")
+    }
+
+    /// Mark a block as invalid. Rolls dashd's tip back to the parent of
+    /// `block_hash` and forks all descendants out of the active chain.
+    pub fn invalidate_block(&self, block_hash: &BlockHash) {
+        let client = self.rpc_client();
+        client.invalidate_block(block_hash).expect("invalidateblock failed");
+        tracing::info!("Invalidated block {}", block_hash);
+    }
+
+    /// Re-mark a previously invalidated block as valid.
+    pub fn reconsider_block(&self, block_hash: &BlockHash) {
+        let client = self.rpc_client();
+        client.reconsider_block(block_hash).expect("reconsiderblock failed");
+        tracing::info!("Reconsidered block {}", block_hash);
+    }
+
     /// Call getblocktemplate to trigger CreateNewBlock (includes quorum commitments).
     pub fn get_block_template(&self) {
         let client = self.rpc_client();
