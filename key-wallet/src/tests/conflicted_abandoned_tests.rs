@@ -9,6 +9,7 @@ use dashcore::hashes::Hash;
 use dashcore::{BlockHash, Transaction, TxIn, TxOut};
 
 use crate::managed_account::managed_account_trait::ManagedAccountTrait;
+use crate::managed_account::ManagedCoreFundsAccount;
 use crate::test_utils::TestWalletContext;
 use crate::transaction_checking::transaction_router::TransactionType;
 use crate::transaction_checking::{BlockInfo, TransactionContext};
@@ -176,6 +177,51 @@ async fn spending_tx_going_inactive_releases_input_outpoint() {
         ctx.bip44_account().utxos.len(),
         1,
         "UTXO must be re-trackable once its consumer is abandoned"
+    );
+}
+
+/// Regression: the `Deserialize` impl for `ManagedCoreFundsAccount` must skip
+/// inputs from inactive (`Conflicted`/`Abandoned`) records when rebuilding
+/// `spent_outpoints`. Otherwise a round-trip would re-mark the funded outpoint
+/// as spent and the funding UTXO could not be re-tracked after its consumer
+/// has been abandoned.
+#[tokio::test]
+async fn serde_round_trip_does_not_resurrect_inactive_spent_outpoints() {
+    let (mut ctx, funding_tx) = funded_in_block().await;
+    let funded_outpoint = OutPoint {
+        txid: funding_tx.txid(),
+        vout: 0,
+    };
+    let spend = spending_tx(funded_outpoint, FUND_AMOUNT);
+
+    let spend_match = ctx
+        .managed_wallet
+        .first_bip44_managed_account()
+        .expect("bip44 account")
+        .check_transaction_for_match(&spend, Some(0))
+        .expect("spend matches funded account");
+
+    let result = ctx.check_transaction(&spend, block_context()).await;
+    assert!(result.state_modified);
+
+    let account = ctx.managed_wallet.first_bip44_managed_account_mut().expect("bip44 account");
+    account.confirm_transaction(
+        &spend,
+        &spend_match,
+        TransactionContext::Abandoned,
+        TransactionType::Standard,
+    );
+
+    let json = serde_json::to_string(account).expect("serialize");
+    let deserialized: ManagedCoreFundsAccount = serde_json::from_str(&json).expect("deserialize");
+    *account = deserialized;
+
+    let result = ctx.check_transaction(&funding_tx, block_context()).await;
+    assert!(result.is_relevant);
+    assert_eq!(
+        ctx.bip44_account().utxos.len(),
+        1,
+        "funding UTXO must be re-trackable after serde round-trip with abandoned spend"
     );
 }
 
