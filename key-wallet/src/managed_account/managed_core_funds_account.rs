@@ -118,6 +118,12 @@ impl ManagedCoreFundsAccount {
     /// Drop any UTXOs `tx` previously contributed and release the outpoints it
     /// had marked as spent. Restoring the actual UTXOs the inputs referenced is
     /// the caller's responsibility.
+    ///
+    /// NOTE: no current caller restores the predecessor UTXOs, so a wallet with
+    /// a spend chain that includes a conflicted/abandoned transaction will
+    /// report a balance that does not include those re-released funds until
+    /// the predecessor transactions are re-processed. The full rewind path is
+    /// tracked in issue #145.
     fn release_inactive_utxos(&mut self, tx: &Transaction) {
         let txid = tx.txid();
         let mut utxos_changed = false;
