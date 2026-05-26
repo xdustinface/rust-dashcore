@@ -6,6 +6,8 @@ mod account_tests;
 
 mod balance_tests;
 
+mod conflicted_abandoned_tests;
+
 mod address_pool_tests;
 
 mod advanced_transaction_tests;

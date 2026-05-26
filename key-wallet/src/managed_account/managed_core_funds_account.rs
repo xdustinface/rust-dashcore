@@ -115,6 +115,37 @@ impl ManagedCoreFundsAccount {
         self.spent_outpoints.contains(outpoint)
     }
 
+    /// Drop any UTXOs `tx` previously contributed and release the outpoints it
+    /// had marked as spent. Restoring the actual UTXOs the inputs referenced is
+    /// the caller's responsibility.
+    ///
+    /// NOTE: no current caller restores the predecessor UTXOs, so a wallet with
+    /// a spend chain that includes a conflicted/abandoned transaction will
+    /// report a balance that does not include those re-released funds until
+    /// the predecessor transactions are re-processed. The full rewind path is
+    /// tracked in issue #145.
+    fn release_inactive_utxos(&mut self, tx: &Transaction) {
+        let txid = tx.txid();
+        let mut utxos_changed = false;
+        for vout in 0..tx.output.len() as u32 {
+            let outpoint = OutPoint {
+                txid,
+                vout,
+            };
+            if self.utxos.remove(&outpoint).is_some() {
+                utxos_changed = true;
+            }
+        }
+        for input in &tx.input {
+            if self.spent_outpoints.remove(&input.previous_output) {
+                utxos_changed = true;
+            }
+        }
+        if utxos_changed {
+            self.keys.bump_monitor_revision();
+        }
+    }
+
     /// Add new UTXOs for received outputs, remove spent ones.
     fn update_utxos(
         &mut self,
@@ -136,6 +167,10 @@ impl ManagedCoreFundsAccount {
             | ManagedAccountType::DashpayExternalAccount {
                 ..
             } => {
+                if context.is_inactive() {
+                    self.release_inactive_utxos(tx);
+                    return;
+                }
                 let involved_addrs: BTreeSet<_> = account_match
                     .account_type_match
                     .all_involved_addresses()
@@ -278,13 +313,16 @@ impl ManagedCoreFundsAccount {
             );
             if tx_record.context != context {
                 let was_confirmed = tx_record.context.confirmed();
+                let going_inactive = context.is_inactive();
                 tx_record.update_context(context.clone());
                 // Confirm-time upgrades within the confirmed state (e.g.
                 // InBlock → InChainLockedBlock) are not signaled here.
                 // Chainlock-driven promotions go through the dedicated
                 // `apply_chain_lock` path which emits a single batched
-                // ChainLockProcessed event.
-                changed = !was_confirmed;
+                // ChainLockProcessed event. A transition from a confirmed
+                // state to an inactive one (Conflicted/Abandoned) must
+                // still be signaled so callers can refresh balances.
+                changed = !was_confirmed || going_inactive;
             }
         }
 
@@ -717,6 +755,7 @@ impl<'de> Deserialize<'de> for ManagedCoreFundsAccount {
             .keys
             .transactions()
             .values()
+            .filter(|record| !record.context.is_inactive())
             .flat_map(|record| &record.transaction.input)
             .map(|input| input.previous_output)
             .collect();
