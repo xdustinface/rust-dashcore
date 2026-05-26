@@ -1215,6 +1215,14 @@ impl FFIWalletEventCallbacks {
                 // conflicted txid lists and the post-rewind balance.
                 // Until then this variant has no surface on the C ABI.
             }
+            WalletEvent::TxRepeatedlyOrphaned {
+                ..
+            } => {
+                // TODO(issue #146): wire a dedicated FFI callback so
+                // durable consumers can surface "this transaction has
+                // been orphaned too many times" to the UI. Until then
+                // this variant has no surface on the C ABI.
+            }
             WalletEvent::ChainLockProcessed {
                 wallet_id,
                 chain_lock,
