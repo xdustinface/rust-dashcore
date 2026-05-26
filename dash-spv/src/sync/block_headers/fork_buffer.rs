@@ -343,6 +343,8 @@ fn median_time_past(history: &[Header]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use super::*;
     use dashcore::block::Version;
     use dashcore::{BlockHash, CompactTarget, Header, Network, TxMerkleNode};
@@ -768,7 +770,7 @@ mod tests {
         let mut current_tip = fork[0].block_hash();
         for next in &fork[1..] {
             let update = buf
-                .extend_branch(peer, current_tip, std::slice::from_ref(next), &active)
+                .extend_branch(peer, current_tip, slice::from_ref(next), &active)
                 .expect("continuation must validate");
             assert_eq!(update.new_tip, next.block_hash());
             current_tip = update.new_tip;

@@ -4,6 +4,7 @@ pub mod types;
 
 mod block_headers;
 mod blocks;
+mod consistency;
 mod filter_headers;
 mod filters;
 mod io;
@@ -135,6 +136,18 @@ impl DiskStorageManager {
 
             _lock_file: lock_file,
         };
+
+        // Runs before `start_worker` so the first persist tick cannot
+        // race the sentinel-driven recovery and pin a stale tip to disk.
+        consistency::check_and_repair_consistency(
+            &storage.storage_path,
+            &storage.block_headers,
+            &storage.filter_headers,
+            &storage.filters,
+            &storage.blocks,
+            &storage.metadata,
+        )
+        .await?;
 
         storage.start_worker().await;
 
@@ -370,6 +383,10 @@ impl filters::FilterStorage for DiskStorageManager {
         self.filters.read().await.filter_tip_height().await
     }
 
+    async fn clear_all(&mut self) -> StorageResult<()> {
+        self.filters.write().await.clear_all().await
+    }
+
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
         self.filters.write().await.truncate_above(target_height).await
     }
@@ -400,12 +417,30 @@ impl metadata::MetadataStorage for DiskStorageManager {
         self.metadata.read().await.load_metadata(key).await
     }
 
+    async fn delete_metadata(&mut self, key: &str) -> StorageResult<()> {
+        self.metadata.write().await.delete_metadata(key).await
+    }
+
     async fn store_last_target_height(&mut self, height: CoreBlockHeight) -> StorageResult<()> {
         self.metadata.write().await.store_last_target_height(height).await
     }
 
     async fn load_last_target_height(&self) -> StorageResult<CoreBlockHeight> {
         self.metadata.read().await.load_last_target_height().await
+    }
+
+    async fn write_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.write_reorg_sentinel().await
+    }
+
+    async fn clear_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.clear_reorg_sentinel().await
+    }
+
+    async fn is_reorg_sentinel_set(&self) -> bool {
+        tokio::fs::try_exists(PersistentMetadataStorage::sentinel_path_for(&self.storage_path))
+            .await
+            .unwrap_or(false)
     }
 }
 

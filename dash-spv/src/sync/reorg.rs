@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::chain::{CheckpointManager, ForkCandidate};
 use crate::error::SyncResult;
-use crate::storage::{BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage};
+use crate::storage::{
+    BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage, MetadataStorage,
+};
 use crate::sync::SyncEvent;
 
 /// Maximum reorg depth (active_tip_height - fork_ancestor_height) the
@@ -60,20 +62,23 @@ impl ReorgState {
     }
 }
 
-/// Storage handles passed into [`handle_reorg`]. All four storages are
+/// Storage handles passed into [`handle_reorg`]. All four data storages are
 /// truncated in lockstep so downstream caches don't outlive the truncated
-/// header chain.
-pub(crate) struct ReorgStorages<'a, H, FH, F, B>
+/// header chain. `metadata_storage` carries the reorg-in-progress sentinel,
+/// written before the cascade commits and cleared once truncation succeeds.
+pub(crate) struct ReorgStorages<'a, H, FH, F, B, M>
 where
     H: BlockHeaderStorage,
     FH: FilterHeaderStorage,
     F: FilterStorage,
     B: BlockStorage,
+    M: MetadataStorage,
 {
     pub(crate) block_header_storage: &'a Arc<RwLock<H>>,
     pub(crate) filter_header_storage: Option<&'a Arc<RwLock<FH>>>,
     pub(crate) filter_storage: Option<&'a Arc<RwLock<F>>>,
     pub(crate) block_storage: Option<&'a Arc<RwLock<B>>>,
+    pub(crate) metadata_storage: &'a Arc<RwLock<M>>,
 }
 
 /// Drive the reorg cascade for a buffered fork candidate.
@@ -88,11 +93,11 @@ where
 /// valid `ChainLockForcedReorg` overrides both). Checkpoint floor,
 /// single-flight, and deny-list guards still apply.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_reorg<H, FH, F, B>(
+pub(crate) async fn handle_reorg<H, FH, F, B, M>(
     candidate: ForkCandidate,
     state: &Mutex<ReorgState>,
     generation: &AtomicU64,
-    storages: ReorgStorages<'_, H, FH, F, B>,
+    storages: ReorgStorages<'_, H, FH, F, B, M>,
     checkpoint_manager: &CheckpointManager,
     best_chainlock_height: Option<u32>,
     current_tip_height: u32,
@@ -104,6 +109,7 @@ where
     FH: FilterHeaderStorage,
     F: FilterStorage,
     B: BlockStorage,
+    M: MetadataStorage,
 {
     let candidate_tip_hash = candidate.tip_hash();
 
@@ -145,12 +151,12 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_guards_and_cascade<H, FH, F, B>(
+async fn run_guards_and_cascade<H, FH, F, B, M>(
     candidate: &ForkCandidate,
     candidate_tip_hash: BlockHash,
     state: &Mutex<ReorgState>,
     generation: &AtomicU64,
-    storages: ReorgStorages<'_, H, FH, F, B>,
+    storages: ReorgStorages<'_, H, FH, F, B, M>,
     checkpoint_manager: &CheckpointManager,
     best_chainlock_height: Option<u32>,
     current_tip_height: u32,
@@ -162,6 +168,7 @@ where
     FH: FilterHeaderStorage,
     F: FilterStorage,
     B: BlockStorage,
+    M: MetadataStorage,
 {
     // Checkpoint floor.
     if checkpoint_manager.should_reject_fork(candidate.ancestor_height) {
@@ -221,16 +228,22 @@ where
         }
     }
 
-    // Cascade. Bump the generation first so any response that races with the
-    // truncation is tagged stale and dropped at the downstream manager.
-    let new_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
-
     let ReorgStorages {
         block_header_storage,
         filter_header_storage,
         filter_storage,
         block_storage,
+        metadata_storage,
     } = storages;
+
+    // Mark the reorg in progress before any storage mutation. A crash between
+    // this write and the matching clear below leaves the sentinel on disk so
+    // the next startup can recompute a safe tip from `header_hash_index`.
+    metadata_storage.write().await.write_reorg_sentinel().await?;
+
+    // Cascade. Bump the generation first so any response that races with the
+    // truncation is tagged stale and dropped at the downstream manager.
+    let new_generation = generation.fetch_add(1, Ordering::AcqRel) + 1;
 
     {
         let mut headers = block_header_storage.write().await;
@@ -246,6 +259,13 @@ where
     }
     if let Some(bs) = block_storage {
         bs.write().await.truncate_above(candidate.ancestor_height).await?;
+    }
+
+    if let Err(e) = metadata_storage.write().await.clear_reorg_sentinel().await {
+        tracing::error!(
+            "reorg cascade succeeded but sentinel clear failed ({}); next startup will re-run recovery",
+            e
+        );
     }
 
     tracing::info!(
@@ -269,8 +289,9 @@ mod tests {
     use crate::chain::checkpoints::Checkpoint;
     use crate::chain::ChainWork;
     use crate::storage::{
-        DiskStorageManager, PersistentBlockHeaderStorage, PersistentBlockStorage,
-        PersistentFilterHeaderStorage, PersistentFilterStorage, StorageManager,
+        DiskStorageManager, MetadataStorage, PersistentBlockHeaderStorage, PersistentBlockStorage,
+        PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
+        StorageManager,
     };
     use crate::types::HashedBlockHeader;
     use dashcore::block::{Header, Version};
@@ -341,6 +362,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         let candidate = fork_candidate_from(5, chain[5].block_hash(), 3, 1_700_010_000);
 
@@ -353,11 +375,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let old_tip_hash = chain.last().unwrap().block_hash();
@@ -409,6 +433,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         let candidate = fork_candidate_from(2, chain[2].block_hash(), 2, 1_700_010_000);
 
@@ -424,11 +449,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let result = handle_reorg(
@@ -459,6 +486,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         let candidate = fork_candidate_from(3, chain[3].block_hash(), 2, 1_700_010_000);
         let candidate_tip = candidate.tip_hash();
@@ -472,11 +500,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let result = handle_reorg(
@@ -509,6 +539,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         // ancestor at 10, tip at 119 → depth 109 > 100.
         let candidate = fork_candidate_from(10, chain[10].block_hash(), 3, 1_700_100_000);
@@ -523,11 +554,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let event = handle_reorg(
@@ -570,6 +603,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         let candidate = fork_candidate_from(5, chain[5].block_hash(), 2, 1_700_010_000);
 
@@ -593,11 +627,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let result = handle_reorg(
@@ -630,6 +666,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         // ancestor at 10, tip at 119 → depth 109 > MAX_REORG_DEPTH.
         let candidate = fork_candidate_from(10, chain[10].block_hash(), 3, 1_700_100_000);
@@ -644,11 +681,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
 
         let event = handle_reorg(
@@ -697,6 +736,7 @@ mod tests {
         let filter_headers = storage.filter_headers();
         let filters = storage.filters();
         let blocks = storage.blocks();
+        let metadata = storage.metadata();
 
         // ancestor at 40, best chainlock at 50 → is_below_chainlock_floor(40, 50) = true.
         let candidate = fork_candidate_from(40, chain[40].block_hash(), 3, 1_700_100_000);
@@ -712,11 +752,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
         let result = handle_reorg(
             candidate.clone(),
@@ -736,7 +778,7 @@ mod tests {
             state.lock().await.deny_list.contains_key(&candidate_tip),
             "rejected candidate must land on deny-list"
         );
-        assert_eq!(generation.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
 
         // force=true: chainlock floor is bypassed, cascade runs, ChainReorg is emitted.
         let state2 = Mutex::new(ReorgState::default());
@@ -746,11 +788,13 @@ mod tests {
             PersistentFilterHeaderStorage,
             PersistentFilterStorage,
             PersistentBlockStorage,
+            PersistentMetadataStorage,
         > = ReorgStorages {
             block_header_storage: &block_headers,
             filter_header_storage: Some(&filter_headers),
             filter_storage: Some(&filters),
             block_storage: Some(&blocks),
+            metadata_storage: &metadata,
         };
         let event = handle_reorg(
             candidate,
@@ -778,14 +822,65 @@ mod tests {
             }
             other => panic!("expected ChainReorg, got {:?}", other),
         }
-        assert_eq!(
-            generation2.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "forced cascade must bump generation"
-        );
+        assert_eq!(generation2.load(Ordering::SeqCst), 1, "forced cascade must bump generation");
         assert!(
             !state2.lock().await.deny_list.contains_key(&candidate_tip),
             "forced reorg must not land on the deny-list"
+        );
+    }
+
+    /// Successful cascade writes the sentinel before truncation and clears it
+    /// once the last `truncate_above` completes, so a clean restart sees no
+    /// in-progress marker.
+    #[tokio::test]
+    async fn cascade_writes_and_clears_reorg_sentinel() {
+        let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let chain = mined_chain(10, 1_700_000_000);
+        storage.store_headers(&chain).await.unwrap();
+        let block_headers = storage.block_headers();
+        let filter_headers = storage.filter_headers();
+        let filters = storage.filters();
+        let blocks = storage.blocks();
+        let metadata = storage.metadata();
+
+        assert!(!metadata.read().await.is_reorg_sentinel_set().await);
+
+        let candidate = fork_candidate_from(5, chain[5].block_hash(), 3, 1_700_010_000);
+        let state = Mutex::new(ReorgState::default());
+        let generation = AtomicU64::new(0);
+        let checkpoint_manager = CheckpointManager::new(vec![]);
+        let storages: ReorgStorages<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+            PersistentMetadataStorage,
+        > = ReorgStorages {
+            block_header_storage: &block_headers,
+            filter_header_storage: Some(&filter_headers),
+            filter_storage: Some(&filters),
+            block_storage: Some(&blocks),
+            metadata_storage: &metadata,
+        };
+
+        let _ = handle_reorg(
+            candidate,
+            &state,
+            &generation,
+            storages,
+            &checkpoint_manager,
+            Some(0),
+            9,
+            chain[9].block_hash(),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("ChainReorg event");
+
+        assert!(
+            !metadata.read().await.is_reorg_sentinel_set().await,
+            "sentinel must be cleared after a successful cascade"
         );
     }
 

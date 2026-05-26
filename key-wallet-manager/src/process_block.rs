@@ -287,6 +287,19 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         );
     }
 
+    async fn clamp_heights_to(&mut self, tip: CoreBlockHeight) {
+        for info in self.wallet_infos.values_mut() {
+            let current_last = info.last_processed_height();
+            if current_last > tip {
+                info.update_last_processed_height(tip);
+            }
+            let current_synced = info.synced_height();
+            if current_synced > tip {
+                info.update_synced_height(tip);
+            }
+        }
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
     }
@@ -603,6 +616,34 @@ mod tests {
             }
         }
         assert!(found, "should emit BlockProcessed for block processing");
+    }
+
+    #[tokio::test]
+    async fn test_clamp_heights_to_lowers_above_tip_metadata() {
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+
+        manager.update_wallet_synced_height(&wallet_id, 500);
+        manager.update_wallet_last_processed_height(&wallet_id, 600);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 500);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 600);
+
+        manager.clamp_heights_to(450).await;
+
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().synced_height(),
+            450,
+            "synced_height above tip must be clamped down"
+        );
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(),
+            450,
+            "last_processed_height above tip must be clamped down"
+        );
+
+        // Clamping to a tip above both is a no-op.
+        manager.clamp_heights_to(10_000).await;
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 450);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 450);
     }
 
     #[tokio::test]

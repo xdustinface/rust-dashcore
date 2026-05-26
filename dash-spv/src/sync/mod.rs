@@ -18,6 +18,7 @@ mod sync_manager;
 
 pub use block_headers::{BlockHeadersManager, BlockHeadersProgress};
 pub use blocks::{BlocksManager, BlocksProgress};
+pub(crate) use chainlock::BEST_CHAINLOCK_KEY;
 pub use chainlock::{ChainLockManager, ChainLockProgress};
 pub use filter_headers::{FilterHeadersManager, FilterHeadersProgress};
 pub use filters::{FiltersManager, FiltersProgress};

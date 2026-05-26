@@ -102,8 +102,7 @@ impl<I: Persistable> SegmentCache<I> {
 
         // Building the metadata
         if let Ok(entries) = fs::read_dir(&segments_dir) {
-            let mut max_seg_id = None;
-            let mut min_seg_id = None;
+            let mut segment_ids: Vec<u32> = Vec::new();
 
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
@@ -114,24 +113,59 @@ impl<I: Persistable> SegmentCache<I> {
                         let segment_id_end = segment_id_start + 4;
 
                         if let Ok(id) = name[segment_id_start..segment_id_end].parse::<u32>() {
-                            max_seg_id = Some(max_seg_id.map_or(id, |max: u32| max.max(id)));
-                            min_seg_id = Some(min_seg_id.map_or(id, |min: u32| min.min(id)));
+                            segment_ids.push(id);
                         }
                     }
                 }
             }
+            segment_ids.sort_unstable();
 
-            if let Some(segment_id) = max_seg_id {
+            let max_readable_id = {
+                let mut result = None;
+                for id in segment_ids.iter().rev() {
+                    match cache.get_segment(id).await {
+                        Ok(_) => {
+                            result = Some(*id);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "SegmentCache: dropping unreadable segment {} ({}), truncating cache to last readable segment",
+                                id,
+                                e
+                            );
+                            cache.to_delete.insert(*id);
+                        }
+                    }
+                }
+                result
+            };
+
+            if let Some(segment_id) = max_readable_id {
                 let segment = cache.get_segment(&segment_id).await?;
-
                 cache.tip_height = segment
                     .last_valid_offset()
                     .map(|offset| Self::segment_id_to_start_height(segment_id) + offset);
             }
 
-            if let Some(segment_id) = min_seg_id {
-                let segment = cache.get_segment(&segment_id).await?;
+            // Walk forward from the lowest id to find the first readable
+            // segment for start_height. Unreadable lower segments are skipped
+            // to mirror the truncation behaviour above.
+            let mut min_readable_id = None;
+            for id in segment_ids.iter() {
+                if let Some(max) = max_readable_id {
+                    if *id > max {
+                        break;
+                    }
+                }
+                if cache.get_segment(id).await.is_ok() {
+                    min_readable_id = Some(*id);
+                    break;
+                }
+            }
 
+            if let Some(segment_id) = min_readable_id {
+                let segment = cache.get_segment(&segment_id).await?;
                 cache.start_height = segment
                     .first_valid_offset()
                     .map(|offset| Self::segment_id_to_start_height(segment_id) + offset);
@@ -459,6 +493,29 @@ impl<I: Persistable> SegmentCache<I> {
     #[inline]
     pub fn start_height(&self) -> Option<u32> {
         self.start_height
+    }
+
+    /// Queue all segments for deletion and reset the cache to the empty state.
+    pub fn clear_all(&mut self) {
+        if let (Some(start), Some(tip)) = (self.start_height, self.tip_height) {
+            let start_seg = Self::height_to_segment_id(start);
+            let end_seg = Self::height_to_segment_id(tip);
+            for id in start_seg..=end_seg {
+                self.segments.remove(&id);
+                self.evicted.remove(&id);
+                self.to_delete.insert(id);
+            }
+        } else {
+            let all_ids: Vec<u32> =
+                self.segments.keys().chain(self.evicted.keys()).copied().collect();
+            for id in all_ids {
+                self.segments.remove(&id);
+                self.evicted.remove(&id);
+                self.to_delete.insert(id);
+            }
+        }
+        self.tip_height = None;
+        self.start_height = None;
     }
 
     #[inline]
@@ -1067,6 +1124,93 @@ mod tests {
             reloaded.get_items(ITEMS_PER_SEGMENT + 6..ITEMS_PER_SEGMENT + 16).await.unwrap(),
             replacement
         );
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_deletes_all_segment_files_across_multiple_segments() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        const ITEMS_PER_SEGMENT: u32 = Segment::<FilterHeader>::ITEMS_PER_SEGMENT;
+        let items = FilterHeader::dummy_batch(0..ITEMS_PER_SEGMENT * 2 + 5);
+
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        cache.store_items_at_height(&items, 0).await.unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        // Verify all three segment files exist on disk before clearing.
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(0)).exists());
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(1)).exists());
+        assert!(tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
+
+        // Reload so segments 1 is evicted and only boundary segments (0 and 2)
+        // are in memory, leaving segment 1 as on-disk-only.
+        let mut cache = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(cache.tip_height(), Some(ITEMS_PER_SEGMENT * 2 + 4));
+
+        cache.clear_all();
+        cache.persist(tmp_dir.path()).await;
+
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(0)).exists());
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(1)).exists());
+        assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
+
+        let reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(
+            reloaded.tip_height(),
+            None,
+            "cache must be empty after clear_all + persist + reload"
+        );
+        assert_eq!(reloaded.start_height(), None);
+    }
+
+    /// A corrupted highest segment is logged and dropped; the cache reopens
+    /// with the tip pointing at the last readable segment. The corruption
+    /// uses a non-minimal `VarInt` prefix (`0xFD 0x01 0x00`) which makes
+    /// `consensus_decode` return `Error::NonMinimalVarInt` instead of the
+    /// EOF break case `Segment::load` would tolerate.
+    #[tokio::test]
+    async fn test_load_or_new_truncates_on_corrupt_segment() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let mut cache = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+        for height in 0..10u32 {
+            cache.store_items_at_height(&[vec![height as u8; 4]], height).await.unwrap();
+        }
+        cache.persist(tmp_dir.path()).await;
+
+        // Force segment 1's existence by storing an item in it, then persist
+        // to materialise the file before corrupting.
+        cache
+            .store_items_at_height(&[vec![0xAA; 4]], Segment::<Vec<u8>>::ITEMS_PER_SEGMENT)
+            .await
+            .unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let corrupt_path = tmp_dir.path().join(Vec::<u8>::segment_file_name(1));
+        assert!(corrupt_path.exists());
+
+        // Non-minimal VarInt: 0xFD prefix demands a u16 >= 0xFD; supplying
+        // 0x0001 violates that and `VarInt::consensus_decode` returns
+        // `Error::NonMinimalVarInt`, which `Segment::load` propagates as a
+        // `StorageError::ReadFailed`.
+        tokio::fs::write(&corrupt_path, [0xFDu8, 0x01, 0x00]).await.unwrap();
+
+        let mut reloaded = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+
+        assert_eq!(
+            reloaded.tip_height(),
+            Some(9),
+            "tip should fall back to the last readable segment"
+        );
+        assert_eq!(reloaded.start_height(), Some(0));
+
+        // The corrupt segment must be queued for deletion and removed on
+        // persist so subsequent startups do not emit the warning again.
+        reloaded.persist(tmp_dir.path()).await;
+        assert!(!corrupt_path.exists(), "corrupt segment file must be deleted on persist");
+
+        let reloaded2 = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+        assert_eq!(reloaded2.tip_height(), Some(9));
     }
 
     #[test]

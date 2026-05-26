@@ -263,6 +263,49 @@ impl BlockHeaderStorage for PersistentBlockHeaderStorage {
     }
 }
 
+impl PersistentBlockHeaderStorage {
+    /// Highest height `h` for which the immediate parent link
+    /// (`header_hash_index[prev_blockhash_of(h)] == h - 1`) is found in the
+    /// index and the header at `h` is present in storage. Walks backward from
+    /// the current tip, returning the first height that satisfies these two
+    /// conditions. Returns `None` when the storage is empty. Mid-chain gaps
+    /// are not detected; callers must not assume that `[start, result]` is
+    /// fully contiguous. Used by the startup consistency check to recover a
+    /// safe tip after a crash mid-cascade.
+    pub(crate) async fn highest_valid_tip(&mut self) -> Option<u32> {
+        let mut headers = self.block_headers.write().await;
+        let tip = headers.tip_height()?;
+        let start = headers.start_height()?;
+
+        let mut height = tip;
+        loop {
+            if height == start {
+                return Some(start);
+            }
+
+            let parent_height = height - 1;
+            let current = headers.get_item(height).await.ok().flatten();
+            let Some(current) = current else {
+                if height == 0 {
+                    return None;
+                }
+                height -= 1;
+                continue;
+            };
+
+            match self.header_hash_index.get(&current.header().prev_blockhash) {
+                Some(&indexed) if indexed == parent_height => return Some(height),
+                _ => {
+                    if height == 0 {
+                        return None;
+                    }
+                    height -= 1;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
