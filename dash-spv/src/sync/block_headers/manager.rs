@@ -203,11 +203,12 @@ impl<
         let current_tip = self.tip().await?;
         let current_tip_height = current_tip.height();
         let current_tip_hash = *current_tip.hash();
-        let storages: ReorgStorages<'_, H, FH, F, B> = ReorgStorages {
+        let storages: ReorgStorages<'_, H, FH, F, B, M> = ReorgStorages {
             block_header_storage: &self.header_storage,
             filter_header_storage: self.filter_header_storage.as_ref(),
             filter_storage: self.filter_storage.as_ref(),
             block_storage: self.block_storage.as_ref(),
+            metadata_storage: &self.metadata_storage,
         };
         handle_reorg(
             candidate,
