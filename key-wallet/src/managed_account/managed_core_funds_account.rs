@@ -115,6 +115,35 @@ impl ManagedCoreFundsAccount {
         self.spent_outpoints.contains(outpoint)
     }
 
+    /// Drop any UTXOs `tx` previously contributed and release the
+    /// outpoints it had marked as spent. Invoked when `tx` transitions
+    /// to an inactive context (`Conflicted`, `Abandoned`): its outputs
+    /// must leave the spendable set and the inputs it consumed are no
+    /// longer spent by this tx, so the previously spending marker is
+    /// cleared. Restoring the actual UTXOs the inputs referenced is
+    /// the rewind logic's responsibility, not this method's.
+    fn release_inactive_utxos(&mut self, tx: &Transaction) {
+        let txid = tx.txid();
+        let mut utxos_changed = false;
+        for vout in 0..tx.output.len() as u32 {
+            let outpoint = OutPoint {
+                txid,
+                vout,
+            };
+            if self.utxos.remove(&outpoint).is_some() {
+                utxos_changed = true;
+            }
+        }
+        for input in &tx.input {
+            if self.spent_outpoints.remove(&input.previous_output) {
+                utxos_changed = true;
+            }
+        }
+        if utxos_changed {
+            self.keys.bump_monitor_revision();
+        }
+    }
+
     /// Add new UTXOs for received outputs, remove spent ones.
     fn update_utxos(
         &mut self,
@@ -136,6 +165,10 @@ impl ManagedCoreFundsAccount {
             | ManagedAccountType::DashpayExternalAccount {
                 ..
             } => {
+                if context.is_inactive() {
+                    self.release_inactive_utxos(tx);
+                    return;
+                }
                 let involved_addrs: BTreeSet<_> = account_match
                     .account_type_match
                     .all_involved_addresses()

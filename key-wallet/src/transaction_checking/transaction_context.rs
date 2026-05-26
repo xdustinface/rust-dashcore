@@ -115,4 +115,15 @@ impl TransactionContext {
             }
         }
     }
+
+    /// Returns whether this record has been reorganized out and no
+    /// longer contributes to the spendable balance. True for both
+    /// [`TransactionContext::Conflicted`] and
+    /// [`TransactionContext::Abandoned`].
+    pub(crate) fn is_inactive(&self) -> bool {
+        matches!(
+            self,
+            TransactionContext::Conflicted { .. } | TransactionContext::Abandoned
+        )
+    }
 }
