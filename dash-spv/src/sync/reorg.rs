@@ -84,8 +84,8 @@ where
 /// `ChainReorg` event on success, a `DeepReorgDetected` event when the depth
 /// cap fires, or `Ok(None)` when an earlier guard short-circuits.
 ///
-/// When `force` is `true`, the depth cap is skipped (a valid
-/// `ChainLockForcedReorg` overrides it). Checkpoint floor, chainlock floor,
+/// When `force` is `true`, the depth cap and chainlock floor are skipped (a
+/// valid `ChainLockForcedReorg` overrides both). Checkpoint floor,
 /// single-flight, and deny-list guards still apply.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_reorg<H, FH, F, B>(
@@ -174,32 +174,36 @@ where
         return Ok(None);
     }
 
-    // Chainlock floor or fresh-client fallback.
-    match best_chainlock_height {
-        Some(cl_height) => {
-            if is_below_chainlock_floor(candidate.ancestor_height, cl_height) {
-                tracing::warn!(
-                    "rejecting reorg: ancestor {} below best chainlock {}",
-                    candidate.ancestor_height,
-                    cl_height
-                );
-                state.lock().await.deny_list.insert(candidate_tip_hash, cl_height);
-                return Ok(None);
+    // Chainlock floor or fresh-client fallback. Bypassed when `force` is set:
+    // a BLS-validated CLSig overrides the stored chainlock floor because the
+    // quorum signature has higher authority than our locally cached height.
+    if !force {
+        match best_chainlock_height {
+            Some(cl_height) => {
+                if is_below_chainlock_floor(candidate.ancestor_height, cl_height) {
+                    tracing::warn!(
+                        "rejecting reorg: ancestor {} below best chainlock {}",
+                        candidate.ancestor_height,
+                        cl_height
+                    );
+                    state.lock().await.deny_list.insert(candidate_tip_hash, cl_height);
+                    return Ok(None);
+                }
             }
-        }
-        None => {
-            let checkpoint_height =
-                checkpoint_manager.last_checkpoint().map(|cp| cp.height).unwrap_or(0);
-            let recent_floor = current_tip_height.saturating_sub(FRESH_CLIENT_FORK_FLOOR);
-            let floor = checkpoint_height.max(recent_floor);
-            if candidate.ancestor_height < floor {
-                tracing::warn!(
-                    "rejecting reorg on fresh client: ancestor {} below floor {}",
-                    candidate.ancestor_height,
-                    floor
-                );
-                state.lock().await.deny_list.insert(candidate_tip_hash, floor);
-                return Ok(None);
+            None => {
+                let checkpoint_height =
+                    checkpoint_manager.last_checkpoint().map(|cp| cp.height).unwrap_or(0);
+                let recent_floor = current_tip_height.saturating_sub(FRESH_CLIENT_FORK_FLOOR);
+                let floor = checkpoint_height.max(recent_floor);
+                if candidate.ancestor_height < floor {
+                    tracing::warn!(
+                        "rejecting reorg on fresh client: ancestor {} below floor {}",
+                        candidate.ancestor_height,
+                        floor
+                    );
+                    state.lock().await.deny_list.insert(candidate_tip_hash, floor);
+                    return Ok(None);
+                }
             }
         }
     }
