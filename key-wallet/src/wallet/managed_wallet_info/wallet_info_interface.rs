@@ -33,8 +33,8 @@ pub struct RewindOutcome {
     /// self-conflict detection work; currently always empty.
     pub conflicted_txids: Vec<Txid>,
     /// `true` iff this wallet's `last_processed_height` was rolled back
-    /// (or any record was demoted). Lets the caller filter wallets that
-    /// were untouched by the reorg out of the event stream.
+    /// or any record was demoted; `false` when the reorg had no
+    /// observable effect on this wallet's state.
     pub state_changed: bool,
 }
 
@@ -213,11 +213,11 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// `min(height, current)`. Refreshes cached balances.
     ///
     /// `used_addresses` markers on every address pool are intentionally
-    /// preserved. Address usage is monotonic from a wallet's
-    /// perspective — even if the reorg removes the on-chain evidence
-    /// for that usage, the user has still committed the addresses and
-    /// could publish them again. Resurrecting unused addresses also
-    /// risks recycling them across separate counterparties.
+    /// preserved. Address usage is monotonic from a wallet's perspective:
+    /// even if the reorg removes the on-chain evidence for that usage,
+    /// the user has still committed the addresses and could publish them
+    /// again. Resurrecting unused addresses also risks recycling them
+    /// across separate counterparties.
     ///
     /// Refuses the rewind when `height` is strictly below this
     /// wallet's `last_applied_chain_lock.block_height` and returns

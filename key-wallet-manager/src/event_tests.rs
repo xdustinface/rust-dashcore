@@ -1,6 +1,6 @@
 use super::test_helpers::*;
 use super::*;
-use crate::wallet_interface::WalletInterface;
+use crate::wallet_interface::{RewindError, WalletInterface};
 use dashcore::block::{Block, Header, Version};
 use dashcore::blockdata::script::Builder;
 use dashcore::blockdata::transaction::special_transaction::asset_lock::AssetLockPayload;
@@ -1276,7 +1276,7 @@ async fn test_block_processed_chainlocked_flag_matches_record_context() {
 
 /// Build a transaction that spends a specific outpoint of a previous
 /// transaction (mimicking a child) paying back to one of the wallet's
-/// addresses. Used to exercise the descendant-cascade demotion path.
+/// addresses.
 fn spend_from(parent_txid: Txid, parent_vout: u32, addr: &Address, value: u64) -> Transaction {
     Transaction {
         version: 2,
@@ -1391,7 +1391,7 @@ async fn test_rewind_refuses_below_chainlock_floor() {
         .await
         .expect_err("rewind below chainlock floor must be rejected");
     match err {
-        crate::wallet_interface::RewindError::BelowChainLockFloor {
+        RewindError::BelowChainLockFloor {
             requested,
             floor,
             wallet_id: rejecting,

@@ -340,7 +340,7 @@ pub enum WalletEvent {
         /// range that contained no wallet records.
         demoted_txids: Vec<Txid>,
         /// Records demoted to a terminal inactive context
-        /// (`Conflicted` / `Abandoned`). Currently always empty —
+        /// (`Conflicted` / `Abandoned`). Currently always empty;
         /// self-conflict detection is deferred to a follow-up.
         conflicted_txids: Vec<Txid>,
         /// Wallet balance after the rewind. UTXO state was rebuilt

@@ -49,7 +49,7 @@ pub enum RewindError {
         /// The wallet's `last_applied_chain_lock.block_height`.
         floor: CoreBlockHeight,
         /// The wallet whose chainlock floor was crossed.
-        wallet_id: crate::WalletId,
+        wallet_id: WalletId,
     },
 }
 
