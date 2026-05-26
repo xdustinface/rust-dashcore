@@ -1,6 +1,9 @@
 use crate::events::{diff_account_balances, project_derived_addresses, DerivedAddress};
-use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
+use crate::wallet_interface::{
+    BlockProcessingResult, MempoolTransactionResult, RewindError, RewindResult, WalletInterface,
+};
 use crate::{WalletEvent, WalletId, WalletManager};
+use key_wallet::wallet::managed_wallet_info::wallet_info_interface::RewindRejection;
 use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
@@ -298,6 +301,79 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
                 info.update_synced_height(tip);
             }
         }
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        for (wallet_id, info) in self.wallet_infos.iter() {
+            if let Some(cl) = info.last_applied_chain_lock() {
+                if height < cl.block_height {
+                    tracing::warn!(
+                        wallet_id = ?wallet_id,
+                        requested = height,
+                        floor = cl.block_height,
+                        "refusing rewind: requested height crosses chainlock floor",
+                    );
+                    return Err(RewindError::BelowChainLockFloor {
+                        requested: height,
+                        floor: cl.block_height,
+                        wallet_id: *wallet_id,
+                    });
+                }
+            }
+        }
+
+        let mut aggregated = RewindResult::default();
+        let wallet_ids: Vec<WalletId> = self.wallet_infos.keys().copied().collect();
+        for wallet_id in wallet_ids {
+            let Some(info) = self.wallet_infos.get_mut(&wallet_id) else {
+                continue;
+            };
+            let outcome = match info.rewind_to_height(height) {
+                Ok(o) => o,
+                Err(RewindRejection::BelowChainLockFloor {
+                    requested,
+                    floor,
+                }) => {
+                    return Err(RewindError::BelowChainLockFloor {
+                        requested,
+                        floor,
+                        wallet_id,
+                    });
+                }
+            };
+
+            if !outcome.state_changed {
+                continue;
+            }
+
+            aggregated.demoted_txids.extend(outcome.demoted_txids.iter().copied());
+            aggregated.conflicted_txids.extend(outcome.conflicted_txids.iter().copied());
+
+            let balance = info.balance();
+            let event = WalletEvent::Reorg {
+                wallet_id,
+                fork_height: height,
+                demoted_txids: outcome.demoted_txids,
+                conflicted_txids: outcome.conflicted_txids,
+                balance,
+            };
+            let _ = self.event_sender.send(event);
+        }
+        Ok(aggregated)
+    }
+
+    async fn get_transaction(&self, txid: &dashcore::Txid) -> Option<Transaction> {
+        for info in self.wallet_infos.values() {
+            for account in info.accounts().all_accounts() {
+                if let Some(record) = account.transactions().get(txid) {
+                    return Some(record.transaction.clone());
+                }
+            }
+        }
+        None
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {

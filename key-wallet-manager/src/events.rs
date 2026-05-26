@@ -322,6 +322,31 @@ pub enum WalletEvent {
         /// the parent transaction).
         locked_transactions: BTreeMap<AccountType, Vec<Txid>>,
     },
+    /// The wallet was rolled back to `fork_height` after a chain reorg.
+    /// Fires once per wallet whose state actually changed (records
+    /// demoted, or `last_processed_height` rolled back). Carries the
+    /// partitioned demoted-vs-conflicted txid lists plus the wallet's
+    /// post-rewind balance so consumers can persist the new state
+    /// atomically.
+    Reorg {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// Common-ancestor height in the active chain that the wallet
+        /// was rolled back to.
+        fork_height: CoreBlockHeight,
+        /// Records demoted to an active-but-unconfirmed context
+        /// (`Mempool` or retained `InstantSend`). Empty when the
+        /// reorg rolled `last_processed_height` back over a height
+        /// range that contained no wallet records.
+        demoted_txids: Vec<Txid>,
+        /// Records demoted to a terminal inactive context
+        /// (`Conflicted` / `Abandoned`). Currently always empty —
+        /// self-conflict detection is deferred to a follow-up.
+        conflicted_txids: Vec<Txid>,
+        /// Wallet balance after the rewind. UTXO state was rebuilt
+        /// from the surviving records before this value was computed.
+        balance: WalletCoreBalance,
+    },
 }
 
 impl WalletEvent {
@@ -345,6 +370,10 @@ impl WalletEvent {
                 ..
             }
             | WalletEvent::ChainLockProcessed {
+                wallet_id,
+                ..
+            }
+            | WalletEvent::Reorg {
                 wallet_id,
                 ..
             } => *wallet_id,
@@ -425,6 +454,20 @@ impl fmt::Display for WalletEvent {
                     total_txids,
                 )
             }
+            WalletEvent::Reorg {
+                fork_height,
+                demoted_txids,
+                conflicted_txids,
+                balance,
+                ..
+            } => write!(
+                f,
+                "Reorg(fork_height={}, demoted={}, conflicted={}, balance={})",
+                fork_height,
+                demoted_txids.len(),
+                conflicted_txids.len(),
+                balance,
+            ),
         }
     }
 }
