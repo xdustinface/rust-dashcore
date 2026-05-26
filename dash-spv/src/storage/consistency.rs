@@ -515,4 +515,25 @@ mod tests {
             "stale block above safe tip must be removed during sentinel recovery"
         );
     }
+
+    #[tokio::test]
+    async fn sentinel_cleared_when_no_block_headers_exist() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        // Sentinel set but block-header storage is empty: the function must
+        // still clear the sentinel so a subsequent startup does not re-enter
+        // recovery indefinitely.
+        m.write().await.write_reorg_sentinel().await.unwrap();
+        assert!(m.read().await.is_reorg_sentinel_set().await);
+        assert_eq!(bh.read().await.get_tip_height().await, None);
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert!(
+            !m.read().await.is_reorg_sentinel_set().await,
+            "sentinel must be cleared even when block-header storage is empty"
+        );
+        assert_eq!(bh.read().await.get_tip_height().await, None);
+    }
 }
