@@ -90,7 +90,8 @@ pub(crate) async fn check_and_repair_consistency(
     // valid because we have no header to match it against. Clear it so the
     // chainlock manager starts from scratch instead of trusting a value the
     // header tip can no longer corroborate.
-    if let Some(bytes) = metadata.read().await.load_metadata(BEST_CHAINLOCK_KEY).await? {
+    let stored_chainlock = metadata.read().await.load_metadata(BEST_CHAINLOCK_KEY).await?;
+    if let Some(bytes) = stored_chainlock {
         match serde_json::from_slice::<ChainLock>(&bytes) {
             Ok(chainlock) if chainlock.block_height > block_tip => {
                 tracing::warn!(
@@ -212,4 +213,192 @@ async fn repair_blocks_above_tip(
         guard.persist(storage_path).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
+    use dashcore::hash_types::FilterHeader;
+    use dashcore::Header as BlockHeader;
+    use dashcore_hashes::Hash;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    use crate::storage::{
+        BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage, MetadataStorage,
+        PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
+        PersistentFilterStorage, PersistentMetadataStorage, PersistentStorage,
+    };
+    use crate::sync::BEST_CHAINLOCK_KEY;
+    use crate::types::HashedBlock;
+
+    use super::check_and_repair_consistency;
+
+    async fn open_all(
+        path: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        Arc<RwLock<PersistentBlockHeaderStorage>>,
+        Arc<RwLock<PersistentFilterHeaderStorage>>,
+        Arc<RwLock<PersistentFilterStorage>>,
+        Arc<RwLock<PersistentBlockStorage>>,
+        Arc<RwLock<PersistentMetadataStorage>>,
+    ) {
+        let storage_path = path.to_path_buf();
+        let bh = Arc::new(RwLock::new(
+            PersistentBlockHeaderStorage::open(&storage_path).await.unwrap(),
+        ));
+        let fh = Arc::new(RwLock::new(
+            PersistentFilterHeaderStorage::open(&storage_path).await.unwrap(),
+        ));
+        let f = Arc::new(RwLock::new(
+            PersistentFilterStorage::open(&storage_path).await.unwrap(),
+        ));
+        let b = Arc::new(RwLock::new(
+            PersistentBlockStorage::open(&storage_path).await.unwrap(),
+        ));
+        let m = Arc::new(RwLock::new(
+            PersistentMetadataStorage::open(&storage_path).await.unwrap(),
+        ));
+        (storage_path, bh, fh, f, b, m)
+    }
+
+    #[tokio::test]
+    async fn highest_valid_tip_returns_full_chain_when_intact() {
+        let tmp = TempDir::new().unwrap();
+        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        let storage = PersistentBlockHeaderStorage::open(tmp.path()).await.unwrap();
+        let mut storage = storage;
+        storage.store_headers(&chain).await.unwrap();
+        let tip = storage.highest_valid_tip().await;
+        assert_eq!(tip, Some(4));
+    }
+
+    #[tokio::test]
+    async fn highest_valid_tip_returns_lower_height_when_chain_broken() {
+        let tmp = TempDir::new().unwrap();
+        // `BlockHeader::dummy_batch(0..5)` produces headers whose
+        // `prev_blockhash` is `BlockHash::dummy(h-1)`, which does not equal
+        // the previous header's actual block_hash. So the index chain is
+        // broken everywhere except height 0, where `prev_blockhash` =
+        // `BlockHash::dummy(0)` which is stored in the index only when
+        // `block_hash() == dummy(0)`. Since that's also unlikely, the function
+        // bails to the start sentinel `Some(0)`.
+        let chain = BlockHeader::dummy_batch(0..5);
+        let mut storage = PersistentBlockHeaderStorage::open(tmp.path()).await.unwrap();
+        storage.store_headers(&chain).await.unwrap();
+        let tip = storage.highest_valid_tip().await;
+        assert_eq!(
+            tip,
+            Some(0),
+            "broken chain must fall back to the start height"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_header_above_block_tip_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+        fh.write()
+            .await
+            .store_filter_headers(&FilterHeader::dummy_batch(0..10))
+            .await
+            .unwrap();
+        assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(9));
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn filter_above_filter_header_tip_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        let chain = BlockHeader::dummy_chain(10, dashcore::BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+        fh.write()
+            .await
+            .store_filter_headers(&FilterHeader::dummy_batch(0..5))
+            .await
+            .unwrap();
+        for h in 0..8 {
+            f.write().await.store_filter(h, &[0xAA; 4]).await.unwrap();
+        }
+        assert_eq!(f.read().await.filter_tip_height().await.unwrap(), 7);
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert_eq!(f.read().await.filter_tip_height().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn block_above_block_tip_is_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        // Header tip at 4, block storage holds a block at heights 3 and 10.
+        // Block 3 is within bounds, block 10 is stale and must be dropped.
+        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+        b.write().await.store_block(3, HashedBlock::dummy(3, vec![])).await.unwrap();
+        b.write().await.store_block(10, HashedBlock::dummy(10, vec![])).await.unwrap();
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert_eq!(b.read().await.load_block(10).await.unwrap(), None);
+        assert!(b.read().await.load_block(3).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_chainlock_is_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+
+        let chainlock = ChainLock {
+            block_height: 100,
+            block_hash: dashcore::BlockHash::all_zeros(),
+            signature: dashcore::bls_sig_utils::BLSSignature::from([0u8; 96]),
+        };
+        let bytes = serde_json::to_vec(&chainlock).unwrap();
+        m.write()
+            .await
+            .store_metadata(BEST_CHAINLOCK_KEY, &bytes)
+            .await
+            .unwrap();
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        let after = m.read().await.load_metadata(BEST_CHAINLOCK_KEY).await.unwrap();
+        assert!(after.is_none(), "stale chainlock must be cleared");
+    }
+
+    #[tokio::test]
+    async fn sentinel_triggers_safe_tip_truncation() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        let chain = BlockHeader::dummy_chain(10, dashcore::BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+        m.write().await.write_reorg_sentinel().await.unwrap();
+        assert!(m.read().await.is_reorg_sentinel_set());
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert!(
+            !m.read().await.is_reorg_sentinel_set(),
+            "sentinel must be cleared after safe-tip recovery"
+        );
+        // Intact chain reopens at the same tip.
+        assert_eq!(bh.read().await.get_tip_height().await, Some(9));
+    }
 }

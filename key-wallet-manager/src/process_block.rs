@@ -619,6 +619,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clamp_heights_to_lowers_above_tip_metadata() {
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+
+        manager.update_wallet_synced_height(&wallet_id, 500);
+        manager.update_wallet_last_processed_height(&wallet_id, 600);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 500);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 600);
+
+        manager.clamp_heights_to(450).await;
+
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().synced_height(),
+            450,
+            "synced_height above tip must be clamped down"
+        );
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(),
+            450,
+            "last_processed_height above tip must be clamped down"
+        );
+
+        // Clamping to a tip above both is a no-op.
+        manager.clamp_heights_to(10_000).await;
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 450);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 450);
+    }
+
+    #[tokio::test]
     async fn test_update_wallet_synced_height_emits_sync_height_advanced() {
         let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
         let mut rx = manager.subscribe_events();
