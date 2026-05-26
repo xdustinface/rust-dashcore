@@ -430,6 +430,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filters_without_filter_headers_are_not_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
+
+        let chain = BlockHeader::dummy_chain(5, BlockHash::all_zeros());
+        bh.write().await.store_headers(&chain).await.unwrap();
+        for h in 0..3u32 {
+            f.write().await.store_filter(h, &[0xAA; 4]).await.unwrap();
+        }
+        assert_eq!(f.read().await.filter_tip_height().await.unwrap(), 2);
+        assert!(fh.read().await.get_filter_tip_height().await.unwrap().is_none());
+
+        check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
+
+        assert_eq!(
+            f.read().await.filter_tip_height().await.unwrap(),
+            2,
+            "filter storage must be left untouched when filter headers are absent"
+        );
+    }
+
+    #[tokio::test]
     async fn sentinel_triggers_safe_tip_truncation() {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
@@ -443,6 +465,15 @@ mod tests {
         for h in 0..12u32 {
             f.write().await.store_filter(h, &[0xBB; 4]).await.unwrap();
         }
+        // Store blocks: one within the safe range (anchors start_height) and one
+        // above the safe tip to verify block-storage truncation by the sentinel path.
+        let stale_height = 11u32;
+        b.write().await.store_block(0, HashedBlock::dummy(0, vec![])).await.unwrap();
+        b.write()
+            .await
+            .store_block(stale_height, HashedBlock::dummy(stale_height, vec![]))
+            .await
+            .unwrap();
         assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(14));
         assert_eq!(f.read().await.filter_tip_height().await.unwrap(), 11);
 
@@ -461,5 +492,10 @@ mod tests {
         // Downstream storages must be truncated to the safe tip.
         assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(safe_tip));
         assert_eq!(f.read().await.filter_tip_height().await.unwrap(), safe_tip);
+        assert_eq!(
+            b.read().await.load_block(stale_height).await.unwrap(),
+            None,
+            "stale block above safe tip must be removed during sentinel recovery"
+        );
     }
 }
