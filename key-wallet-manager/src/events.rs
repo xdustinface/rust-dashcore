@@ -347,11 +347,27 @@ pub enum WalletEvent {
         /// from the surviving records before this value was computed.
         balance: WalletCoreBalance,
     },
+    /// An outgoing transaction has been demoted by reorg and the SPV
+    /// rebroadcast loop has given up after the per-tx retry cap. The
+    /// transaction is not in any mempool and will not be rebroadcast
+    /// further until the user intervenes. Surface this in the UI so
+    /// the user can decide whether to abandon, re-sign, or wait.
+    TxRepeatedlyOrphaned {
+        /// ID of the affected wallet (looked up at emit time, may be
+        /// `None` when the rebroadcaster could not attribute the
+        /// txid to any managed wallet).
+        wallet_id: Option<WalletId>,
+        /// The transaction that exhausted its retry budget.
+        txid: Txid,
+    },
 }
 
 impl WalletEvent {
-    /// ID of the wallet this event pertains to.
-    pub fn wallet_id(&self) -> WalletId {
+    /// ID of the wallet this event pertains to. Returns `None` for events
+    /// that may not be tied to a specific wallet (e.g.
+    /// [`WalletEvent::TxRepeatedlyOrphaned`] emitted by the SPV
+    /// rebroadcast loop when the txid was not attributable).
+    pub fn wallet_id(&self) -> Option<WalletId> {
         match self {
             WalletEvent::TransactionDetected {
                 wallet_id,
@@ -374,6 +390,10 @@ impl WalletEvent {
                 ..
             }
             | WalletEvent::Reorg {
+                wallet_id,
+                ..
+            } => Some(*wallet_id),
+            WalletEvent::TxRepeatedlyOrphaned {
                 wallet_id,
                 ..
             } => *wallet_id,
@@ -468,6 +488,10 @@ impl fmt::Display for WalletEvent {
                 conflicted_txids.len(),
                 balance,
             ),
+            WalletEvent::TxRepeatedlyOrphaned {
+                txid,
+                ..
+            } => write!(f, "TxRepeatedlyOrphaned(txid={})", txid),
         }
     }
 }
