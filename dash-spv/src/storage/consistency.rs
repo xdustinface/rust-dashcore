@@ -152,12 +152,7 @@ pub(crate) async fn check_and_repair_consistency(
     // partially-truncated filter-header range, so we truncate filter headers
     // and filters back to the block header tip.
     if let Some(start) = filter_headers.read().await.get_filter_start_height().await {
-        let tip = filter_headers
-            .read()
-            .await
-            .get_filter_tip_height()
-            .await?
-            .unwrap_or(start);
+        let tip = filter_headers.read().await.get_filter_tip_height().await?.unwrap_or(start);
         if tip >= start {
             let read = filter_headers.read().await.load_filter_headers(start..tip + 1).await;
             if let Err(err) = read {
@@ -247,21 +242,15 @@ mod tests {
         Arc<RwLock<PersistentMetadataStorage>>,
     ) {
         let storage_path = path.to_path_buf();
-        let bh = Arc::new(RwLock::new(
-            PersistentBlockHeaderStorage::open(&storage_path).await.unwrap(),
-        ));
+        let bh =
+            Arc::new(RwLock::new(PersistentBlockHeaderStorage::open(&storage_path).await.unwrap()));
         let fh = Arc::new(RwLock::new(
             PersistentFilterHeaderStorage::open(&storage_path).await.unwrap(),
         ));
-        let f = Arc::new(RwLock::new(
-            PersistentFilterStorage::open(&storage_path).await.unwrap(),
-        ));
-        let b = Arc::new(RwLock::new(
-            PersistentBlockStorage::open(&storage_path).await.unwrap(),
-        ));
-        let m = Arc::new(RwLock::new(
-            PersistentMetadataStorage::open(&storage_path).await.unwrap(),
-        ));
+        let f = Arc::new(RwLock::new(PersistentFilterStorage::open(&storage_path).await.unwrap()));
+        let b = Arc::new(RwLock::new(PersistentBlockStorage::open(&storage_path).await.unwrap()));
+        let m =
+            Arc::new(RwLock::new(PersistentMetadataStorage::open(&storage_path).await.unwrap()));
         (storage_path, bh, fh, f, b, m)
     }
 
@@ -290,11 +279,7 @@ mod tests {
         let mut storage = PersistentBlockHeaderStorage::open(tmp.path()).await.unwrap();
         storage.store_headers(&chain).await.unwrap();
         let tip = storage.highest_valid_tip().await;
-        assert_eq!(
-            tip,
-            Some(0),
-            "broken chain must fall back to the start height"
-        );
+        assert_eq!(tip, Some(0), "broken chain must fall back to the start height");
     }
 
     #[tokio::test]
@@ -304,11 +289,7 @@ mod tests {
 
         let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
-        fh.write()
-            .await
-            .store_filter_headers(&FilterHeader::dummy_batch(0..10))
-            .await
-            .unwrap();
+        fh.write().await.store_filter_headers(&FilterHeader::dummy_batch(0..10)).await.unwrap();
         assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(9));
 
         check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
@@ -323,11 +304,7 @@ mod tests {
 
         let chain = BlockHeader::dummy_chain(10, dashcore::BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
-        fh.write()
-            .await
-            .store_filter_headers(&FilterHeader::dummy_batch(0..5))
-            .await
-            .unwrap();
+        fh.write().await.store_filter_headers(&FilterHeader::dummy_batch(0..5)).await.unwrap();
         for h in 0..8 {
             f.write().await.store_filter(h, &[0xAA; 4]).await.unwrap();
         }
@@ -370,11 +347,7 @@ mod tests {
             signature: dashcore::bls_sig_utils::BLSSignature::from([0u8; 96]),
         };
         let bytes = serde_json::to_vec(&chainlock).unwrap();
-        m.write()
-            .await
-            .store_metadata(BEST_CHAINLOCK_KEY, &bytes)
-            .await
-            .unwrap();
+        m.write().await.store_metadata(BEST_CHAINLOCK_KEY, &bytes).await.unwrap();
 
         check_and_repair_consistency(&path, &bh, &fh, &f, &b, &m).await.unwrap();
 

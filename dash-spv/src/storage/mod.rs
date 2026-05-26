@@ -34,8 +34,8 @@ pub use crate::storage::blocks::{BlockStorage, PersistentBlockStorage};
 pub use crate::storage::filter_headers::{FilterHeaderStorage, PersistentFilterHeaderStorage};
 pub use crate::storage::filters::{FilterStorage, PersistentFilterStorage};
 pub use crate::storage::masternode::{MasternodeStateStorage, PersistentMasternodeStateStorage};
-pub use crate::storage::metadata::{MetadataStorage, PersistentMetadataStorage};
 use crate::storage::metadata::REORG_SENTINEL_FILE;
+pub use crate::storage::metadata::{MetadataStorage, PersistentMetadataStorage};
 pub use crate::storage::peers::{PeerStorage, PersistentPeerStorage};
 
 pub use types::*;
