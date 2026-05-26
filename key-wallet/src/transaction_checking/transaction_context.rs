@@ -121,9 +121,58 @@ impl TransactionContext {
     /// [`TransactionContext::Conflicted`] and
     /// [`TransactionContext::Abandoned`].
     pub(crate) fn is_inactive(&self) -> bool {
-        matches!(
-            self,
-            TransactionContext::Conflicted { .. } | TransactionContext::Abandoned
-        )
+        matches!(self, TransactionContext::Conflicted { .. } | TransactionContext::Abandoned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dashcore::ephemerealdata::instant_lock::InstantLock;
+    use dashcore::hashes::Hash;
+    use dashcore::BlockHash;
+
+    fn sample_block_info() -> BlockInfo {
+        BlockInfo::new(100, BlockHash::all_zeros(), 1_700_000_000)
+    }
+
+    #[test]
+    fn conflicted_helpers_are_negative() {
+        let previous = TransactionContext::InstantSend(InstantLock::default());
+        let conflicted = TransactionContext::Conflicted {
+            previous: Box::new(previous),
+        };
+        assert!(!conflicted.confirmed());
+        assert!(!conflicted.is_instant_send());
+        assert!(!conflicted.is_chain_locked());
+        assert!(conflicted.is_inactive());
+        assert!(conflicted.block_info().is_none());
+        assert_eq!(format!("{}", conflicted), "conflicted (was instant send)");
+    }
+
+    #[test]
+    fn abandoned_helpers_are_negative() {
+        let abandoned = TransactionContext::Abandoned;
+        assert!(!abandoned.confirmed());
+        assert!(!abandoned.is_instant_send());
+        assert!(!abandoned.is_chain_locked());
+        assert!(abandoned.is_inactive());
+        assert!(abandoned.block_info().is_none());
+        assert_eq!(format!("{}", abandoned), "abandoned");
+    }
+
+    #[test]
+    fn conflicted_preserves_previous_in_block_context() {
+        let previous = TransactionContext::InBlock(sample_block_info());
+        let conflicted = TransactionContext::Conflicted {
+            previous: Box::new(previous.clone()),
+        };
+        let TransactionContext::Conflicted {
+            previous: restored,
+        } = conflicted
+        else {
+            panic!("expected Conflicted variant");
+        };
+        assert_eq!(*restored, previous);
     }
 }
