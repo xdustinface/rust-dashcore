@@ -47,7 +47,11 @@ async fn wait_for_chain_reorg(
                 Ok(event @ SyncEvent::ChainReorg { fork_height, .. })
                     if fork_height == expected_fork_height => return event,
                 Ok(_) => continue,
-                Err(err) => panic!("sync event channel error waiting for ChainReorg: {}", err),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("sync event receiver lagged, skipped {} messages", n);
+                    continue;
+                }
+                Err(err) => panic!("sync event channel closed waiting for ChainReorg: {}", err),
             }
         }
     }
@@ -70,7 +74,11 @@ async fn wait_for_wallet_reorg(
                 Ok(event @ WalletEvent::Reorg { fork_height, .. })
                     if fork_height == expected_fork_height => return event,
                 Ok(_) => continue,
-                Err(err) => panic!("wallet event channel error waiting for Reorg: {}", err),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("wallet event receiver lagged, skipped {} messages", n);
+                    continue;
+                }
+                Err(err) => panic!("wallet event channel closed waiting for Reorg: {}", err),
             }
         }
     }
