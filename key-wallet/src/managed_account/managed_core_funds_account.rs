@@ -572,13 +572,35 @@ impl ManagedCoreFundsAccount {
             .collect();
         records.sort_by_key(|record| record.context.block_info().map(|info| info.height()));
 
+        // Collect every owned outpoint up front so `has_owned_input` below
+        // is independent of record visit order. The in-loop `spent_outpoints`
+        // set cannot serve here: it only sees already-processed inputs, so a
+        // mempool child sorted before its block parent would observe an
+        // empty set and miss the trusted-change signal.
+        let account_type = self.keys.managed_account_type();
+        let mut owned_outpoints: HashSet<OutPoint> = HashSet::new();
+        for record in &records {
+            let txid = record.transaction.txid();
+            for (vout, output) in record.transaction.output.iter().enumerate() {
+                let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
+                    continue;
+                };
+                if account_type.contains_address(&addr) {
+                    owned_outpoints.insert(OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    });
+                }
+            }
+        }
+
         for record in records {
             let tx = &record.transaction;
             let txid = tx.txid();
             let context = &record.context;
 
             let has_owned_input =
-                tx.input.iter().any(|input| self.spent_outpoints.contains(&input.previous_output));
+                tx.input.iter().any(|input| owned_outpoints.contains(&input.previous_output));
 
             for (vout, output) in tx.output.iter().enumerate() {
                 let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
