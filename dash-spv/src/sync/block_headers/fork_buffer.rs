@@ -308,6 +308,22 @@ impl ForkBuffer {
         self.branches.keys().map(|(_, tip)| tip)
     }
 
+    /// Take a buffered branch by tip hash without comparing chain work.
+    ///
+    /// Used by the `ChainLockForcedReorg` path: a validated CLSig overrides
+    /// the work-superiority requirement so the branch leading to the
+    /// chainlocked block must be promoted even when lighter than the active
+    /// extension.
+    pub(super) fn take_branch_by_tip(&mut self, tip: &BlockHash) -> Option<ForkCandidate> {
+        let key = *self.branches.keys().find(|(_, t)| t == tip)?;
+        let branch = self.branches.remove(&key)?;
+        Some(ForkCandidate {
+            ancestor_height: branch.ancestor_height,
+            headers: branch.headers,
+            total_work: branch.total_work,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.branches.len()

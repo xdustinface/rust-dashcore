@@ -122,10 +122,32 @@ impl<
 
     async fn handle_sync_event(
         &mut self,
-        _event: &SyncEvent,
-        _requests: &RequestSender,
+        event: &SyncEvent,
+        requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
-        // BlockHeadersManager doesn't react to events from other managers
+        if let SyncEvent::ChainLockForcedReorg {
+            chain_lock,
+            fork_height,
+        } = event
+        {
+            tracing::warn!(
+                "ChainLockForcedReorg: cl_height={} fork_height={} target_hash={}",
+                chain_lock.block_height,
+                fork_height,
+                chain_lock.block_hash
+            );
+            self.cl_forced_reorg_pending = Some(chain_lock.clone());
+            // Broadcast a getheaders with the storage-tip-anchored locator so
+            // every connected peer has a chance to deliver the chainlocked
+            // branch. The locator goes back from the current tip, so any peer
+            // on the chainlocked branch will reply with headers from the
+            // first common ancestor — which will land in `ingest_fork` and
+            // be force-promoted by `try_drive_forced_reorg`.
+            let locator = self.build_locator().await?;
+            if let Err(e) = requests.request_block_headers(locator) {
+                tracing::warn!("Failed to broadcast getheaders for forced reorg: {}", e);
+            }
+        }
         Ok(vec![])
     }
 

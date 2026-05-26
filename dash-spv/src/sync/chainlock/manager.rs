@@ -18,6 +18,7 @@ use dashcore::BlockHash;
 use tokio::sync::RwLock;
 
 use crate::error::SyncResult;
+use crate::network::{MisbehaviorKind, RequestSender};
 use crate::storage::{BlockHeaderStorage, MetadataStorage};
 use crate::sync::{ChainLockProgress, SyncEvent};
 
@@ -75,8 +76,7 @@ pub struct ChainLockManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// [`PENDING_UNKNOWN_HASH_TTL`] are dropped on `tick`. The
     /// `Option<SocketAddr>` is the peer that delivered the CLSig, used for
     /// misbehavior reporting when the hash later resolves to a `Mismatch`.
-    pub(super) pending_unknown_hash:
-        HashMap<BlockHash, (ChainLock, Option<SocketAddr>, Instant)>,
+    pub(super) pending_unknown_hash: HashMap<BlockHash, (ChainLock, Option<SocketAddr>, Instant)>,
     /// Shared snapshot of the best validated chainlock height. `0` means
     /// "no chainlock observed yet". Read by `BlockHeadersManager` as the
     /// floor for the reorg cascade.
@@ -140,8 +140,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
             // the finality boundary onto a block the local chain doesn't
             // match. `Match` and `Unknown` (header still missing) take the
             // signature-validation path.
-            let header_ok =
-                !matches!(self.verify_block_hash(&pending).await, BlockHashVerification::Mismatch { .. });
+            let header_ok = !matches!(
+                self.verify_block_hash(&pending).await,
+                BlockHashVerification::Mismatch { .. }
+            );
             if header_ok && self.validate_signature(&pending).await {
                 self.progress.add_valid(1);
                 self.progress.update_best_validated_height(pending.block_height);
@@ -184,11 +186,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     /// Process an incoming ChainLock message.
     ///
     /// `peer` is the address that delivered the CLSig, used for misbehavior
-    /// reporting when a `Mismatch` later resolves to an invalid signature.
+    /// reporting when the local chain disagrees on the chainlocked block and
+    /// the BLS signature does not verify. `requests` is the channel into the
+    /// network manager so the reputation penalty can be applied.
     pub(super) async fn process_chainlock(
         &mut self,
         chainlock: &ChainLock,
         peer: Option<SocketAddr>,
+        requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
         let height = chainlock.block_height;
         let block_hash = chainlock.block_hash;
@@ -251,12 +256,38 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 local_header_hash,
             } => {
                 tracing::warn!(
-                    "ChainLock hash mismatch at height {}: local {} vs CLSig {} (rejecting until forced-reorg path lands)",
+                    "ChainLock hash mismatch at height {}: local {} vs CLSig {}; validating signature",
                     height,
                     local_header_hash,
                     block_hash
                 );
-                return Ok(vec![]);
+                if !self.validate_signature(chainlock).await {
+                    self.progress.add_invalid(1);
+                    if let Some(peer_addr) = peer {
+                        if let Err(e) = requests.report_misbehavior(
+                            peer_addr,
+                            MisbehaviorKind::InvalidChainLockSignature,
+                        ) {
+                            tracing::warn!(
+                                "Failed to report invalid-CLSig misbehavior for {}: {}",
+                                peer_addr,
+                                e
+                            );
+                        }
+                    }
+                    return Ok(vec![]);
+                }
+                // Valid signature against a local-disagreeing block: drive a
+                // forced reorg through `BlockHeadersManager`. `fork_height`
+                // is the parent of the chainlocked block since the chainlock
+                // locks block at `block_height` and rewrites everything from
+                // there.
+                let fork_height = height.saturating_sub(1);
+                self.progress.add_valid(1);
+                return Ok(vec![SyncEvent::ChainLockForcedReorg {
+                    chain_lock: chainlock.clone(),
+                    fork_height,
+                }]);
             }
         }
 
@@ -332,10 +363,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     ///   the signature is invalid; the caller decides which.
     /// - [`BlockHashVerification::Unknown`]: no header yet. Caller queues the
     ///   chainlock and re-checks once headers progress.
-    pub(super) async fn verify_block_hash(
-        &self,
-        chainlock: &ChainLock,
-    ) -> BlockHashVerification {
+    pub(super) async fn verify_block_hash(&self, chainlock: &ChainLock) -> BlockHashVerification {
         let storage = self.header_storage.read().await;
         match storage.get_header(chainlock.block_height).await {
             Ok(Some(header)) => {
@@ -396,7 +424,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     ///   `ChainLockForcedReorg` after validating the signature.
     /// - `Unknown`: the entry stays queued for a later `BlockHeadersStored`,
     ///   subject to TTL eviction in `tick`.
-    pub(super) async fn retry_pending_unknown_hash(&mut self) -> SyncResult<Vec<SyncEvent>> {
+    pub(super) async fn retry_pending_unknown_hash(
+        &mut self,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
         if self.pending_unknown_hash.is_empty() {
             return Ok(vec![]);
         }
@@ -404,7 +435,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         let mut to_retry: Vec<(BlockHash, ChainLock, Option<SocketAddr>)> = Vec::new();
         for (hash, (cl, peer, _)) in &self.pending_unknown_hash {
             match self.verify_block_hash(cl).await {
-                BlockHashVerification::Match | BlockHashVerification::Mismatch { .. } => {
+                BlockHashVerification::Match
+                | BlockHashVerification::Mismatch {
+                    ..
+                } => {
                     to_retry.push((*hash, cl.clone(), *peer));
                 }
                 BlockHashVerification::Unknown => {}
@@ -413,9 +447,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         for (hash, cl, peer) in to_retry {
             self.pending_unknown_hash.remove(&hash);
             // Re-run process_chainlock so the resolved branch is handled
-            // through the canonical path (Match → validate, Mismatch →
-            // reject for now / forced reorg in the follow-up commit).
-            let mut produced = self.process_chainlock(&cl, peer).await?;
+            // through the canonical path: `Match` validates the signature,
+            // `Mismatch` either reports misbehavior (bad sig) or emits
+            // `ChainLockForcedReorg` (good sig).
+            let mut produced = self.process_chainlock(&cl, peer, requests).await?;
             events.append(&mut produced);
         }
         Ok(events)
@@ -506,6 +541,14 @@ mod tests {
         }
     }
 
+    /// Test helper: a stand-alone `RequestSender` whose receiver is
+    /// discarded. Used by `process_chainlock` call sites that don't care
+    /// about the misbehavior-reporting side-effect.
+    fn test_requests() -> RequestSender {
+        let (tx, _rx) = unbounded_channel();
+        RequestSender::new(tx)
+    }
+
     #[tokio::test]
     async fn test_chainlock_manager_new() {
         let manager = create_test_manager().await;
@@ -541,7 +584,7 @@ mod tests {
 
         // Before masternode sync, ChainLocks should not be validated
         let chainlock = create_test_chainlock(100);
-        let events = manager.process_chainlock(&chainlock, None).await.unwrap();
+        let events = manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(manager.progress.valid(), 0);
@@ -559,9 +602,18 @@ mod tests {
         // Lower height first, then higher — pending_validation tracks
         // the highest seen pre-ready chainlock so the retry on
         // masternode-ready always validates the most recent.
-        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
-        let _ = manager.process_chainlock(&create_test_chainlock(200), None).await.unwrap();
-        let _ = manager.process_chainlock(&create_test_chainlock(150), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(200), None, &test_requests())
+            .await
+            .unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(150), None, &test_requests())
+            .await
+            .unwrap();
 
         assert_eq!(manager.pending_validation.as_ref().map(|cl| cl.block_height), Some(200));
     }
@@ -574,7 +626,10 @@ mod tests {
         // Cache a chainlock for height 100 BEFORE any header exists.
         // `process_chainlock`'s permissive `verify_block_hash` lets it
         // through and it lands in `pending_validation`.
-        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
         assert!(manager.pending_validation.is_some());
 
         // Header for height 100 resolves later with a hash that differs
@@ -601,7 +656,10 @@ mod tests {
     #[tokio::test]
     async fn test_on_masternode_ready_retries_pending_validation() {
         let mut manager = create_test_manager().await;
-        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
         assert!(manager.pending_validation.is_some());
 
         // With the default empty engine, validation fails — the
@@ -645,7 +703,7 @@ mod tests {
             .await
             .expect("store header at 100");
 
-        let _ = manager.process_chainlock(&chainlock, None).await.unwrap();
+        let _ = manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
 
         assert_eq!(manager.progress.invalid(), 1);
         assert_eq!(manager.progress.valid(), 0);
@@ -660,17 +718,20 @@ mod tests {
 
         // Lower height should be ignored
         let chainlock_lower = create_test_chainlock(150);
-        let events = manager.process_chainlock(&chainlock_lower, None).await.unwrap();
+        let events =
+            manager.process_chainlock(&chainlock_lower, None, &test_requests()).await.unwrap();
         assert_eq!(events.len(), 0);
 
         // Equal height should also be ignored
         let chainlock_equal = create_test_chainlock(200);
-        let events = manager.process_chainlock(&chainlock_equal, None).await.unwrap();
+        let events =
+            manager.process_chainlock(&chainlock_equal, None, &test_requests()).await.unwrap();
         assert_eq!(events.len(), 0);
 
         // Higher height should be processed
         let chainlock_higher = create_test_chainlock(300);
-        let events = manager.process_chainlock(&chainlock_higher, None).await.unwrap();
+        let events =
+            manager.process_chainlock(&chainlock_higher, None, &test_requests()).await.unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -773,7 +834,7 @@ mod tests {
 
         // Without masternode ready, chainlocks are not validated and not persisted
         let chainlock = create_test_chainlock(500);
-        manager.process_chainlock(&chainlock, None).await.unwrap();
+        manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
         assert!(manager.best_chainlock().is_none());
 
         // Verify nothing was persisted
@@ -838,7 +899,10 @@ mod tests {
         assert!(!manager.masternode_ready, "ChainReorg must flip masternode_ready back to false");
         assert!(manager.pending_validation.is_none(), "ChainReorg must drop pending_validation");
 
-        let _ = manager.process_chainlock(&create_test_chainlock(150), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(150), None, &test_requests())
+            .await
+            .unwrap();
         assert!(manager.pending_validation.is_some());
         assert_eq!(manager.progress.valid(), 0);
         assert_eq!(manager.progress.invalid(), 0);
@@ -853,7 +917,10 @@ mod tests {
     async fn test_reorg_prevents_stale_pending_validation_from_being_revalidated() {
         let mut manager = create_test_manager().await;
 
-        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
         assert!(manager.pending_validation.is_some());
 
         manager.reset_for_reorg();
@@ -892,7 +959,10 @@ mod tests {
     async fn test_pending_validation_survives_disconnect_and_consumed_on_reconnect() {
         let mut manager = create_test_manager().await;
 
-        let _ = manager.process_chainlock(&create_test_chainlock(100), None).await.unwrap();
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
         assert!(manager.pending_validation.is_some());
         assert!(!manager.masternode_ready);
 
@@ -937,7 +1007,8 @@ mod tests {
 
             // Try to process a lower chainlock
             let lower_chainlock = create_test_chainlock(100);
-            let events = manager.process_chainlock(&lower_chainlock, None).await.unwrap();
+            let events =
+                manager.process_chainlock(&lower_chainlock, None, &test_requests()).await.unwrap();
 
             // Should be rejected (no events)
             assert_eq!(events.len(), 0);
@@ -1032,7 +1103,8 @@ mod tests {
             block_hash: BlockHash::from_byte_array([0xCC; 32]),
             signature: BLSSignature::from([0u8; 96]),
         };
-        let events = manager.process_chainlock(&chainlock, Some(peer)).await.unwrap();
+        let events =
+            manager.process_chainlock(&chainlock, Some(peer), &test_requests()).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], SyncEvent::PendingChainLockQueued { .. }));
@@ -1101,7 +1173,7 @@ mod tests {
         };
 
         // Queue the chainlock first (header not stored yet → Unknown branch).
-        let events = manager.process_chainlock(&chainlock, None).await.unwrap();
+        let events = manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], SyncEvent::PendingChainLockQueued { .. }));
         assert_eq!(manager.pending_unknown_hash.len(), 1);
@@ -1115,7 +1187,7 @@ mod tests {
             .await
             .expect("store header at 123");
 
-        let retry_events = manager.retry_pending_unknown_hash().await.unwrap();
+        let retry_events = manager.retry_pending_unknown_hash(&test_requests()).await.unwrap();
         // process_chainlock returned the `ChainLockReceived` event for the
         // signature-validation outcome (empty engine fails, validated=false).
         assert_eq!(retry_events.len(), 1);
@@ -1147,7 +1219,7 @@ mod tests {
             signature: BLSSignature::from([0u8; 96]),
         };
 
-        let _ = manager.process_chainlock(&chainlock, None).await.unwrap();
+        let _ = manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
         assert_eq!(manager.pending_unknown_hash.len(), 1);
 
         storage
@@ -1158,10 +1230,57 @@ mod tests {
             .await
             .expect("store header at 200");
 
-        let _ = manager.retry_pending_unknown_hash().await.unwrap();
+        let _ = manager.retry_pending_unknown_hash(&test_requests()).await.unwrap();
         assert!(
             manager.pending_unknown_hash.is_empty(),
             "mismatched entry must be removed from the queue"
         );
+    }
+
+    /// `Mismatch` with an invalid signature reports peer misbehavior and
+    /// does not emit `ChainLockForcedReorg`. The receiver of the underlying
+    /// request channel sees a `ReportMisbehavior` request for the delivering
+    /// peer with `InvalidChainLockSignature`.
+    #[tokio::test]
+    async fn test_process_chainlock_mismatch_invalid_signature_reports_misbehavior() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let mut manager = create_test_manager_with_storage(&storage).await;
+        manager.masternode_ready = true;
+
+        // Store a header at height 50 that differs from the chainlock's hash
+        // so `verify_block_hash` returns `Mismatch`.
+        let header = dashcore::block::Header::dummy(50);
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 50)
+            .await
+            .expect("store header at 50");
+        let chainlock = ChainLock {
+            block_height: 50,
+            block_hash: BlockHash::from_byte_array([0xFE; 32]),
+            signature: BLSSignature::from([0u8; 96]),
+        };
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+
+        let (tx, mut rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let events = manager.process_chainlock(&chainlock, Some(peer), &requests).await.unwrap();
+        assert!(
+            events.is_empty(),
+            "invalid signature must not emit ChainLockForcedReorg, got {:?}",
+            events
+        );
+        let req = rx.try_recv().expect("misbehavior report must be queued");
+        match req {
+            crate::network::NetworkRequest::ReportMisbehavior(reported_peer, kind) => {
+                assert_eq!(reported_peer, peer);
+                assert_eq!(kind, MisbehaviorKind::InvalidChainLockSignature);
+            }
+            other => panic!("expected ReportMisbehavior, got {:?}", other),
+        }
+        assert_eq!(manager.progress.invalid(), 1);
     }
 }

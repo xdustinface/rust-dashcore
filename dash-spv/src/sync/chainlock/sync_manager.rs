@@ -38,7 +38,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     ) -> SyncResult<Vec<SyncEvent>> {
         let peer = msg.peer_address();
         match msg.inner() {
-            NetworkMessage::CLSig(chainlock) => self.process_chainlock(chainlock, Some(peer)).await,
+            NetworkMessage::CLSig(chainlock) => {
+                self.process_chainlock(chainlock, Some(peer), requests).await
+            }
             NetworkMessage::Inv(inv) => {
                 // Check for ChainLock inventory items, filtering out already-requested ones
                 let chainlocks_to_request: Vec<Inventory> = inv
@@ -77,7 +79,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     async fn handle_sync_event(
         &mut self,
         event: &SyncEvent,
-        _requests: &RequestSender,
+        requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
         if let SyncEvent::ChainReorg {
             fork_height,
@@ -93,7 +95,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         }
 
         if matches!(event, SyncEvent::BlockHeadersStored { .. }) {
-            return self.retry_pending_unknown_hash().await;
+            return self.retry_pending_unknown_hash(requests).await;
         }
 
         // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
