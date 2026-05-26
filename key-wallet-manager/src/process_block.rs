@@ -287,6 +287,19 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         );
     }
 
+    async fn clamp_heights_to(&mut self, tip: CoreBlockHeight) {
+        for info in self.wallet_infos.values_mut() {
+            let current_last = info.last_processed_height();
+            if current_last > tip {
+                info.update_last_processed_height(tip);
+            }
+            let current_synced = info.synced_height();
+            if current_synced > tip {
+                info.update_synced_height(tip);
+            }
+        }
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
     }

@@ -13,8 +13,9 @@ use crate::chain::checkpoints::{mainnet_checkpoints, testnet_checkpoints, Checkp
 use crate::error::{Result, SpvError};
 use crate::network::NetworkManager;
 use crate::storage::{
-    PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
-    PersistentFilterStorage, PersistentMetadataStorage, StorageManager,
+    BlockHeaderStorage, PersistentBlockHeaderStorage, PersistentBlockStorage,
+    PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
+    StorageManager,
 };
 use crate::sync::{
     BlockHeadersManager, BlocksManager, ChainLockManager, FilterHeadersManager, FiltersManager,
@@ -45,6 +46,13 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // Initialize genesis block or checkpoint before creating managers,
         // so they can read the tip from storage during construction.
         Self::initialize_genesis_block(&config, &mut storage).await?;
+
+        // Clamp wallet heights to the (possibly repaired) block-header tip so
+        // a mid-cascade crash recovery cannot leave wallet metadata pointing
+        // above a height the local header chain no longer contains.
+        if let Some(tip) = storage.block_headers().read().await.get_tip_height().await {
+            wallet.write().await.clamp_heights_to(tip).await;
+        }
 
         let masternode_engine = {
             if config.enable_masternodes {

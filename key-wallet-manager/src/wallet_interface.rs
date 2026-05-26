@@ -134,6 +134,14 @@ pub trait WalletInterface: Send + Sync + 'static {
         height: CoreBlockHeight,
     );
 
+    /// Clamp every managed wallet's `last_processed_height` and `synced_height`
+    /// so neither exceeds `tip`. Called from the SPV client's startup path
+    /// after the storage consistency check repairs a mid-cascade crash. The
+    /// default implementation is a no-op; implementations that track per-wallet
+    /// heights must iterate their internal wallets and bound both metadata
+    /// fields with `min(current, tip)`.
+    async fn clamp_heights_to(&mut self, _tip: CoreBlockHeight) {}
+
     /// Return a revision counter that increments whenever the set of monitored
     /// addresses or watched outpoints changes. The mempool manager uses this to
     /// detect when its bloom filter is stale without requiring an external signal.
