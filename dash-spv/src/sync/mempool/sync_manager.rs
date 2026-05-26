@@ -22,6 +22,12 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
         self.progress.set_state(state);
     }
 
+    fn update_target_height(&mut self, height: u32) {
+        if height > self.current_tip_height {
+            self.current_tip_height = height;
+        }
+    }
+
     fn wanted_message_types(&self) -> &'static [MessageType] {
         &[MessageType::Inv, MessageType::Tx]
     }
@@ -88,6 +94,9 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                 // Remove confirmed transactions from mempool.
                 // Bloom filter rebuild is handled by the tick's revision check.
                 if !confirmed_txids.is_empty() {
+                    for txid in confirmed_txids {
+                        self.pending_rebroadcast.remove(txid);
+                    }
                     self.remove_confirmed(confirmed_txids);
                 }
                 Ok(vec![])
@@ -119,6 +128,12 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
 
         // Rebroadcast unconfirmed self-sent transactions on a randomized interval
         self.rebroadcast_if_due(requests).await;
+
+        // Drain WalletEvents to pick up reorg-demoted txids and new-chain
+        // confirmations, then drive the reorg rebroadcast queue. Both
+        // calls are no-ops when there is no pending state.
+        self.drain_wallet_events().await;
+        self.drive_reorg_rebroadcast(requests).await;
 
         // Rebuild bloom filter if the wallet's monitored set has changed.
         //
@@ -204,7 +219,13 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let manager = MempoolManager::new(wallet, MempoolStrategy::FetchAll, 1000, 0);
+        let manager = MempoolManager::new(
+            wallet,
+            MempoolStrategy::FetchAll,
+            1000,
+            0,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        );
 
         (manager, requests, rx)
     }
@@ -556,7 +577,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let mut manager = MempoolManager::new(wallet, MempoolStrategy::BloomFilter, 1000, 0);
+        let mut manager = MempoolManager::new(
+            wallet,
+            MempoolStrategy::BloomFilter,
+            1000,
+            0,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        );
 
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
@@ -631,6 +658,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -686,7 +714,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let mut manager = MempoolManager::new(wallet.clone(), MempoolStrategy::FetchAll, 1000, 0);
+        let mut manager = MempoolManager::new(
+            wallet.clone(),
+            MempoolStrategy::FetchAll,
+            1000,
+            0,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        );
 
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
@@ -740,6 +774,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -789,6 +824,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);

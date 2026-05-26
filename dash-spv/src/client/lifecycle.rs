@@ -163,12 +163,16 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // Build mempool manager if tracking is enabled
         if config.enable_mempool_tracking {
             let initial_revision = wallet.read().await.monitor_revision();
-            managers.mempool = Some(MempoolManager::new(
+            let wallet_event_rx = wallet.read().await.subscribe_events();
+            let mut mempool = MempoolManager::new(
                 wallet.clone(),
                 config.mempool_strategy,
                 config.max_mempool_transactions,
                 initial_revision,
-            ));
+                chainlock_height.clone(),
+            );
+            mempool.set_wallet_event_subscription(wallet_event_rx);
+            managers.mempool = Some(mempool);
         }
 
         // `reorg_generation` is held by each manager (via clones threaded in
