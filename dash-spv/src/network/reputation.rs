@@ -218,7 +218,7 @@ pub struct PeerReputation {
     /// Cause of the most recent disconnect, if any. Defaulted on load so older
     /// reputation files without this field continue to deserialize.
     #[serde(default)]
-    pub(crate) last_disconnect_reason: Option<DisconnectReason>,
+    pub last_disconnect_reason: Option<DisconnectReason>,
 }
 
 impl Default for PeerReputation {
