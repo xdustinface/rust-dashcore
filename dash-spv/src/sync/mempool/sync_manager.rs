@@ -421,7 +421,7 @@ mod tests {
             );
         }
         manager
-            .enqueue_demoted_for_rebroadcast(
+            .enqueue_demoted_for_rebroadcast_for_test(
                 key_wallet_manager::test_utils::MOCK_WALLET_ID,
                 &[txids[0]],
             )

@@ -211,6 +211,17 @@ impl<W: WalletInterface> MempoolManager<W> {
         &self.wallet_event_tx
     }
 
+    /// Test-only wrapper so sibling-module tests can seed `pending_rebroadcast`
+    /// without widening the production visibility of the underlying method.
+    #[cfg(test)]
+    pub(super) async fn enqueue_demoted_for_rebroadcast_for_test(
+        &mut self,
+        wallet_id: WalletId,
+        demoted_txids: &[Txid],
+    ) {
+        self.enqueue_demoted_for_rebroadcast(wallet_id, demoted_txids).await;
+    }
+
     /// Activate mempool monitoring on a single peer.
     ///
     /// Since we connect with `relay=false`, peers won't send transaction INVs
@@ -585,7 +596,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    pub(super) async fn enqueue_demoted_for_rebroadcast(
+    async fn enqueue_demoted_for_rebroadcast(
         &mut self,
         wallet_id: WalletId,
         demoted_txids: &[Txid],
@@ -2146,7 +2157,8 @@ mod tests {
     async fn test_chainlock_floor_prevents_enqueue() {
         // Chainlock floor strictly above the current tip must skip enqueue
         // entirely, since a tx confirmed in a chainlocked block can never
-        // be a candidate for rebroadcast.
+        // be a candidate for rebroadcast. This test invokes the enqueue
+        // path directly and does not exercise the wallet-event channel.
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
         let (tx_chan, _rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let _requests = RequestSender::new(tx_chan);
@@ -2158,8 +2170,6 @@ mod tests {
             0,
             chainlock_height,
         );
-        let wallet_event_rx = wallet.read().await.subscribe_events();
-        manager.set_wallet_event_subscription(wallet_event_rx);
 
         let prev = OutPoint {
             txid: Txid::from_byte_array([0xee; 32]),
@@ -2175,9 +2185,12 @@ mod tests {
             !manager.pending_rebroadcast.contains_key(&txid),
             "chainlock floor above tip must prevent enqueue"
         );
+        // The chainlock-floor guard must short-circuit before the wallet
+        // fetch/insert path runs; if that ordering ever flips, this stray
+        // entry would be the symptom.
         assert!(
             !manager.transactions.contains_key(&txid),
-            "skipped enqueue must not leave a stray transactions entry"
+            "skipped enqueue must not leave a stray transactions entry (guard fires before fetch)"
         );
     }
 
