@@ -507,6 +507,130 @@ impl ManagedCoreFundsAccount {
         self.keys.apply_chain_lock(cl_height)
     }
 
+    /// Demote every transaction record on this account whose mined
+    /// height is strictly greater than `height` back to a
+    /// pre-confirmation context, and return the demoted txids in the
+    /// order they were visited (highest height first).
+    ///
+    /// `InBlock` / `InChainLockedBlock` above the cut are demoted to
+    /// [`TransactionContext::Mempool`]. Records currently in
+    /// `InstantSend` are retained as-is even when their (formerly
+    /// confirmed) block height is above the cut, since the IS lock
+    /// itself is independent of the demoted block. Re-validating the
+    /// IS lock against the post-reorg quorum set is the caller's
+    /// responsibility (the wallet has no view of the masternode list).
+    /// Records already in an inactive context (`Conflicted`,
+    /// `Abandoned`) are left alone.
+    ///
+    /// This routine only mutates `transactions`. UTXO / spent-outpoint
+    /// state must be rebuilt afterwards via [`Self::rebuild_utxos`]
+    /// once the wallet-level descendant cascade has fully converged,
+    /// so the rebuild observes the final post-rewind context for every
+    /// record.
+    pub(crate) fn demote_records_above(&mut self, height: CoreBlockHeight) -> Vec<Txid> {
+        let mut demoted = Vec::new();
+        let to_demote: Vec<Txid> = self
+            .keys
+            .transactions()
+            .iter()
+            .filter_map(|(txid, record)| match record.context.block_info() {
+                Some(info) if info.height() > height => Some(*txid),
+                _ => None,
+            })
+            .collect();
+        for txid in to_demote {
+            if let Some(record) = self.keys.transactions_mut().get_mut(&txid) {
+                record.update_context(TransactionContext::Mempool);
+                demoted.push(txid);
+            }
+        }
+        demoted
+    }
+
+    /// Demote a specific transaction by txid to `Mempool` (used for
+    /// the wallet-level descendant cascade). Returns `true` when the
+    /// record existed and was actually demoted (i.e. was not already
+    /// in `Mempool` / `InstantSend` / inactive).
+    pub(crate) fn demote_record(&mut self, txid: &Txid) -> bool {
+        let Some(record) = self.keys.transactions_mut().get_mut(txid) else {
+            return false;
+        };
+        if record.context.block_info().is_none() {
+            return false;
+        }
+        record.update_context(TransactionContext::Mempool);
+        true
+    }
+
+    /// Drop the cached UTXO set and spent-outpoint tracking, then
+    /// rebuild both from the current `transactions` map in height
+    /// order. Mirrors the post-deserialization rebuild used by the
+    /// serde `Deserialize` impl.
+    ///
+    /// Records with an inactive context (`Conflicted`, `Abandoned`) are
+    /// excluded from both the UTXO inserts and the spent-outpoint
+    /// inserts so their outputs do not pollute the spendable set and
+    /// their inputs do not block predecessor UTXOs from being
+    /// re-credited.
+    pub(crate) fn rebuild_utxos(&mut self) {
+        self.utxos.clear();
+        self.spent_outpoints.clear();
+        if !matches!(
+            self.keys.managed_account_type(),
+            ManagedAccountType::Standard { .. }
+                | ManagedAccountType::CoinJoin { .. }
+                | ManagedAccountType::DashpayReceivingFunds { .. }
+                | ManagedAccountType::DashpayExternalAccount { .. }
+        ) {
+            self.keys.bump_monitor_revision();
+            return;
+        }
+
+        let network = self.keys.network();
+        let mut records: Vec<&TransactionRecord> = self
+            .keys
+            .transactions()
+            .values()
+            .filter(|record| !record.context.is_inactive())
+            .collect();
+        records.sort_by_key(|record| record.context.block_info().map(|info| info.height()));
+
+        for record in records {
+            let tx = &record.transaction;
+            let txid = tx.txid();
+            let context = &record.context;
+
+            for (vout, output) in tx.output.iter().enumerate() {
+                let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
+                    continue;
+                };
+                if !self.keys.managed_account_type().contains_address(&addr) {
+                    continue;
+                }
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                let txout = dashcore::TxOut {
+                    value: output.value,
+                    script_pubkey: output.script_pubkey.clone(),
+                };
+                let block_height = context.block_info().map_or(0, |info| info.height);
+                let mut utxo = Utxo::new(outpoint, txout, addr, block_height, tx.is_coin_base());
+                utxo.is_confirmed = context.confirmed();
+                utxo.is_instantlocked = matches!(context, TransactionContext::InstantSend(_));
+                self.utxos.insert(outpoint, utxo);
+            }
+
+            for input in &tx.input {
+                self.spent_outpoints.insert(input.previous_output);
+                self.utxos.remove(&input.previous_output);
+            }
+        }
+
+        self.keys.bump_monitor_revision();
+    }
+
     /// Update the account balance.
     ///
     /// Mature, non-locked UTXOs land in either the `confirmed` bucket
