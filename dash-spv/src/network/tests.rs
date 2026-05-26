@@ -261,7 +261,9 @@ mod pool_tests {
 
         let reputation = manager.test_reputation_manager();
         for _ in 0..10 {
-            reputation.update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+            reputation
+                .update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse")
+                .await;
         }
         assert!(reputation.is_banned(&banned).await);
 
