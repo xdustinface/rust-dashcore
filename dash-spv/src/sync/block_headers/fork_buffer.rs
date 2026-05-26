@@ -841,4 +841,79 @@ mod tests {
         );
         assert!(buf.branches.contains_key(&(peer_a, first_tip)), "peer_a branch must be untouched");
     }
+
+    /// `take_branch_by_tip` removes the branch keyed by the given tip hash and
+    /// returns the corresponding `ForkCandidate` with the correct metadata.
+    #[test]
+    fn take_branch_by_tip_removes_and_returns_matching_branch() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 2, ancestor.block_hash());
+        let tip = fork.last().unwrap().block_hash();
+        buf.ingest(peer, &fork, ancestor_height, ancestor, &active).expect("ingest");
+        assert_eq!(buf.len(), 1);
+
+        let candidate = buf.take_branch_by_tip(&tip).expect("branch must be found");
+        assert_eq!(candidate.ancestor_height, ancestor_height);
+        assert_eq!(candidate.headers.len(), 2);
+        assert_eq!(buf.len(), 0, "branch must be removed after take");
+    }
+
+    /// `take_branch_by_tip` returns `None` when no branch ends at the given
+    /// tip hash, and leaves the buffer unchanged.
+    #[test]
+    fn take_branch_by_tip_returns_none_for_unknown_tip() {
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 1, ancestor.block_hash());
+        buf.ingest(peer, &fork, ancestor_height, ancestor, &active).expect("ingest");
+        assert_eq!(buf.len(), 1);
+
+        let unknown = BlockHash::from_byte_array([0xFF; 32]);
+        assert!(buf.take_branch_by_tip(&unknown).is_none(), "unknown tip must return None");
+        assert_eq!(buf.len(), 1, "buffer must be unchanged after miss");
+    }
+
+    /// When two branches from different peers share the same ancestor but have
+    /// different tip hashes, `take_branch_by_tip` removes only the targeted
+    /// branch and leaves the other intact.
+    #[test]
+    fn take_branch_by_tip_removes_only_targeted_branch() {
+        let peer_a: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let peer_b: SocketAddr = "5.6.7.8:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        // Two distinct 1-header forks from different peers: different nonce
+        // offsets guarantee distinct tip hashes.
+        let fork_a = build_chain(1_700_000_000 + 12 * 600, 1, ancestor.block_hash());
+        let fork_b = build_chain(1_700_000_000 + 24 * 600, 1, ancestor.block_hash());
+        let tip_a = fork_a[0].block_hash();
+        let tip_b = fork_b[0].block_hash();
+
+        buf.ingest(peer_a, &fork_a, ancestor_height, ancestor, &active).expect("ingest a");
+        buf.ingest(peer_b, &fork_b, ancestor_height, ancestor, &active).expect("ingest b");
+        assert_eq!(buf.len(), 2);
+
+        let candidate = buf.take_branch_by_tip(&tip_a).expect("branch a must be found");
+        assert_eq!(*candidate.headers.last().unwrap().hash(), tip_a, "returned candidate must be branch A");
+        assert_eq!(buf.len(), 1, "only branch A must be removed");
+        assert!(
+            buf.branches.contains_key(&(peer_b, tip_b)),
+            "branch B must remain in the buffer"
+        );
+    }
 }
