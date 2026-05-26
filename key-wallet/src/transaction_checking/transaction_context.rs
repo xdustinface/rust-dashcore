@@ -51,6 +51,11 @@ pub enum TransactionContext {
     /// double-spending transaction on the active chain. `previous`
     /// remembers the last confirmed-or-mempool context so the UI can
     /// surface what state the tx was in before the conflict.
+    ///
+    /// Invariant: `previous` must be an active context (`Mempool`,
+    /// `InstantSend`, `InBlock`, `InChainLockedBlock`) — never another
+    /// `Conflicted` or `Abandoned`. The type does not enforce this, so
+    /// constructors must uphold it.
     Conflicted {
         previous: Box<TransactionContext>,
     },
