@@ -124,7 +124,7 @@ impl ForkBuffer {
     /// headers. It is extended in place with each validated header so MTP
     /// and DGW v3 see the full window.
     ///
-    /// `prev_height` is the height of `prev`; the first validated header
+    /// `prev_height` is the height of `prev`. The first validated header
     /// lands at `prev_height + 1`. Pass `ancestor_height` for a fresh ingest
     /// and the branch's current tip height when extending an existing branch.
     fn validate_chain(
@@ -798,7 +798,7 @@ mod tests {
         buf.ingest(peer, &fork, ancestor_height, ancestor, &active).expect("ingest");
 
         // Build a header whose prev_blockhash points at the ancestor (the
-        // active-chain tip) instead of the branch tip — that is exactly the
+        // active-chain tip) instead of the branch tip, which is exactly the
         // shape of a dashd headers2 message arriving for the next reorg block
         // before the branch re-key happens. With `extend_branch`, this is a
         // ForkChainBreak because the buffered tip is `first_tip`, not ancestor.

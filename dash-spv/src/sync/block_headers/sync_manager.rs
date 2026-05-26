@@ -141,7 +141,7 @@ impl<
             // every connected peer has a chance to deliver the chainlocked
             // branch. The locator goes back from the current tip, so any peer
             // on the chainlocked branch will reply with headers from the
-            // first common ancestor — which will land in `ingest_fork` and
+            // first common ancestor, which will land in `ingest_fork` and
             // be force-promoted by `try_drive_forced_reorg`.
             let locator = self.build_locator().await?;
             if let Err(e) = requests.request_block_headers(locator) {

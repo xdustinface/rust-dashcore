@@ -489,7 +489,7 @@ impl FFISyncEventCallbacks {
             }
             // No FFI callbacks for the forced-reorg lifecycle events yet.
             // Consumers receive the resulting `ChainReorg` once the cascade
-            // completes; the intermediate signals stay internal.
+            // completes. The intermediate signals stay internal.
             SyncEvent::PendingChainLockQueued {
                 ..
             }
