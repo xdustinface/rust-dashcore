@@ -4,6 +4,7 @@ pub mod types;
 
 mod block_headers;
 mod blocks;
+mod consistency;
 mod filter_headers;
 mod filters;
 mod io;
@@ -136,6 +137,16 @@ impl DiskStorageManager {
 
             _lock_file: lock_file,
         };
+
+        consistency::check_and_repair_consistency(
+            &storage.storage_path,
+            &storage.block_headers,
+            &storage.filter_headers,
+            &storage.filters,
+            &storage.blocks,
+            &storage.metadata,
+        )
+        .await?;
 
         storage.start_worker().await;
 
