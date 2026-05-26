@@ -23,7 +23,7 @@ mod pool_tests {
     use crate::network::manager::PeerNetworkManager;
     use crate::network::peer::Peer;
     use crate::network::pool::PeerPool;
-    use crate::network::reputation::misbehavior_scores;
+    use crate::network::reputation::{misbehavior_scores, DisconnectReason};
     use crate::test_utils::test_socket_address;
     use dashcore::network::constants::ServiceFlags;
     use dashcore::Network;
@@ -229,6 +229,13 @@ mod pool_tests {
         assert!(evicted, "better incoming peer must trigger eviction");
         assert_eq!(manager.test_peer_count().await, TARGET_PEERS - 1, "pool must shrink by one");
         assert!(!manager.test_is_connected(&worst).await, "worst peer must be gone after eviction");
+
+        let reputations = reputation.get_all_reputations().await;
+        assert_eq!(
+            reputations[&worst].last_disconnect_reason,
+            Some(DisconnectReason::PoolFull),
+            "evicted peer must have PoolFull recorded as disconnect reason"
+        );
 
         // Re-fill to capacity for the guard-rejection scenario.
         let filler = test_socket_address(100);
