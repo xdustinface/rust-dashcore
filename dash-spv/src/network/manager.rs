@@ -1580,8 +1580,9 @@ impl PeerNetworkManager {
         }
         let candidates = self.pool.get_all_peers().await;
         let incoming_score = self.reputation_manager.get_score(&incoming_addr).await;
-        if let Some(victim) = self.reputation_manager.pick_worst(&candidates).await {
-            let victim_score = self.reputation_manager.get_score(&victim).await;
+        if let Some((victim, victim_score)) =
+            self.reputation_manager.pick_worst(&candidates).await
+        {
             if victim_score > incoming_score {
                 tracing::info!(
                     "Pool at capacity, evicting peer {} (score {}) for incoming peer {} (score {})",

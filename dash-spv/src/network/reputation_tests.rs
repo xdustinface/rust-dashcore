@@ -530,8 +530,9 @@ mod tests {
         manager.update_reputation(bad, 80, "bad").await;
 
         let peers = vec![(mild, ()), (bad, ()), (neutral, ())];
-        let victim = manager.pick_worst(&peers).await.expect("non-empty input");
+        let (victim, victim_score) = manager.pick_worst(&peers).await.expect("non-empty input");
         assert_eq!(victim, bad);
+        assert_eq!(victim_score, 80, "returned score must match the worst observed score");
     }
 
     #[tokio::test]
@@ -545,8 +546,9 @@ mod tests {
         manager.update_reputation(fresh, 30, "later abuse").await;
 
         let peers = vec![(stale, ()), (fresh, ())];
-        let victim = manager.pick_worst(&peers).await.expect("non-empty input");
+        let (victim, victim_score) = manager.pick_worst(&peers).await.expect("non-empty input");
         assert_eq!(victim, fresh, "tie at score 30 should pick the most recent offender");
+        assert_eq!(victim_score, 30, "returned score must match the tied worst score");
     }
 
     #[tokio::test]
@@ -555,12 +557,13 @@ mod tests {
         let a: SocketAddr = "127.0.0.1:8001".parse().unwrap();
         let b: SocketAddr = "127.0.0.1:8002".parse().unwrap();
         let peers = vec![(a, ()), (b, ())];
-        let victim =
+        let (victim, victim_score) =
             manager.pick_worst(&peers).await.expect("must return Some for non-empty input");
         assert!(
             victim == a || victim == b,
             "any peer is valid when scores are equal and no events exist"
         );
+        assert_eq!(victim_score, 0, "neutral peers must report score 0");
     }
 
     #[tokio::test]

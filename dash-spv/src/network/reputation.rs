@@ -455,8 +455,14 @@ impl PeerReputationManager {
     /// upward (higher = worse), so the worst reputation has the highest score.
     /// Ties at the worst score are broken by selecting the peer with the most
     /// recent negative reputation event so chronic offenders are preferred over
-    /// quiet peers. Returns `None` if `peers` is empty.
-    pub(crate) async fn pick_worst<T>(&self, peers: &[(SocketAddr, T)]) -> Option<SocketAddr> {
+    /// quiet peers. Returns the chosen peer together with the score observed
+    /// under the same lock acquisition that selected it, so callers can compare
+    /// against an incoming peer's score without racing a concurrent reputation
+    /// update. Returns `None` if `peers` is empty.
+    pub(crate) async fn pick_worst<T>(
+        &self,
+        peers: &[(SocketAddr, T)],
+    ) -> Option<(SocketAddr, i32)> {
         if peers.is_empty() {
             return None;
         }
@@ -486,7 +492,7 @@ impl PeerReputationManager {
             .collect();
 
         if tied.len() == 1 {
-            return Some(tied[0]);
+            return Some((tied[0], worst_score));
         }
 
         let mut latest_negative: HashMap<SocketAddr, Instant> = HashMap::new();
@@ -505,7 +511,11 @@ impl PeerReputationManager {
         }
         drop(events);
 
-        tied.into_iter().max_by_key(|addr| latest_negative.get(addr).copied()).or(Some(peers[0].0))
+        let victim = tied
+            .into_iter()
+            .max_by_key(|addr| latest_negative.get(addr).copied())
+            .unwrap_or(peers[0].0);
+        Some((victim, worst_score))
     }
 
     /// Compute weights for `peers` so that lower (better) scores yield higher weights.
