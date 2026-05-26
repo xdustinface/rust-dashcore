@@ -7,7 +7,7 @@ use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, OutPoint, Transaction, Txid};
 use key_wallet::transaction_checking::TransactionContext;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
@@ -44,6 +44,7 @@ pub struct MockWallet {
     pub processed_instant_locks: InstantLockCaptures,
     /// Monitor revision counter for staleness detection.
     monitor_revision: u64,
+    stored_transactions: HashMap<Txid, Transaction>,
 }
 
 impl Default for MockWallet {
@@ -71,7 +72,17 @@ impl MockWallet {
             status_changes: Arc::new(Mutex::new(Vec::new())),
             processed_instant_locks: Arc::new(Mutex::new(Vec::new())),
             monitor_revision: 0,
+            stored_transactions: HashMap::new(),
         }
+    }
+
+    pub fn insert_stored_transaction(&mut self, tx: Transaction) {
+        self.stored_transactions.insert(tx.txid(), tx);
+    }
+
+    /// Sender used to fire synthetic `WalletEvent`s from tests.
+    pub fn event_sender(&self) -> &broadcast::Sender<WalletEvent> {
+        &self.event_sender
     }
 
     /// Override the wallet id used for per-wallet API surfaces.
@@ -272,8 +283,8 @@ impl WalletInterface for MockWallet {
         Ok(RewindResult::default())
     }
 
-    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
-        None
+    async fn get_transaction(&self, txid: &Txid) -> Option<Transaction> {
+        self.stored_transactions.get(txid).cloned()
     }
 }
 
