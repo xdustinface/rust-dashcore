@@ -20,8 +20,8 @@ use crate::network::reputation::{
     misbehavior_scores, positive_scores, PeerReputationManager, ReputationAware,
 };
 use crate::network::{
-    HandshakeManager, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
-    NetworkRequest, Peer, RequestSender,
+    HandshakeManager, Message, MessageDispatcher, MessageType, MisbehaviorKind, NetworkEvent,
+    NetworkManager, NetworkRequest, Peer, RequestSender,
 };
 use crate::storage::{PeerStorage, PersistentPeerStorage, PersistentStorage};
 use async_trait::async_trait;
@@ -863,6 +863,18 @@ impl PeerNetworkManager {
                                     if let Err(e) = result {
                                         tracing::error!("Request processor: failed to send message to peer {}: {}", peer_address, e);
                                     }
+                                });
+                            }
+                            Some(NetworkRequest::ReportMisbehavior(peer, kind)) => {
+                                let (score, reason) = match kind {
+                                    MisbehaviorKind::InvalidChainLockSignature => (
+                                        misbehavior_scores::INVALID_CHAINLOCK,
+                                        "invalid ChainLock signature",
+                                    ),
+                                };
+                                let reputation_manager = this.reputation_manager.clone();
+                                tokio::spawn(async move {
+                                    reputation_manager.update_reputation(peer, score, reason).await;
                                 });
                             }
                             Some(NetworkRequest::BroadcastMessage(msg)) => {

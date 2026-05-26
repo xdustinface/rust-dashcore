@@ -40,6 +40,15 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 const FILTER_TYPE_DEFAULT: u8 = 0;
 
+/// Kinds of peer misbehavior the sync managers can report.
+///
+/// Translated to a reputation-score adjustment by the network manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MisbehaviorKind {
+    /// Peer delivered a CLSig whose BLS signature failed verification.
+    InvalidChainLockSignature,
+}
+
 /// Request to send to network.
 #[derive(Debug)]
 pub enum NetworkRequest {
@@ -49,6 +58,8 @@ pub enum NetworkRequest {
     SendMessageToPeer(NetworkMessage, SocketAddr),
     /// Broadcast a message to all connected peers.
     BroadcastMessage(NetworkMessage),
+    /// Apply a reputation penalty to a peer for protocol misbehavior.
+    ReportMisbehavior(SocketAddr, MisbehaviorKind),
 }
 
 /// Handle for managers to queue outgoing network requests.
@@ -180,6 +191,14 @@ impl RequestSender {
     /// Send a mempool message to request inventory from a specific peer.
     pub fn request_mempool(&self, peer: SocketAddr) -> NetworkResult<()> {
         self.send_message_to_peer(NetworkMessage::MemPool, peer)
+    }
+
+    /// Report a peer for protocol misbehavior. The network manager
+    /// translates the kind into a reputation-score adjustment.
+    pub fn report_misbehavior(&self, peer: SocketAddr, kind: MisbehaviorKind) -> NetworkResult<()> {
+        self.tx
+            .send(NetworkRequest::ReportMisbehavior(peer, kind))
+            .map_err(|e| NetworkError::ProtocolError(e.to_string()))
     }
 }
 

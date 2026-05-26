@@ -36,8 +36,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         msg: Message,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        let peer = msg.peer_address();
         match msg.inner() {
-            NetworkMessage::CLSig(chainlock) => self.process_chainlock(chainlock).await,
+            NetworkMessage::CLSig(chainlock) => {
+                self.process_chainlock(chainlock, Some(peer), requests).await
+            }
             NetworkMessage::Inv(inv) => {
                 // Check for ChainLock inventory items, filtering out already-requested ones
                 let chainlocks_to_request: Vec<Inventory> = inv
@@ -76,7 +79,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     async fn handle_sync_event(
         &mut self,
         event: &SyncEvent,
-        _requests: &RequestSender,
+        requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
         if let SyncEvent::ChainReorg {
             fork_height,
@@ -89,6 +92,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
             );
             self.reset_for_reorg();
             return Ok(vec![]);
+        }
+
+        if matches!(event, SyncEvent::BlockHeadersStored { .. }) {
+            return self.retry_pending_unknown_hash(requests).await;
         }
 
         // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
@@ -105,28 +112,18 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
             return Ok(vec![]);
         }
 
-        let chainlock = self.on_masternode_ready().await;
+        let events = self.on_masternode_ready().await;
         self.set_state(SyncState::Synced);
         tracing::info!("ChainLock manager synced (masternode data available)");
 
-        // Re-broadcast the best chainlock we know about so downstream
-        // consumers (e.g. the wallet manager's record promotion) learn
-        // pre-ready state without waiting for a fresh CLSig from the
-        // network. Covers both the persisted-from-disk case and a
-        // chainlock that arrived during initial sync but couldn't be
-        // validated until now.
-        if let Some(chain_lock) = chainlock {
-            return Ok(vec![SyncEvent::ChainLockReceived {
-                chain_lock,
-                validated: true,
-            }]);
-        }
-
-        Ok(vec![])
+        Ok(events)
     }
 
     async fn tick(&mut self, _requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
-        // No periodic work needed
+        let evicted = self.drain_expired_pending();
+        if evicted > 0 {
+            tracing::debug!("Evicted {} expired pending-unknown-hash chainlocks", evicted);
+        }
         Ok(vec![])
     }
 

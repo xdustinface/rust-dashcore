@@ -4,10 +4,12 @@
 //! regtest masternode network (1 controller + 4 masternodes with DKG cycles).
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use dash_spv::sync::{ProgressPercentage, SyncState};
+use dash_spv::sync::{ProgressPercentage, SyncEvent, SyncState};
 use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::sml::llmq_type::LLMQType;
+use tokio::time;
 
 use super::helpers::{
     assert_all_rotated_quorums_verified, wait_for_chain_reorg_event,
@@ -733,6 +735,112 @@ async fn test_qrinfo_refresh_across_dip24_cycle_reorg() {
             "replacement DKG must mint a different cycle key"
         );
     }
+
+    client_handle.stop().await;
+}
+
+/// EnforceBestChainLock end-to-end against the regtest masternode harness.
+///
+/// Walks the DIP-0008 forced-reorg path:
+///
+/// 1. Sync SPV with the masternode network and wait for a chainlock.
+/// 2. Drive `mine_reorg(4)` on the controller so the chainlocked block is
+///    orphaned and the controller mines 5 replacement blocks. The new tip
+///    is on a chain that disagrees with the prior CL'd block at the same
+///    height.
+/// 3. Wait for the masternode network to chainlock the new tip.
+/// 4. Observe the SPV emit `ChainReorg` for the forced reorg. The CL'd hash
+///    on the new branch is what `process_chainlock`'s `Mismatch` branch
+///    detects after the SPV first sees the new (lighter, in the worst
+///    case) branch's CLSig.
+///
+/// Marked `#[ignore]` because regtest CLSig re-delivery onto a peer that is
+/// already pinned to a different branch is timing-sensitive: the controller
+/// and the masternodes share a single mempool / chain state, so once
+/// `mine_reorg` succeeds the masternodes pivot too and the SPV gets the new
+/// branch through normal headers sync, not through the forced-reorg path.
+/// Reproducing a true CL-vs-local disagreement in regtest requires
+/// peer-network isolation that the current harness does not provide. See
+/// [#141](https://github.com/xdustinface/rust-dashcore/issues/141) for the
+/// follow-up that adds the peer isolation needed for a deterministic
+/// forced-reorg integration test.
+#[tokio::test]
+#[ignore = "see #141: needs peer-network isolation to drive a true CL-vs-local disagreement"]
+async fn test_chainlock_forced_reorg_end_to_end() {
+    let Some(mut ctx) = TestContext::new(true).await else {
+        return;
+    };
+
+    let wallet = create_dummy_wallet();
+    let config =
+        create_mn_test_config(ctx.storage_path().to_path_buf(), ctx.mn_ctx.controller_addr);
+    let mut client_handle = create_and_start_client(&config, Arc::clone(&wallet)).await;
+
+    let mn = wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    assert_eq!(mn.state(), SyncState::Synced);
+
+    wait_for_full_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+
+    // Initial chainlock.
+    let initial_cl_height = ctx
+        .mn_ctx
+        .mine_blocks_and_wait_for_chainlock(3, 60)
+        .expect("initial chainlock should be produced after DKG cycle completion");
+    let synced_cl = wait_for_chainlock_height_at_least(
+        &mut client_handle.progress_receiver,
+        initial_cl_height,
+        SYNC_TIMEOUT,
+    )
+    .await;
+    assert!(synced_cl >= initial_cl_height);
+    tracing::info!("Initial CL at height {}", initial_cl_height);
+
+    // Orphan the chainlocked block and mine a replacement chain heavier
+    // than the depth cap would normally tolerate.
+    let reorg_depth = 4;
+    let pre_reorg_tip = ctx.mn_ctx.controller.get_block_count();
+    let fork_height = pre_reorg_tip - reorg_depth;
+    let (orphaned, _replacement) = ctx.mn_ctx.mine_reorg(reorg_depth);
+    assert_eq!(orphaned.len(), reorg_depth as usize);
+
+    // The reorg may surface through the normal work-comparison path or the
+    // forced-reorg path depending on whether the SPV saw the orphaned CL
+    // first. Either way a `ChainReorg` event must fire and the new tip's
+    // CLSig must validate above `fork_height`.
+    let _ = wait_for_chain_reorg_event(
+        &mut client_handle.sync_event_receiver,
+        Some(fork_height),
+        SYNC_TIMEOUT,
+    )
+    .await;
+
+    let new_cl_height = ctx
+        .mn_ctx
+        .mine_blocks_and_wait_for_chainlock(3, 60)
+        .expect("post-reorg chainlock should be produced");
+    let resynced_cl = wait_for_chainlock_height_at_least(
+        &mut client_handle.progress_receiver,
+        new_cl_height,
+        SYNC_TIMEOUT,
+    )
+    .await;
+    assert!(resynced_cl >= new_cl_height, "SPV must catch back up to the post-reorg CL height");
+
+    // Drain any remaining events briefly to make sure no late `ManagerError`
+    // surfaces.
+    let drain = time::timeout(Duration::from_millis(500), async {
+        while let Ok(event) = client_handle.sync_event_receiver.recv().await {
+            if let SyncEvent::ManagerError {
+                manager,
+                error,
+            } = event
+            {
+                panic!("unexpected ManagerError from {}: {}", manager, error);
+            }
+        }
+    })
+    .await;
+    let _ = drain;
 
     client_handle.stop().await;
 }

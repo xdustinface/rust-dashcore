@@ -487,6 +487,15 @@ impl FFISyncEventCallbacks {
                     cb(*fork_height, *depth, self.user_data);
                 }
             }
+            // No FFI callbacks for the forced-reorg lifecycle events yet.
+            // Consumers receive the resulting `ChainReorg` once the cascade
+            // completes. The intermediate signals stay internal.
+            SyncEvent::PendingChainLockQueued {
+                ..
+            }
+            | SyncEvent::ChainLockForcedReorg {
+                ..
+            } => {}
         }
     }
 }

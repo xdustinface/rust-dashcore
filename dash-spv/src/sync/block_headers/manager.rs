@@ -29,6 +29,7 @@ use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
 use dashcore::block::Header;
 use dashcore::consensus::Params;
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::network::message_blockdata::Inventory;
 use dashcore::{BlockHash, Network};
 use tokio::sync::RwLock;
@@ -97,6 +98,11 @@ pub struct BlockHeadersManager<
     /// Headers seen on a chainlocked-conflicting fork. Recorded for
     /// monitoring without penalizing the peer.
     pub(super) side_headers: Vec<(u32, BlockHash)>,
+    /// A validated `ChainLockForcedReorg` waiting for the chainlocked branch
+    /// headers to arrive. Once a `headers2` batch produces a tip matching the
+    /// stored chainlock's `block_hash`, the cascade is force-driven through
+    /// `drive_reorg(force: true)`. Cleared on success or on coordinator reset.
+    pub(super) cl_forced_reorg_pending: Option<ChainLock>,
 }
 
 impl<
@@ -172,6 +178,7 @@ impl<
             chainlock_height,
             reorg_state: Arc::new(Mutex::new(ReorgState::default())),
             side_headers: Vec::new(),
+            cl_forced_reorg_pending: None,
         })
     }
 
@@ -185,9 +192,13 @@ impl<
     }
 
     /// Drive the reorg cascade for a buffered fork candidate.
+    ///
+    /// `force` skips the depth cap. Used by the `ChainLockForcedReorg` path so
+    /// a validated CLSig can override a deeper-than-`MAX_REORG_DEPTH` rewrite.
     pub(super) async fn drive_reorg(
         &mut self,
         candidate: ForkCandidate,
+        force: bool,
     ) -> SyncResult<Option<SyncEvent>> {
         let current_tip = self.tip().await?;
         let current_tip_height = current_tip.height();
@@ -207,6 +218,7 @@ impl<
             self.best_chainlock_height(),
             current_tip_height,
             current_tip_hash,
+            force,
         )
         .await
     }
@@ -240,26 +252,39 @@ impl<
         // cl_height) diverges at cl_height+1 and does not rewrite any
         // finalized block, so it is still eligible for the normal fork path.
         // The peer is not banned, just observed.
-        if let Some(cl_height) = self.best_chainlock_height() {
-            if is_below_chainlock_floor(ancestor_height, cl_height) {
-                tracing::warn!(
-                    "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
-                    peer,
-                    ancestor_height,
-                    cl_height
-                );
-                let incoming = headers.len();
-                let cap = Self::MAX_SIDE_HEADERS;
-                if self.side_headers.len() + incoming > cap {
-                    let excess = (self.side_headers.len() + incoming)
-                        .saturating_sub(cap)
-                        .min(self.side_headers.len());
-                    self.side_headers.drain(..excess);
+        //
+        // Exception: when a `ChainLockForcedReorg` is pending and the incoming
+        // batch lands on the chainlocked branch (its tip matches the pending
+        // chainlock's `block_hash`), the chainlock-floor side-list is bypassed
+        // so the fork buffer can take ownership of the headers and the cascade
+        // can force-drive the reorg.
+        let on_forced_branch = self
+            .cl_forced_reorg_pending
+            .as_ref()
+            .zip(headers.last())
+            .is_some_and(|(cl, last)| cl.block_hash == last.block_hash());
+        if !on_forced_branch {
+            if let Some(cl_height) = self.best_chainlock_height() {
+                if is_below_chainlock_floor(ancestor_height, cl_height) {
+                    tracing::warn!(
+                        "flagging chainlock-conflicting fork from {} at ancestor {} (chainlock {})",
+                        peer,
+                        ancestor_height,
+                        cl_height
+                    );
+                    let incoming = headers.len();
+                    let cap = Self::MAX_SIDE_HEADERS;
+                    if self.side_headers.len() + incoming > cap {
+                        let excess = (self.side_headers.len() + incoming)
+                            .saturating_sub(cap)
+                            .min(self.side_headers.len());
+                        self.side_headers.drain(..excess);
+                    }
+                    for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
+                        self.side_headers.push((height, h.block_hash()));
+                    }
+                    return Ok(());
                 }
-                for (height, h) in (ancestor_height + 1..).zip(headers.iter()) {
-                    self.side_headers.push((height, h.block_hash()));
-                }
-                return Ok(());
             }
         }
 
@@ -383,6 +408,36 @@ impl<
         Ok(())
     }
 
+    /// If a `ChainLockForcedReorg` is pending and the fork buffer holds a
+    /// branch ending at the chainlocked block, force-drive the cascade.
+    ///
+    /// Bypasses `take_winning_candidate`'s work-superiority check because a
+    /// validated CLSig overrides chain work. Bypasses the depth cap by
+    /// passing `force: true` to `drive_reorg`. Other guards (checkpoint
+    /// floor, single-flight, deny-list) still apply.
+    pub(super) async fn try_drive_forced_reorg(&mut self) -> SyncResult<Option<SyncEvent>> {
+        let Some(cl) = self.cl_forced_reorg_pending.as_ref() else {
+            return Ok(None);
+        };
+        let target_tip = cl.block_hash;
+        let Some(candidate) = self.fork_buffer.take_branch_by_tip(&target_tip) else {
+            return Ok(None);
+        };
+        self.fork_tip_index.remove(&target_tip);
+        tracing::info!(
+            "driving forced reorg for chainlock at height {} (ancestor {}, {} headers)",
+            cl.block_height,
+            candidate.ancestor_height,
+            candidate.headers.len()
+        );
+        let event = self.drive_reorg(candidate, true).await?;
+        // Clear on success or on a definitive guard rejection. The field stays
+        // set only when the branch hasn't arrived yet (early return above),
+        // keeping the retry trigger alive for future header batches.
+        self.cl_forced_reorg_pending = None;
+        Ok(event)
+    }
+
     /// Remove `fork_tip_index` entries whose branch no longer exists in the buffer.
     pub(super) fn prune_fork_tip_index(&mut self) {
         let live_tips: HashSet<BlockHash> = self.fork_buffer.branch_tip_hashes().copied().collect();
@@ -477,7 +532,8 @@ impl<
             if let Some(prev_h) = prev_height {
                 if prev_h < tip_height {
                     self.ingest_fork(peer, headers, prev_h).await?;
-                    return Ok(Vec::new());
+                    let forced = self.try_drive_forced_reorg().await?;
+                    return Ok(forced.into_iter().collect());
                 }
             } else if let Some(&ancestor_height) = self.fork_tip_index.get(&first.prev_blockhash) {
                 // prev_blockhash is a fork tip, not on the active chain.
@@ -486,7 +542,8 @@ impl<
                 // `headers2`) accumulate into a single candidate.
                 let prev_tip = first.prev_blockhash;
                 self.extend_fork(peer, prev_tip, ancestor_height, headers).await?;
-                return Ok(Vec::new());
+                let forced = self.try_drive_forced_reorg().await?;
+                return Ok(forced.into_iter().collect());
             }
         }
 
@@ -629,6 +686,7 @@ mod tests {
     };
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::block::Version;
+    use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::network::message::NetworkMessage;
     use dashcore::{CompactTarget, TxMerkleNode};
     use dashcore_hashes::Hash;
@@ -1357,7 +1415,7 @@ mod tests {
             .expect("fork should win against zero active work");
 
         let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
-        let event = manager.drive_reorg(candidate).await.unwrap().expect("ChainReorg event");
+        let event = manager.drive_reorg(candidate, false).await.unwrap().expect("ChainReorg event");
         match event {
             SyncEvent::ChainReorg {
                 fork_height,
@@ -1446,7 +1504,7 @@ mod tests {
             total_work: crate::chain::ChainWork::zero(),
         };
 
-        let result = manager.drive_reorg(candidate).await.unwrap();
+        let result = manager.drive_reorg(candidate, false).await.unwrap();
         assert!(result.is_none(), "guard-rejected candidate must return None");
         assert_eq!(
             manager.reorg_generation.load(Ordering::Acquire),
@@ -1500,7 +1558,7 @@ mod tests {
             total_work: crate::chain::ChainWork::zero(),
         };
 
-        let result = manager.drive_reorg(candidate).await.unwrap();
+        let result = manager.drive_reorg(candidate, false).await.unwrap();
         assert!(
             result.is_some(),
             "fork anchored at chainlocked height must not be rejected by the chainlock floor guard"
@@ -1580,5 +1638,177 @@ mod tests {
         assert_eq!(candidate.ancestor_height, 4);
         assert_eq!(candidate.headers.len(), 4);
         assert_eq!(*candidate.headers.last().unwrap().hash(), final_fork_tip);
+    }
+
+    /// `ChainLockForcedReorg` drives a cascade even when the buffered fork
+    /// branch is lighter than the active extension (no work-superiority
+    /// check) and even when the active extension exceeds the depth cap
+    /// (`force: true` bypasses it). Verifies that `try_drive_forced_reorg`
+    /// returns `Some(ChainReorg)` after the headers land, the cascade bumps
+    /// the generation, and storage reflects the chainlocked branch.
+    #[tokio::test]
+    async fn chainlock_forced_reorg_drives_cascade_for_lighter_branch() {
+        use dashcore::bls_sig_utils::BLSSignature;
+        use dashcore::ephemerealdata::chain_lock::ChainLock;
+
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Build a 2-header fork extending chain[5] (lighter than the
+        // 3-header active extension at heights 6,7,8 minus 5 = heights 6-7).
+        let ancestor = chain[5];
+        let mut prev = ancestor.block_hash();
+        let mut fork_headers: Vec<Header> = Vec::new();
+        for i in 0..2u32 {
+            let time = ancestor.time + 11 * 600 + 1 + i * 600;
+            let mut header = None;
+            for nonce in 0u32..64 {
+                let h = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: easy_bits,
+                    nonce,
+                };
+                if h.target().is_met_by(h.block_hash()) {
+                    header = Some(h);
+                    break;
+                }
+            }
+            let h = header.expect("nonce space exhausted");
+            prev = h.block_hash();
+            fork_headers.push(h);
+        }
+        let new_tip_hash = fork_headers.last().unwrap().block_hash();
+
+        // Plant the forced-reorg pending entry: a chainlock at the fork tip.
+        // fork_height = cl_height - 1, so CL height = 7 ⇒ fork ancestor = 5.
+        manager.cl_forced_reorg_pending = Some(ChainLock {
+            block_height: 7,
+            block_hash: new_tip_hash,
+            signature: BLSSignature::from([0u8; 96]),
+        });
+
+        let initial_gen = manager.reorg_generation.load(Ordering::Acquire);
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let (sender, _rx) = create_test_request_sender();
+        let events = manager.handle_headers_pipeline(&fork_headers, peer, &sender).await.unwrap();
+
+        // The cascade fired through the forced-reorg helper, producing a
+        // `ChainReorg` event even though the fork is lighter than the active
+        // extension. `take_winning_candidate`'s work check is bypassed by
+        // `take_branch_by_tip`.
+        assert_eq!(events.len(), 1, "forced cascade must surface a ChainReorg event");
+        match &events[0] {
+            SyncEvent::ChainReorg {
+                fork_height,
+                new_tip,
+                ..
+            } => {
+                assert_eq!(*fork_height, 5);
+                assert_eq!(*new_tip, new_tip_hash);
+            }
+            other => panic!("expected ChainReorg, got {:?}", other),
+        }
+        assert_eq!(
+            manager.reorg_generation.load(Ordering::Acquire),
+            initial_gen + 1,
+            "forced cascade must bump generation"
+        );
+        assert!(manager.cl_forced_reorg_pending.is_none(), "pending CL must be cleared on success");
+        assert!(manager.side_headers.is_empty(), "forced fork must not be side-listed");
+
+        let new_tip = manager.tip().await.unwrap();
+        assert_eq!(*new_tip.hash(), new_tip_hash);
+    }
+
+    /// `on_disconnect` must clear `cl_forced_reorg_pending`. A pending forced
+    /// reorg is peer-specific: after a disconnect the branch that carried the
+    /// chainlocked chain is gone and any cached tip hash must not drive a reorg
+    /// against a different branch that happens to share the same tip hash on
+    /// reconnect.
+    #[tokio::test]
+    async fn cl_forced_reorg_pending_cleared_on_disconnect() {
+        let mut manager = create_synced_manager().await;
+
+        manager.cl_forced_reorg_pending = Some(ChainLock {
+            block_height: 10,
+            block_hash: BlockHash::from_byte_array([0xAB; 32]),
+            signature: BLSSignature::from([0u8; 96]),
+        });
+        assert!(manager.cl_forced_reorg_pending.is_some());
+
+        manager.on_disconnect();
+
+        assert!(
+            manager.cl_forced_reorg_pending.is_none(),
+            "on_disconnect must clear cl_forced_reorg_pending"
+        );
+    }
+
+    /// `try_drive_forced_reorg` must clear `cl_forced_reorg_pending` when
+    /// the cascade is definitively blocked (guard rejection returns `None`).
+    /// Here the candidate is placed directly in the fork buffer but the
+    /// deny-list rejects it, so `drive_reorg` returns `None` and the
+    /// pending field must be cleared.
+    #[tokio::test]
+    async fn cl_forced_reorg_pending_cleared_when_guard_blocks() {
+        // Chain of 8: heights 0-7, tip at 7. Fork off ancestor at 5 so the
+        // active extension (6,7) is non-empty and `ingest_fork` can compute
+        // active work without hitting the empty-range assertion in storage.
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Build one fork header off ancestor at height 5.
+        let ancestor = chain[5];
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let mut fork_header = None;
+        let fork_time = ancestor.time + 11 * 600 + 1;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: fork_time,
+                bits: easy_bits,
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce space exhausted");
+        let fork_tip_hash = fork_header.block_hash();
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        manager.ingest_fork(peer, &[fork_header], 5).await.unwrap();
+
+        // Pre-populate the deny-list for the fork tip so `drive_reorg` returns
+        // `None` without cascading. The deny-list check runs before any storage
+        // mutation, so no truncation occurs.
+        manager.reorg_state.lock().await.deny_list.insert(fork_tip_hash, u32::MAX);
+        manager.cl_forced_reorg_pending = Some(ChainLock {
+            block_height: 6,
+            block_hash: fork_tip_hash,
+            signature: BLSSignature::from([0u8; 96]),
+        });
+
+        let event = manager.try_drive_forced_reorg().await.unwrap();
+        assert!(event.is_none(), "deny-listed candidate must not produce a ChainReorg event");
+        assert!(
+            manager.cl_forced_reorg_pending.is_none(),
+            "cl_forced_reorg_pending must be cleared even when the cascade is guard-blocked"
+        );
     }
 }
