@@ -431,9 +431,10 @@ impl<
             candidate.headers.len()
         );
         let event = self.drive_reorg(candidate, true).await?;
-        if matches!(event, Some(SyncEvent::ChainReorg { .. })) {
-            self.cl_forced_reorg_pending = None;
-        }
+        // Clear on success or on a definitive guard rejection. The field stays
+        // set only when the branch hasn't arrived yet (early return above),
+        // keeping the retry trigger alive for future header batches.
+        self.cl_forced_reorg_pending = None;
         Ok(event)
     }
 
@@ -685,6 +686,7 @@ mod tests {
     };
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::block::Version;
+    use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::network::message::NetworkMessage;
     use dashcore::{CompactTarget, TxMerkleNode};
     use dashcore_hashes::Hash;
@@ -1724,5 +1726,94 @@ mod tests {
 
         let new_tip = manager.tip().await.unwrap();
         assert_eq!(*new_tip.hash(), new_tip_hash);
+    }
+
+    /// `on_disconnect` must clear `cl_forced_reorg_pending`. A pending forced
+    /// reorg is peer-specific: after a disconnect the branch that carried the
+    /// chainlocked chain is gone and any cached tip hash must not drive a reorg
+    /// against a different branch that happens to share the same tip hash on
+    /// reconnect.
+    #[tokio::test]
+    async fn cl_forced_reorg_pending_cleared_on_disconnect() {
+        let mut manager = create_synced_manager().await;
+
+        manager.cl_forced_reorg_pending = Some(ChainLock {
+            block_height: 10,
+            block_hash: BlockHash::from_byte_array([0xAB; 32]),
+            signature: BLSSignature::from([0u8; 96]),
+        });
+        assert!(manager.cl_forced_reorg_pending.is_some());
+
+        manager.on_disconnect();
+
+        assert!(
+            manager.cl_forced_reorg_pending.is_none(),
+            "on_disconnect must clear cl_forced_reorg_pending"
+        );
+    }
+
+    /// `try_drive_forced_reorg` must clear `cl_forced_reorg_pending` when
+    /// the cascade is definitively blocked (guard rejection returns `None`).
+    /// Here the candidate is placed directly in the fork buffer but the
+    /// deny-list rejects it, so `drive_reorg` returns `None` and the
+    /// pending field must be cleared.
+    #[tokio::test]
+    async fn cl_forced_reorg_pending_cleared_when_guard_blocks() {
+        // Chain of 8: heights 0-7, tip at 7. Fork off ancestor at 5 so the
+        // active extension (6,7) is non-empty and `ingest_fork` can compute
+        // active work without hitting the empty-range assertion in storage.
+        let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
+        let tip = manager.tip().await.unwrap();
+        let tip_hash = *tip.hash();
+        manager.pipeline.init(0, tip_hash, tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+
+        // Build one fork header off ancestor at height 5.
+        let ancestor = chain[5];
+        let easy_bits = CompactTarget::from_consensus(0x207fffff);
+        let mut fork_header = None;
+        let fork_time = ancestor.time + 11 * 600 + 1;
+        for nonce in 0u32..64 {
+            let h = Header {
+                version: Version::ONE,
+                prev_blockhash: ancestor.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: fork_time,
+                bits: easy_bits,
+                nonce,
+            };
+            if h.target().is_met_by(h.block_hash()) {
+                fork_header = Some(h);
+                break;
+            }
+        }
+        let fork_header = fork_header.expect("nonce space exhausted");
+        let fork_tip_hash = fork_header.block_hash();
+
+        let peer: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        manager.ingest_fork(peer, &[fork_header], 5).await.unwrap();
+
+        // Pre-populate the deny-list for the fork tip so `drive_reorg` returns
+        // `None` without cascading. The deny-list check runs before any storage
+        // mutation, so no truncation occurs.
+        manager
+            .reorg_state
+            .lock()
+            .await
+            .deny_list
+            .insert(fork_tip_hash, u32::MAX);
+        manager.cl_forced_reorg_pending = Some(ChainLock {
+            block_height: 6,
+            block_hash: fork_tip_hash,
+            signature: BLSSignature::from([0u8; 96]),
+        });
+
+        let event = manager.try_drive_forced_reorg().await.unwrap();
+        assert!(event.is_none(), "deny-listed candidate must not produce a ChainReorg event");
+        assert!(
+            manager.cl_forced_reorg_pending.is_none(),
+            "cl_forced_reorg_pending must be cleared even when the cascade is guard-blocked"
+        );
     }
 }

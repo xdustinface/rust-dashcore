@@ -57,6 +57,11 @@ impl<
         self.pipeline.clear_in_flight();
         self.pending_announcements.clear();
         self.announced_peers.clear();
+        // A pending forced-reorg is peer-specific: if the peer that held the
+        // chainlocked branch disconnects, a stale pending CL must not drive a
+        // reorg against a different branch that happens to share the tip hash
+        // on the next reconnect.
+        self.cl_forced_reorg_pending = None;
     }
 
     async fn start_sync(&mut self, requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
