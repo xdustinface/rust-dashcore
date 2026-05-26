@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::error::StorageResult;
 use crate::storage::{
-    BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage,
+    BlockHeaderStorage, BlockStorage, FilterHeaderStorage, FilterStorage, MetadataStorage,
     PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
     PersistentFilterStorage, PersistentMetadataStorage, PersistentStorage,
 };
@@ -32,6 +32,49 @@ pub(crate) async fn check_and_repair_consistency(
     blocks: &Arc<RwLock<PersistentBlockStorage>>,
     metadata: &Arc<RwLock<PersistentMetadataStorage>>,
 ) -> StorageResult<()> {
+    // Sentinel branch: a previous run crashed mid-cascade between the
+    // generation bump and the final clear. Recover by recomputing the
+    // highest header whose parent chains correctly back through the
+    // hash index, then truncate every storage to that safe tip.
+    if metadata.read().await.is_reorg_sentinel_set() {
+        let safe_tip = block_headers.read().await.highest_valid_tip().await;
+        match safe_tip {
+            Some(safe_tip) => {
+                tracing::warn!(
+                    "consistency: reorg sentinel set, truncating all storages to safe tip {}",
+                    safe_tip
+                );
+                {
+                    let mut guard = block_headers.write().await;
+                    guard.truncate_above(safe_tip).await?;
+                    guard.persist(storage_path).await?;
+                }
+                {
+                    let mut guard = filter_headers.write().await;
+                    guard.truncate_above(safe_tip).await?;
+                    guard.persist(storage_path).await?;
+                }
+                {
+                    let mut guard = filters.write().await;
+                    guard.truncate_above(safe_tip).await?;
+                    guard.persist(storage_path).await?;
+                }
+                {
+                    let mut guard = blocks.write().await;
+                    guard.truncate_above(safe_tip).await?;
+                    guard.persist(storage_path).await?;
+                }
+                metadata.write().await.clear_reorg_sentinel().await?;
+            }
+            None => {
+                tracing::warn!(
+                    "consistency: reorg sentinel set but no headers available, clearing sentinel"
+                );
+                metadata.write().await.clear_reorg_sentinel().await?;
+            }
+        }
+    }
+
     let block_tip = block_headers.read().await.get_tip_height().await;
     let block_tip = match block_tip {
         Some(h) => h,
@@ -106,9 +149,6 @@ pub(crate) async fn check_and_repair_consistency(
             }
         }
     }
-
-    // Drop unused parameter warnings (metadata used by callers in a later commit).
-    let _ = metadata;
 
     Ok(())
 }
