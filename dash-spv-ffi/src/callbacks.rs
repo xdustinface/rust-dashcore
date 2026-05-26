@@ -1207,6 +1207,14 @@ impl FFIWalletEventCallbacks {
                     cb(c_wallet_id.as_ptr(), *height, self.user_data);
                 }
             }
+            WalletEvent::Reorg {
+                ..
+            } => {
+                // TODO(issue #145): wire a dedicated FFI callback for
+                // wallet rewind so durable consumers see demoted /
+                // conflicted txid lists and the post-rewind balance.
+                // Until then this variant has no surface on the C ABI.
+            }
             WalletEvent::ChainLockProcessed {
                 wallet_id,
                 chain_lock,
