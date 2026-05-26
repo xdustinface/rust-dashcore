@@ -600,6 +600,9 @@ impl ManagedCoreFundsAccount {
             let txid = tx.txid();
             let context = &record.context;
 
+            let has_owned_input =
+                tx.input.iter().any(|input| self.spent_outpoints.contains(&input.previous_output));
+
             for (vout, output) in tx.output.iter().enumerate() {
                 let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
                     continue;
@@ -611,6 +614,19 @@ impl ManagedCoreFundsAccount {
                     txid,
                     vout: vout as u32,
                 };
+                // Order-independence: a record processed earlier in the
+                // sort may have already claimed this outpoint as spent.
+                // Inserting now would resurrect a spent UTXO into the
+                // spendable set.
+                if self.spent_outpoints.contains(&outpoint) {
+                    continue;
+                }
+                let is_change = self
+                    .keys
+                    .managed_account_type()
+                    .address_pools()
+                    .iter()
+                    .any(|pool| pool.is_internal() && pool.contains_address(&addr));
                 let txout = dashcore::TxOut {
                     value: output.value,
                     script_pubkey: output.script_pubkey.clone(),
@@ -619,6 +635,7 @@ impl ManagedCoreFundsAccount {
                 let mut utxo = Utxo::new(outpoint, txout, addr, block_height, tx.is_coin_base());
                 utxo.is_confirmed = context.confirmed();
                 utxo.is_instantlocked = matches!(context, TransactionContext::InstantSend(_));
+                utxo.is_trusted = has_owned_input && is_change;
                 self.utxos.insert(outpoint, utxo);
             }
 
