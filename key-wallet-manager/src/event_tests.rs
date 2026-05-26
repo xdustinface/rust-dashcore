@@ -1370,6 +1370,69 @@ async fn test_rewind_cascades_to_descendant_in_same_account() {
 }
 
 #[tokio::test]
+async fn test_rewind_cascades_three_levels() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+
+    let tx_a = create_tx_paying_to(&addr, 0xd0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xd0, 100), 11, &wallets)
+        .await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xd1, 200), 12, &wallets)
+        .await;
+
+    let tx_c = spend_from(tx_b.txid(), 0, &addr, TX_AMOUNT / 4);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_c.clone()], 0xd2, 300), 13, &wallets)
+        .await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    // Wave 2 of the frontier cascade only fires if wave 1 propagated the
+    // newly-demoted parent into the next frontier. A regression that drops
+    // descendants beyond the first hop would still pass the two-level test
+    // above but fail here.
+    assert!(demoted.contains(&tx_a.txid()), "grandparent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "parent must cascade (wave 1)");
+    assert!(demoted.contains(&tx_c.txid()), "child must cascade (wave 2)");
+}
+
+#[tokio::test]
+async fn test_rewind_restores_is_trusted_on_mempool_change() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let (_, _, change_addr) = pool_state(&manager, &wallet_id, AddressPoolType::Internal);
+
+    let tx_a = create_tx_paying_to(&addr, 0xe0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xe0, 100), 11, &wallets)
+        .await;
+
+    // tx_b spends the wallet's UTXO from tx_a and pays change back to our
+    // own internal pool: after rewind tx_b ends up in mempool, so the
+    // change output is a trusted-change UTXO that must be credited to
+    // `confirmed()`, not `unconfirmed()`.
+    let tx_b = spend_from(tx_a.txid(), 0, &change_addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xe1, 200), 12, &wallets)
+        .await;
+
+    manager.rewind_to_height(10).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    assert_eq!(
+        balance.confirmed(),
+        TX_AMOUNT / 2,
+        "trusted mempool change must be credited to confirmed() after rebuild (got {balance:?})",
+    );
+    assert_eq!(balance.unconfirmed(), 0, "no untrusted mempool outputs remain");
+}
+
+#[tokio::test]
 async fn test_rewind_retains_instant_send_record() {
     let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
     let tx = create_tx_paying_to(&addr, 0xd3);
