@@ -185,6 +185,7 @@ async fn spending_tx_going_inactive_releases_input_outpoint() {
 /// `spent_outpoints`. Otherwise a round-trip would re-mark the funded outpoint
 /// as spent and the funding UTXO could not be re-tracked after its consumer
 /// has been abandoned.
+#[cfg(feature = "serde")]
 #[tokio::test]
 async fn serde_round_trip_does_not_resurrect_inactive_spent_outpoints() {
     let (mut ctx, funding_tx) = funded_in_block().await;
