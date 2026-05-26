@@ -1353,6 +1353,20 @@ async fn test_rewind_cascades_to_descendant_in_same_account() {
 
     let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
     assert_eq!(info.last_processed_height(), 10);
+
+    // Rewind to Mempool leaves the child still spending the parent's
+    // output, so only the child's own output reaches the spendable
+    // set. Without `rebuild_utxos`'s order-independent spent-outpoint
+    // guard the child's output could be wrongly resurrected as still
+    // spent, or the parent's output wrongly resurrected as spendable,
+    // depending on txid sort order.
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 2,
+        "after rewind the child still spends the parent in mempool, only the child's output is a UTXO (got balance {balance:?})",
+    );
 }
 
 #[tokio::test]
@@ -1432,6 +1446,7 @@ async fn test_rewind_below_current_does_not_advance_heights_upward() {
     let block = make_block(vec![], 0xef, 100);
     manager.process_block_for_wallets(&block, 100, &wallets).await;
 
+    let mut rx = manager.subscribe_events();
     manager.rewind_to_height(1000).await.expect("rewind succeeds");
 
     let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
@@ -1440,6 +1455,12 @@ async fn test_rewind_below_current_does_not_advance_heights_upward() {
         100,
         "rewinding to a height above current must not advance the wallet forward",
     );
+
+    let reorg_events: Vec<_> = drain_events(&mut rx)
+        .into_iter()
+        .filter(|e| matches!(e, WalletEvent::Reorg { .. }))
+        .collect();
+    assert!(reorg_events.is_empty(), "no-op rewind must not emit Reorg, got {reorg_events:?}",);
 }
 
 #[tokio::test]
