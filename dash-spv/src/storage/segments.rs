@@ -102,8 +102,7 @@ impl<I: Persistable> SegmentCache<I> {
 
         // Building the metadata
         if let Ok(entries) = fs::read_dir(&segments_dir) {
-            let mut max_seg_id = None;
-            let mut min_seg_id = None;
+            let mut segment_ids: Vec<u32> = Vec::new();
 
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
@@ -114,24 +113,58 @@ impl<I: Persistable> SegmentCache<I> {
                         let segment_id_end = segment_id_start + 4;
 
                         if let Ok(id) = name[segment_id_start..segment_id_end].parse::<u32>() {
-                            max_seg_id = Some(max_seg_id.map_or(id, |max: u32| max.max(id)));
-                            min_seg_id = Some(min_seg_id.map_or(id, |min: u32| min.min(id)));
+                            segment_ids.push(id);
                         }
                     }
                 }
             }
+            segment_ids.sort_unstable();
 
-            if let Some(segment_id) = max_seg_id {
+            let max_readable_id = {
+                let mut result = None;
+                for id in segment_ids.iter().rev() {
+                    match cache.get_segment(id).await {
+                        Ok(_) => {
+                            result = Some(*id);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "SegmentCache: dropping unreadable segment {} ({}), truncating cache to last readable segment",
+                                id,
+                                e
+                            );
+                        }
+                    }
+                }
+                result
+            };
+
+            if let Some(segment_id) = max_readable_id {
                 let segment = cache.get_segment(&segment_id).await?;
-
                 cache.tip_height = segment
                     .last_valid_offset()
                     .map(|offset| Self::segment_id_to_start_height(segment_id) + offset);
             }
 
-            if let Some(segment_id) = min_seg_id {
-                let segment = cache.get_segment(&segment_id).await?;
+            // Walk forward from the lowest id to find the first readable
+            // segment for start_height. Unreadable lower segments are skipped
+            // to mirror the truncation behaviour above.
+            let mut min_readable_id = None;
+            for id in segment_ids.iter() {
+                if let Some(max) = max_readable_id {
+                    if *id > max {
+                        break;
+                    }
+                }
+                if cache.get_segment(id).await.is_ok() {
+                    min_readable_id = Some(*id);
+                    break;
+                }
+            }
 
+            if let Some(segment_id) = min_readable_id {
+                let segment = cache.get_segment(&segment_id).await?;
                 cache.start_height = segment
                     .first_valid_offset()
                     .map(|offset| Self::segment_id_to_start_height(segment_id) + offset);
@@ -1067,6 +1100,48 @@ mod tests {
             reloaded.get_items(ITEMS_PER_SEGMENT + 6..ITEMS_PER_SEGMENT + 16).await.unwrap(),
             replacement
         );
+    }
+
+    /// A corrupted highest segment is logged and dropped; the cache reopens
+    /// with the tip pointing at the last readable segment. The corruption
+    /// uses a non-minimal `VarInt` prefix (`0xFD 0x01 0x00`) which makes
+    /// `consensus_decode` return `Error::NonMinimalVarInt` instead of the
+    /// EOF break case `Segment::load` would tolerate.
+    #[tokio::test]
+    async fn test_load_or_new_truncates_on_corrupt_segment() {
+        let tmp_dir = TempDir::new().unwrap();
+
+        let mut cache = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+        for height in 0..10u32 {
+            cache.store_items_at_height(&[vec![height as u8; 4]], height).await.unwrap();
+        }
+        cache.persist(tmp_dir.path()).await;
+
+        // Force segment 1's existence by storing an item in it, then persist
+        // to materialise the file before corrupting.
+        cache
+            .store_items_at_height(&[vec![0xAA; 4]], Segment::<Vec<u8>>::ITEMS_PER_SEGMENT)
+            .await
+            .unwrap();
+        cache.persist(tmp_dir.path()).await;
+
+        let corrupt_path = tmp_dir.path().join(Vec::<u8>::segment_file_name(1));
+        assert!(corrupt_path.exists());
+
+        // Non-minimal VarInt: 0xFD prefix demands a u16 >= 0xFD; supplying
+        // 0x0001 violates that and `VarInt::consensus_decode` returns
+        // `Error::NonMinimalVarInt`, which `Segment::load` propagates as a
+        // `StorageError::ReadFailed`.
+        tokio::fs::write(&corrupt_path, [0xFDu8, 0x01, 0x00]).await.unwrap();
+
+        let reloaded = SegmentCache::<Vec<u8>>::load_or_new(tmp_dir.path()).await.unwrap();
+
+        assert_eq!(
+            reloaded.tip_height(),
+            Some(9),
+            "tip should fall back to the last readable segment"
+        );
+        assert_eq!(reloaded.start_height(), Some(0));
     }
 
     #[test]
