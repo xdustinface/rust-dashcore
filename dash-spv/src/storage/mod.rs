@@ -138,6 +138,8 @@ impl DiskStorageManager {
             _lock_file: lock_file,
         };
 
+        // Runs before `start_worker` so the first persist tick cannot
+        // race the sentinel-driven recovery and pin a stale tip to disk.
         consistency::check_and_repair_consistency(
             &storage.storage_path,
             &storage.block_headers,
