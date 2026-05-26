@@ -1398,6 +1398,19 @@ async fn test_rewind_cascades_three_levels() {
     assert!(demoted.contains(&tx_a.txid()), "grandparent must be demoted");
     assert!(demoted.contains(&tx_b.txid()), "parent must cascade (wave 1)");
     assert!(demoted.contains(&tx_c.txid()), "child must cascade (wave 2)");
+
+    // Beyond the first cascade hop, `rebuild_utxos` must still produce a
+    // correct UTXO set: a regression that double-removes the intermediate
+    // tx_b's output, or that resurrects a spent ancestor, would inflate or
+    // deflate the balance without affecting the demotion list above.
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 4,
+        "after 3-level cascade only tx_c's output remains spendable (got balance {balance:?})",
+    );
 }
 
 #[tokio::test]
