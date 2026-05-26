@@ -1155,7 +1155,11 @@ mod tests {
         assert!(!tmp_dir.path().join(FilterHeader::segment_file_name(2)).exists());
 
         let reloaded = SegmentCache::<FilterHeader>::load_or_new(tmp_dir.path()).await.unwrap();
-        assert_eq!(reloaded.tip_height(), None, "cache must be empty after clear_all + persist + reload");
+        assert_eq!(
+            reloaded.tip_height(),
+            None,
+            "cache must be empty after clear_all + persist + reload"
+        );
         assert_eq!(reloaded.start_height(), None);
     }
 

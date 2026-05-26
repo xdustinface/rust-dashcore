@@ -458,6 +458,14 @@ mod tests {
             0,
             "orphaned filter storage must be cleared when filter headers are absent"
         );
+
+        // Reopen from disk to verify the clear was persisted and survives a restart.
+        let f2 = Arc::new(RwLock::new(PersistentFilterStorage::open(&path).await.unwrap()));
+        assert_eq!(
+            f2.read().await.filter_tip_height().await.unwrap(),
+            0,
+            "cleared filter storage must remain empty after reopen"
+        );
     }
 
     #[tokio::test]
