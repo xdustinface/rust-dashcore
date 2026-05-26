@@ -143,7 +143,16 @@ pub(crate) async fn check_and_repair_consistency(
             guard.persist(storage_path).await?;
         }
     } else if f_tip > 0 {
-        tracing::warn!("consistency: filters exist (tip {}) but no filter headers present", f_tip);
+        // No filter headers exist but filter segments do. Clear the filter
+        // storage entirely to prevent the filter sync from treating orphaned
+        // segments as already-downloaded data for a potentially discarded chain.
+        tracing::warn!(
+            "consistency: filters exist (tip {}) but no filter headers present, clearing",
+            f_tip
+        );
+        let mut guard = filters.write().await;
+        guard.clear_all().await?;
+        guard.persist(storage_path).await?;
     }
 
     // Block storage invariant: `block_storage_tip <= block_header_tip`. We
@@ -430,7 +439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filters_without_filter_headers_are_not_truncated() {
+    async fn filters_without_filter_headers_are_cleared() {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
 
@@ -446,8 +455,8 @@ mod tests {
 
         assert_eq!(
             f.read().await.filter_tip_height().await.unwrap(),
-            2,
-            "filter storage must be left untouched when filter headers are absent"
+            0,
+            "orphaned filter storage must be cleared when filter headers are absent"
         );
     }
 

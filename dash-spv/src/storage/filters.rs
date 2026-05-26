@@ -21,6 +21,10 @@ pub trait FilterStorage: Send + Sync + 'static {
 
     async fn filter_tip_height(&self) -> StorageResult<u32>;
 
+    /// Remove all stored filters and reset the storage to the empty state.
+    /// Changes are applied in-memory and flushed on the next `persist`.
+    async fn clear_all(&mut self) -> StorageResult<()>;
+
     /// Drop all filters with `height > target_height`.
     ///
     /// Truncating above the current tip is a no-op, truncating below
@@ -77,6 +81,11 @@ impl FilterStorage for PersistentFilterStorage {
 
     async fn filter_tip_height(&self) -> StorageResult<u32> {
         Ok(self.filters.read().await.tip_height().unwrap_or(0))
+    }
+
+    async fn clear_all(&mut self) -> StorageResult<()> {
+        self.filters.write().await.clear_all();
+        Ok(())
     }
 
     async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {

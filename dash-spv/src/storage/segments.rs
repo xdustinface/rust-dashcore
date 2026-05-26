@@ -495,6 +495,18 @@ impl<I: Persistable> SegmentCache<I> {
         self.start_height
     }
 
+    /// Queue all segments for deletion and reset the cache to the empty state.
+    pub fn clear_all(&mut self) {
+        let all_ids: Vec<u32> = self.segments.keys().chain(self.evicted.keys()).copied().collect();
+        for id in all_ids {
+            self.segments.remove(&id);
+            self.evicted.remove(&id);
+            self.to_delete.insert(id);
+        }
+        self.tip_height = None;
+        self.start_height = None;
+    }
+
     #[inline]
     pub fn next_height(&self) -> u32 {
         match self.tip_height() {
