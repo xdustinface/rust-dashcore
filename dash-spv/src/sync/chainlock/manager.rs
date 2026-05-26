@@ -148,7 +148,12 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 } => {
                     if self.validate_signature(&pending).await {
                         self.progress.add_valid(1);
-                        let fork_height = pending.block_height.saturating_sub(1);
+                        self.progress.update_best_validated_height(pending.block_height);
+                        let height = pending.block_height;
+                        let fork_height = height.saturating_sub(1);
+                        self.best_chainlock = Some(pending.clone());
+                        self.chainlock_height.store(height, Ordering::Release);
+                        self.save_best_chainlock().await;
                         return vec![SyncEvent::ChainLockForcedReorg {
                             chain_lock: pending,
                             fork_height,
