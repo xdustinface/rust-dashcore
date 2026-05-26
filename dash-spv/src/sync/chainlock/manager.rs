@@ -23,7 +23,7 @@ use crate::storage::{BlockHeaderStorage, MetadataStorage};
 use crate::sync::{ChainLockProgress, SyncEvent};
 
 /// Metadata key for persisting the best validated ChainLock.
-const BEST_CHAINLOCK_KEY: &str = "best_chainlock";
+pub(crate) const BEST_CHAINLOCK_KEY: &str = "best_chainlock";
 
 /// How long a CLSig waiting on an unresolved header is kept before eviction.
 pub(super) const PENDING_UNKNOWN_HASH_TTL: Duration = Duration::from_secs(5 * 60);

@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use tokio::sync::RwLock;
 
 use crate::error::StorageResult;
@@ -18,6 +19,7 @@ use crate::storage::{
     PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
     PersistentFilterStorage, PersistentMetadataStorage, PersistentStorage,
 };
+use crate::sync::BEST_CHAINLOCK_KEY;
 
 /// Run the cross-storage consistency repair sweep.
 ///
@@ -83,6 +85,31 @@ pub(crate) async fn check_and_repair_consistency(
             return Ok(());
         }
     };
+
+    // Stale chainlock: a persisted chainlock above the header tip cannot be
+    // valid because we have no header to match it against. Clear it so the
+    // chainlock manager starts from scratch instead of trusting a value the
+    // header tip can no longer corroborate.
+    if let Some(bytes) = metadata.read().await.load_metadata(BEST_CHAINLOCK_KEY).await? {
+        match serde_json::from_slice::<ChainLock>(&bytes) {
+            Ok(chainlock) if chainlock.block_height > block_tip => {
+                tracing::warn!(
+                    "consistency: persisted chainlock at height {} above block tip {}, clearing",
+                    chainlock.block_height,
+                    block_tip
+                );
+                metadata.write().await.delete_metadata(BEST_CHAINLOCK_KEY).await?;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "consistency: persisted chainlock failed to deserialize ({}), clearing",
+                    err
+                );
+                metadata.write().await.delete_metadata(BEST_CHAINLOCK_KEY).await?;
+            }
+        }
+    }
 
     // Filter header invariant: `filter_header_tip <= block_header_tip`.
     let fh_tip = filter_headers.read().await.get_filter_tip_height().await?;
