@@ -429,9 +429,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     /// - `Match`: the entry is removed and the CLSig is fed back through
     ///   `process_chainlock`, which validates the signature and promotes
     ///   it to `best_chainlock` on success.
-    /// - `Mismatch`: the entry is removed and rejected. The forced-reorg
-    ///   dispatch lives in a follow-up commit, where this branch will fire
-    ///   `ChainLockForcedReorg` after validating the signature.
+    /// - `Mismatch`: the entry is removed and re-processed through
+    ///   `process_chainlock`. If the BLS signature validates, `ChainLockForcedReorg`
+    ///   is emitted and the delivering peer is penalised if present. If it does
+    ///   not validate, the entry is dropped and misbehavior is reported.
     /// - `Unknown`: the entry stays queued for a later `BlockHeadersStored`,
     ///   subject to TTL eviction in `tick`.
     pub(super) async fn retry_pending_unknown_hash(
@@ -1212,11 +1213,11 @@ mod tests {
         assert_eq!(manager.progress.invalid(), 1);
     }
 
-    /// `retry_pending_unknown_hash` removes a queued CLSig that now resolves
-    /// to a `Mismatch`. In the current commit the chainlock is rejected;
-    /// the forced-reorg dispatch arrives in the follow-up commit.
+    /// `retry_pending_unknown_hash` removes a queued CLSig that resolves to a
+    /// `Mismatch` and re-routes through `process_chainlock`. With an invalid BLS
+    /// signature (empty engine), the entry is dropped and counted as invalid.
     #[tokio::test]
-    async fn test_retry_pending_unknown_hash_drops_mismatch_branch() {
+    async fn test_retry_pending_unknown_hash_mismatch_invalid_sig_drops_entry() {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
         let mut manager = create_test_manager_with_storage(&storage).await;
         manager.masternode_ready = true;
@@ -1232,6 +1233,8 @@ mod tests {
         let _ = manager.process_chainlock(&chainlock, None, &test_requests()).await.unwrap();
         assert_eq!(manager.pending_unknown_hash.len(), 1);
 
+        // Store a header at 200 whose hash differs from `chainlock_hash` →
+        // `Mismatch`. The empty engine rejects the BLS signature → drop.
         storage
             .block_headers()
             .write()
@@ -1240,11 +1243,13 @@ mod tests {
             .await
             .expect("store header at 200");
 
-        let _ = manager.retry_pending_unknown_hash(&test_requests()).await.unwrap();
+        let events = manager.retry_pending_unknown_hash(&test_requests()).await.unwrap();
         assert!(
             manager.pending_unknown_hash.is_empty(),
             "mismatched entry must be removed from the queue"
         );
+        assert!(events.is_empty(), "invalid-sig mismatch must not emit ChainLockForcedReorg");
+        assert_eq!(manager.progress.invalid(), 1);
     }
 
     /// `Mismatch` with an invalid signature reports peer misbehavior and
