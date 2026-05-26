@@ -34,8 +34,7 @@ async fn funded_in_block() -> (TestWalletContext, Transaction) {
 }
 
 /// Promote an existing record from `InBlock` to the given inactive
-/// context via the low-level funds-account API. Mirrors what the
-/// rewind logic in #145 will do at the orchestration layer.
+/// context via the low-level funds-account API.
 fn transition_to_inactive(
     ctx: &mut TestWalletContext,
     tx: &Transaction,

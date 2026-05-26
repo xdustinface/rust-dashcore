@@ -115,13 +115,9 @@ impl ManagedCoreFundsAccount {
         self.spent_outpoints.contains(outpoint)
     }
 
-    /// Drop any UTXOs `tx` previously contributed and release the
-    /// outpoints it had marked as spent. Invoked when `tx` transitions
-    /// to an inactive context (`Conflicted`, `Abandoned`): its outputs
-    /// must leave the spendable set and the inputs it consumed are no
-    /// longer spent by this tx, so the previously spending marker is
-    /// cleared. Restoring the actual UTXOs the inputs referenced is
-    /// the rewind logic's responsibility, not this method's.
+    /// Drop any UTXOs `tx` previously contributed and release the outpoints it
+    /// had marked as spent. Restoring the actual UTXOs the inputs referenced is
+    /// the caller's responsibility.
     fn release_inactive_utxos(&mut self, tx: &Transaction) {
         let txid = tx.txid();
         let mut utxos_changed = false;
