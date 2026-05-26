@@ -1296,7 +1296,7 @@ impl PeerNetworkManager {
 
     /// Peers eligible for a broadcast: every connected peer minus those banned
     /// by the reputation manager.
-    pub(crate) async fn broadcast_targets(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
+    async fn broadcast_targets(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
         self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await
     }
 
