@@ -190,10 +190,15 @@ impl<
                 ..
             } => {
                 tracing::info!(
-                    "FiltersManager: cascading ChainReorg, resetting state at {}",
+                    "FiltersManager: cascading ChainReorg, rewinding wallet at {}",
                     fork_height
                 );
-                self.reset_for_reorg(*fork_height);
+                let effective_floor = self.rewind_wallet_for_reorg(*fork_height).await;
+                tracing::info!(
+                    "FiltersManager: re-matching filters from effective floor {}",
+                    effective_floor
+                );
+                self.reset_for_reorg(effective_floor);
                 self.set_state(SyncState::WaitForEvents);
                 return Ok(vec![]);
             }

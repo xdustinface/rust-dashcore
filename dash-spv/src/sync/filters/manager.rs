@@ -149,16 +149,46 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         self.filter_pipeline = FiltersPipeline::new();
     }
 
-    /// Reset all sync state to begin again at `fork_height` after a reorg
-    /// cascade. Clears in-flight batches and rewinds the per-batch
+    /// Drive the per-wallet rewind and compute the effective floor for
+    /// the filter re-match. Returns the lowest per-wallet `synced_height`
+    /// after the rewind clamps each wallet to `min(fork_height, current)`.
+    ///
+    /// The chainlock-floor invariant is enforced upstream by the reorg
+    /// cascade, so a `BelowChainLockFloor` error here is defense in
+    /// depth: log and fall back to `fork_height` for the floor without
+    /// touching wallet state.
+    pub(super) async fn rewind_wallet_for_reorg(&self, fork_height: u32) -> u32 {
+        let mut wallet = self.wallet.write().await;
+        match wallet.rewind_to_height(fork_height).await {
+            Ok(_) => wallet.synced_height().min(fork_height),
+            Err(e) => {
+                tracing::warn!(
+                    "FiltersManager: wallet rewind to {} rejected: {}; using fork_height as floor",
+                    fork_height,
+                    e
+                );
+                fork_height
+            }
+        }
+    }
+
+    /// Reset all sync state to begin again at `effective_floor` after a
+    /// reorg cascade. Clears in-flight batches and rewinds the per-batch
     /// processing cursors so the next `FilterHeadersStored` event drives a
-    /// fresh download starting at the truncated ancestor.
-    pub(super) fn reset_for_reorg(&mut self, fork_height: u32) {
+    /// fresh download starting at the effective floor.
+    ///
+    /// `effective_floor` is the minimum of `fork_height` and the lowest
+    /// per-wallet `synced_height` across the wallet set, computed after
+    /// the wallet rewind. A wallet whose ingest tip is behind the fork
+    /// point never saw the orphaned chain, so the filter pipeline does
+    /// not need to re-match the segment between that wallet's tip and
+    /// the fork.
+    pub(super) fn reset_for_reorg(&mut self, effective_floor: u32) {
         self.reset_for_rescan();
-        self.next_batch_to_store = fork_height;
-        self.processing_height = fork_height;
-        self.progress.update_committed_height(fork_height);
-        self.progress.update_stored_height(fork_height);
+        self.next_batch_to_store = effective_floor;
+        self.processing_height = effective_floor;
+        self.progress.update_committed_height(effective_floor);
+        self.progress.update_stored_height(effective_floor);
     }
 
     async fn load_filters(
@@ -2403,6 +2433,43 @@ mod tests {
             )),
             "expected FiltersSyncComplete, got {:?}",
             events
+        );
+    }
+
+    /// Wallet whose `synced_height` is already behind `fork_height`
+    /// should drive the effective floor below `fork_height`. The
+    /// post-rewind floor is `min(wallet.synced_height, fork_height)`.
+    #[tokio::test]
+    async fn test_rewind_wallet_for_reorg_uses_min_of_wallet_and_fork() {
+        let manager = create_test_manager().await;
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 40);
+
+        let effective_floor = manager.rewind_wallet_for_reorg(100).await;
+
+        assert_eq!(
+            effective_floor, 40,
+            "wallet behind fork_height should drag floor down to its synced_height"
+        );
+    }
+
+    /// Wallet whose `synced_height` is above `fork_height` should be
+    /// clamped to `fork_height` by the rewind, and the effective floor
+    /// is then `fork_height`.
+    #[tokio::test]
+    async fn test_rewind_wallet_for_reorg_clamps_to_fork_height() {
+        let manager = create_test_manager().await;
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 200);
+
+        let effective_floor = manager.rewind_wallet_for_reorg(100).await;
+
+        assert_eq!(
+            effective_floor, 100,
+            "wallet ahead of fork_height should be clamped and floor equals fork_height"
+        );
+        assert_eq!(
+            manager.wallet.read().await.wallet_synced_height(&MOCK_WALLET_ID),
+            100,
+            "rewind must clamp wallet's synced_height to fork_height"
         );
     }
 }
