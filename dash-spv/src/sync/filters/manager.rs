@@ -2436,9 +2436,6 @@ mod tests {
         );
     }
 
-    /// Wallet whose `synced_height` is already behind `fork_height`
-    /// should drive the effective floor below `fork_height`. The
-    /// post-rewind floor is `min(wallet.synced_height, fork_height)`.
     #[tokio::test]
     async fn test_rewind_wallet_for_reorg_uses_min_of_wallet_and_fork() {
         let manager = create_test_manager().await;
@@ -2452,9 +2449,6 @@ mod tests {
         );
     }
 
-    /// Wallet whose `synced_height` is above `fork_height` should be
-    /// clamped to `fork_height` by the rewind, and the effective floor
-    /// is then `fork_height`.
     #[tokio::test]
     async fn test_rewind_wallet_for_reorg_clamps_to_fork_height() {
         let manager = create_test_manager().await;

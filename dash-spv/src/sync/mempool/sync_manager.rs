@@ -210,6 +210,7 @@ mod tests {
     use dashcore::hashes::Hash;
     use key_wallet_manager::test_utils::MockWallet;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use tokio::sync::{mpsc, RwLock};
 
@@ -224,7 +225,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         (manager, requests, rx)
@@ -582,7 +583,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -658,7 +659,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -719,7 +720,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -774,7 +775,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -824,7 +825,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);

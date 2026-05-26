@@ -9,7 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::network::message::NetworkMessage;
@@ -26,7 +26,7 @@ use crate::network::RequestSender;
 use crate::sync::mempool::MempoolProgress;
 use crate::sync::SyncEvent;
 use crate::types::UnconfirmedTransaction;
-use key_wallet_manager::{WalletEvent, WalletInterface};
+use key_wallet_manager::{WalletEvent, WalletId, WalletInterface};
 
 /// Timeout for pruning expired mempool transactions (24 hours).
 pub(super) const MEMPOOL_TX_EXPIRY: Duration = Duration::from_secs(24 * 3600);
@@ -66,7 +66,7 @@ const REORG_REBROADCAST_MAX_BACKOFF: Duration = Duration::from_secs(3600);
 pub(super) struct RebroadcastState {
     /// Wallet that owns the demoted record, used to scope the
     /// `TxRepeatedlyOrphaned` event when the retry cap fires.
-    wallet_id: key_wallet_manager::WalletId,
+    wallet_id: WalletId,
     /// Outpoints the transaction consumes. Used by the input-conflict
     /// check to drop the entry when another transaction landing on the
     /// new chain spends one of the same outpoints.
@@ -77,9 +77,7 @@ pub(super) struct RebroadcastState {
     /// deferred best-effort against the current wall-clock since
     /// the SPV path does not maintain an MTP cache.
     lock_time: u32,
-    /// Number of rebroadcast attempts already made.
     attempts: u32,
-    /// Earliest `Instant` at which the next attempt may run.
     next_attempt: Instant,
 }
 
@@ -89,7 +87,7 @@ pub(super) struct RebroadcastState {
 const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
 impl RebroadcastState {
-    fn new(wallet_id: key_wallet_manager::WalletId, tx: &Transaction, now: Instant) -> Self {
+    fn new(wallet_id: WalletId, tx: &Transaction, now: Instant) -> Self {
         Self {
             wallet_id,
             inputs: tx.input.iter().map(|i| i.previous_output).collect(),
@@ -105,10 +103,8 @@ impl RebroadcastState {
         Duration::from_secs(secs).min(REORG_REBROADCAST_MAX_BACKOFF)
     }
 
-    /// Returns true when the transaction's `nLockTime` is satisfied
-    /// against `tip_height` and `now` (block-height vs timestamp
-    /// locktime per BIP-65).
-    fn locktime_satisfied(&self, tip_height: u32, now: std::time::SystemTime) -> bool {
+    /// Block-height vs timestamp locktime per BIP-65.
+    fn locktime_satisfied(&self, tip_height: u32, now: SystemTime) -> bool {
         if self.lock_time == 0 {
             return true;
         }
@@ -119,7 +115,7 @@ impl RebroadcastState {
             // wall clock: a stricter MTP-based check would only delay
             // broadcast further, never accept too early, since wall
             // clock >= MTP.
-            now.duration_since(std::time::UNIX_EPOCH)
+            now.duration_since(UNIX_EPOCH)
                 .map(|d| self.lock_time as u64 <= d.as_secs())
                 .unwrap_or(false)
         }
@@ -151,7 +147,6 @@ pub(crate) struct MempoolManager<W: WalletInterface> {
     /// Wallet monitor revision at the time of the last filter build.
     /// Compared on each tick to detect when the wallet's monitored set has changed.
     pub(super) last_monitor_revision: u64,
-    /// Reorg-driven rebroadcast queue keyed by demoted txid.
     pub(super) pending_rebroadcast: HashMap<Txid, RebroadcastState>,
     /// Subscription to `WalletEvent` broadcasts, drained on each tick to
     /// pick up `Reorg` events and to observe new-chain confirmations for
@@ -160,8 +155,7 @@ pub(crate) struct MempoolManager<W: WalletInterface> {
     /// Sender used to emit `TxRepeatedlyOrphaned` events back into the
     /// wallet event stream when the retry cap fires.
     wallet_event_tx: broadcast::Sender<WalletEvent>,
-    /// Current chain tip height, updated via `update_target_height`.
-    /// Used for block-height locktime checks during rebroadcast.
+    /// Updated via `update_target_height`.
     pub(super) current_tip_height: u32,
     /// Shared chainlock-floor height. Defense-in-depth: a tx confirmed
     /// in a chainlocked block must never be queued for rebroadcast.
@@ -205,17 +199,13 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Replace the manager's internal `WalletEvent` subscription with a
-    /// fresh receiver. Call this after `new` if the manager must observe
-    /// the wallet's own broadcast channel directly instead of the
-    /// internal forwarder.
+    /// Use when the manager must observe the wallet's own broadcast channel
+    /// directly instead of the internal forwarder created by `new`.
     pub(crate) fn set_wallet_event_subscription(&mut self, rx: broadcast::Receiver<WalletEvent>) {
         self.wallet_event_rx = rx;
     }
 
-    /// Sender used by the rebroadcaster to emit
-    /// `TxRepeatedlyOrphaned` back into the wallet event stream.
-    /// Exposed so tests can subscribe to observe the cap firing.
+    /// Exposed so tests can subscribe to observe the retry-cap firing.
     #[cfg(test)]
     pub(super) fn wallet_event_sender(&self) -> &broadcast::Sender<WalletEvent> {
         &self.wallet_event_tx
@@ -564,9 +554,6 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Drain pending wallet events to drive the reorg rebroadcast queue.
-    /// Picks up `Reorg` events (which seed `pending_rebroadcast`) and
-    /// `BlockProcessed` events (which feed the input-conflict check).
     pub(super) async fn drain_wallet_events(&mut self) {
         loop {
             match self.wallet_event_rx.try_recv() {
@@ -600,7 +587,7 @@ impl<W: WalletInterface> MempoolManager<W> {
 
     async fn enqueue_demoted_for_rebroadcast(
         &mut self,
-        wallet_id: key_wallet_manager::WalletId,
+        wallet_id: WalletId,
         demoted_txids: &[Txid],
     ) {
         if demoted_txids.is_empty() {
@@ -641,10 +628,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Drop any pending-rebroadcast entry whose inputs collide with a
-    /// transaction confirmed on the new chain. The colliding tx is
-    /// flagged in the trace so the operator can see why the entry was
-    /// retired.
+    /// The colliding tx is flagged in the trace so the operator can see why the entry was retired.
     pub(super) fn evict_conflicting_rebroadcasts<'a, I>(&mut self, new_records: I)
     where
         I: IntoIterator<
@@ -683,9 +667,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Walk the rebroadcast queue and broadcast any entry whose
-    /// `next_attempt` is due. Entries past the retry cap are dropped
-    /// and surface a `TxRepeatedlyOrphaned` wallet event.
+    /// Entries past the retry cap are dropped and surface a `TxRepeatedlyOrphaned` wallet event.
     pub(super) async fn drive_reorg_rebroadcast(&mut self, requests: &RequestSender) {
         self.drive_reorg_rebroadcast_at(requests, Instant::now()).await
     }
@@ -695,9 +677,9 @@ impl<W: WalletInterface> MempoolManager<W> {
             return;
         }
         let tip = self.current_tip_height;
-        let wall_now = std::time::SystemTime::now();
+        let wall_now = SystemTime::now();
         let mut to_drop: Vec<Txid> = Vec::new();
-        let mut to_orphan: Vec<(Txid, key_wallet_manager::WalletId)> = Vec::new();
+        let mut to_orphan: Vec<(Txid, WalletId)> = Vec::new();
         for (txid, state) in self.pending_rebroadcast.iter_mut() {
             if state.next_attempt > now {
                 continue;
@@ -875,6 +857,7 @@ mod tests {
 
     use crate::sync::SyncState;
     use crate::test_utils::test_socket_address;
+    use std::iter::once;
     use tokio::sync::mpsc;
 
     fn dummy_instant_lock(txid: Txid) -> InstantLock {
@@ -903,7 +886,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
         manager.progress.set_state(SyncState::Synced);
 
@@ -921,7 +904,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         (manager, requests, rx)
@@ -991,7 +974,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             2, // Very small capacity
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
         let peer = test_socket_address(1);
         manager.peers.insert(peer, Some(VecDeque::new()));
@@ -1031,7 +1014,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             2,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
         manager.progress.set_state(SyncState::Synced);
         let peer = test_socket_address(1);
@@ -1061,7 +1044,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         let fresh_txid = Txid::from_byte_array([1; 32]);
@@ -1180,7 +1163,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         (manager, requests, wallet)
@@ -1310,7 +1293,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         (manager, requests, rx)
@@ -1736,7 +1719,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
 
         // Drop receiver so send_filter_load fails
@@ -2090,10 +2073,6 @@ mod tests {
         }
     }
 
-    /// Helper that builds a wallet, mempool manager, and pre-wires the
-    /// wallet's own broadcast subscription as the manager's
-    /// `wallet_event_rx`. Returns the wallet so tests can drive
-    /// `WalletEvent`s through it.
     async fn manager_with_wallet_events() -> (
         MempoolManager<MockWallet>,
         Arc<RwLock<MockWallet>>,
@@ -2108,7 +2087,7 @@ mod tests {
             MempoolStrategy::FetchAll,
             1000,
             0,
-            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
         );
         manager.progress.set_state(SyncState::Synced);
         let wallet_event_rx = wallet.read().await.subscribe_events();
@@ -2116,9 +2095,6 @@ mod tests {
         (manager, wallet, requests, rx)
     }
 
-    /// Reorg event with a single demoted txid that the wallet can
-    /// serve via `get_transaction` enqueues a rebroadcast entry, and
-    /// the first tick broadcasts the transaction body to peers.
     #[tokio::test]
     async fn test_reorg_demoted_tx_rebroadcast_happy_path() {
         let (mut manager, wallet, requests, mut rx) = manager_with_wallet_events().await;
@@ -2156,9 +2132,6 @@ mod tests {
         assert_eq!(manager.pending_rebroadcast.get(&txid).unwrap().attempts, 1);
     }
 
-    /// A `BlockProcessed` event carrying a transaction whose input
-    /// collides with a pending demoted tx must evict the demoted
-    /// entry: it is now conflicted on the new chain.
     #[tokio::test]
     async fn test_input_conflict_drops_pending_rebroadcast() {
         let (mut manager, wallet, _requests, _rx) = manager_with_wallet_events().await;
@@ -2203,7 +2176,7 @@ mod tests {
                 0,
             );
 
-        manager.evict_conflicting_rebroadcasts(std::iter::once(&conflicting_record));
+        manager.evict_conflicting_rebroadcasts(once(&conflicting_record));
 
         assert!(
             !manager.pending_rebroadcast.contains_key(&demoted_txid),
@@ -2211,10 +2184,6 @@ mod tests {
         );
     }
 
-    /// A demoted tx with a block-height locktime above the current
-    /// tip must be deferred. The rebroadcaster updates `next_attempt`
-    /// without sending. Once the tip advances past the locktime, the
-    /// next call broadcasts.
     #[tokio::test]
     async fn test_locktime_defer_then_broadcast() {
         let (mut manager, wallet, requests, mut rx) = manager_with_wallet_events().await;
@@ -2260,9 +2229,6 @@ mod tests {
         assert_eq!(manager.pending_rebroadcast.get(&txid).unwrap().attempts, 1);
     }
 
-    /// After `MAX_REORG_REBROADCAST_ATTEMPTS` failures, the
-    /// rebroadcaster gives up: the txid drops from the queue and
-    /// a `TxRepeatedlyOrphaned` event is emitted.
     #[tokio::test]
     async fn test_retry_cap_emits_repeatedly_orphaned() {
         let (mut manager, wallet, requests, _rx) = manager_with_wallet_events().await;
