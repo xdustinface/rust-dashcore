@@ -528,23 +528,7 @@ impl ManagedCoreFundsAccount {
     /// so the rebuild observes the final post-rewind context for every
     /// record.
     pub(crate) fn demote_records_above(&mut self, height: CoreBlockHeight) -> Vec<Txid> {
-        let mut demoted = Vec::new();
-        let to_demote: Vec<Txid> = self
-            .keys
-            .transactions()
-            .iter()
-            .filter_map(|(txid, record)| match record.context.block_info() {
-                Some(info) if info.height() > height => Some(*txid),
-                _ => None,
-            })
-            .collect();
-        for txid in to_demote {
-            if let Some(record) = self.keys.transactions_mut().get_mut(&txid) {
-                record.update_context(TransactionContext::Mempool);
-                demoted.push(txid);
-            }
-        }
-        demoted
+        self.keys.demote_records_above(height)
     }
 
     /// Demote a specific transaction by txid to `Mempool` (used for
@@ -552,14 +536,7 @@ impl ManagedCoreFundsAccount {
     /// record existed and was actually demoted (i.e. was not already
     /// in `Mempool` / `InstantSend` / inactive).
     pub(crate) fn demote_record(&mut self, txid: &Txid) -> bool {
-        let Some(record) = self.keys.transactions_mut().get_mut(txid) else {
-            return false;
-        };
-        if record.context.block_info().is_none() {
-            return false;
-        }
-        record.update_context(TransactionContext::Mempool);
-        true
+        self.keys.demote_record(txid)
     }
 
     /// Drop the cached UTXO set and spent-outpoint tracking, then
