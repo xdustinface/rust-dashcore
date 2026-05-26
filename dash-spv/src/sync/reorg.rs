@@ -684,6 +684,111 @@ mod tests {
         );
     }
 
+    /// `force: true` bypasses the chainlock floor guard so a validated
+    /// `ChainLockForcedReorg` can reorg below the stored chainlock height.
+    /// Paired `force: false` call on the same inputs confirms the guard
+    /// still fires normally.
+    #[tokio::test]
+    async fn force_bypasses_chainlock_floor_and_cascades() {
+        let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let chain = mined_chain(60, 1_700_000_000);
+        storage.store_headers(&chain).await.unwrap();
+        let block_headers = storage.block_headers();
+        let filter_headers = storage.filter_headers();
+        let filters = storage.filters();
+        let blocks = storage.blocks();
+
+        // ancestor at 40, best chainlock at 50 → is_below_chainlock_floor(40, 50) = true.
+        let candidate = fork_candidate_from(40, chain[40].block_hash(), 3, 1_700_100_000);
+        let candidate_tip = candidate.tip_hash();
+
+        let checkpoint_manager = CheckpointManager::new(vec![]);
+
+        // force=false: chainlock floor rejects the candidate and deny-lists it.
+        let state = Mutex::new(ReorgState::default());
+        let generation = AtomicU64::new(0);
+        let storages_false: ReorgStorages<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+        > = ReorgStorages {
+            block_header_storage: &block_headers,
+            filter_header_storage: Some(&filter_headers),
+            filter_storage: Some(&filters),
+            block_storage: Some(&blocks),
+        };
+        let result = handle_reorg(
+            candidate.clone(),
+            &state,
+            &generation,
+            storages_false,
+            &checkpoint_manager,
+            Some(50),
+            59,
+            chain[59].block_hash(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none(), "floor guard must reject when force=false");
+        assert!(
+            state.lock().await.deny_list.contains_key(&candidate_tip),
+            "rejected candidate must land on deny-list"
+        );
+        assert_eq!(generation.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // force=true: chainlock floor is bypassed, cascade runs, ChainReorg is emitted.
+        let state2 = Mutex::new(ReorgState::default());
+        let generation2 = AtomicU64::new(0);
+        let storages_true: ReorgStorages<
+            PersistentBlockHeaderStorage,
+            PersistentFilterHeaderStorage,
+            PersistentFilterStorage,
+            PersistentBlockStorage,
+        > = ReorgStorages {
+            block_header_storage: &block_headers,
+            filter_header_storage: Some(&filter_headers),
+            filter_storage: Some(&filters),
+            block_storage: Some(&blocks),
+        };
+        let event = handle_reorg(
+            candidate,
+            &state2,
+            &generation2,
+            storages_true,
+            &checkpoint_manager,
+            Some(50),
+            59,
+            chain[59].block_hash(),
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("forced reorg must produce a ChainReorg event");
+
+        match event {
+            SyncEvent::ChainReorg {
+                fork_height,
+                new_tip,
+                ..
+            } => {
+                assert_eq!(fork_height, 40);
+                assert_eq!(new_tip, candidate_tip);
+            }
+            other => panic!("expected ChainReorg, got {:?}", other),
+        }
+        assert_eq!(
+            generation2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "forced cascade must bump generation"
+        );
+        assert!(
+            !state2.lock().await.deny_list.contains_key(&candidate_tip),
+            "forced reorg must not land on the deny-list"
+        );
+    }
+
     #[test]
     fn evict_expired_denials_drops_entries_at_or_below_height() {
         let mut state = ReorgState::default();

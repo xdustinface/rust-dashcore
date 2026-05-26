@@ -671,6 +671,42 @@ mod tests {
         assert_eq!(manager.progress.valid(), 0);
     }
 
+    /// `on_masternode_ready` with a pending `Mismatch` chainlock and a valid BLS
+    /// signature must emit `ChainLockForcedReorg` and advance `best_chainlock`.
+    /// Because the unit-test engine has no quorum keys and always rejects BLS
+    /// signatures, this test exercises the invalid-signature branch of the same
+    /// `Mismatch` arm to verify the path is reachable and the side-effects of the
+    /// invalid-sig branch (invalid counter, no best_chainlock update) are correct.
+    /// The valid-sig branch (ChainLockForcedReorg + best_chainlock update) is
+    /// covered by the dashd integration test suite.
+    #[tokio::test]
+    async fn test_on_masternode_ready_mismatch_invalid_sig_counts_invalid() {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let mut manager = create_test_manager_with_storage(&storage).await;
+
+        let _ = manager
+            .process_chainlock(&create_test_chainlock(100), None, &test_requests())
+            .await
+            .unwrap();
+        assert!(manager.pending_validation.is_some());
+
+        let header = dashcore::block::Header::dummy(100);
+        storage
+            .block_headers()
+            .write()
+            .await
+            .store_headers_at_height(&[header], 100)
+            .await
+            .expect("store header at 100");
+
+        // Empty engine rejects the BLS sig → invalid-sig arm of Mismatch.
+        let events = manager.on_masternode_ready().await;
+        assert!(events.is_empty(), "invalid-sig Mismatch must not emit ChainLockForcedReorg");
+        assert!(manager.best_chainlock().is_none(), "invalid-sig must not advance the CL floor");
+        assert_eq!(manager.progress.invalid(), 1);
+        assert_eq!(manager.progress.valid(), 0);
+    }
+
     #[tokio::test]
     async fn test_on_masternode_ready_retries_pending_validation() {
         let mut manager = create_test_manager().await;
@@ -1131,6 +1167,37 @@ mod tests {
             manager.pending_unknown_hash.get(&chainlock.block_hash).unwrap();
         assert_eq!(queued_cl.block_height, 200);
         assert_eq!(*queued_peer, Some(peer));
+    }
+
+    /// Two calls to `process_chainlock` for the same unknown block hash from
+    /// different peers must keep the first entry (first-wins). The second
+    /// call is a no-op so a malicious peer cannot overwrite a legitimate CLSig
+    /// with a garbage signature before the header arrives.
+    #[tokio::test]
+    async fn test_process_chainlock_unknown_hash_first_wins() {
+        let mut manager = create_test_manager().await;
+        manager.masternode_ready = true;
+
+        let peer_a: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let peer_b: SocketAddr = "5.6.7.8:9999".parse().unwrap();
+
+        let hash = BlockHash::from_byte_array([0xCC; 32]);
+        let cl = ChainLock {
+            block_height: 300,
+            block_hash: hash,
+            signature: BLSSignature::from([0u8; 96]),
+        };
+
+        let _ = manager.process_chainlock(&cl, Some(peer_a), &test_requests()).await.unwrap();
+        let _ = manager.process_chainlock(&cl, Some(peer_b), &test_requests()).await.unwrap();
+
+        assert_eq!(manager.pending_unknown_hash.len(), 1);
+        let (_, retained_peer, _) = manager.pending_unknown_hash.get(&hash).unwrap();
+        assert_eq!(
+            *retained_peer,
+            Some(peer_a),
+            "first-wins: peer_a must not be overwritten by peer_b"
+        );
     }
 
     /// `drain_expired_pending` removes entries past

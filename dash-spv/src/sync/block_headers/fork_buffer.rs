@@ -884,6 +884,36 @@ mod tests {
         assert_eq!(buf.len(), 1, "buffer must be unchanged after miss");
     }
 
+    /// When two peers deliver the same fork (same tip hash), `take_branch_by_tip`
+    /// removes exactly one of the two entries and leaves the other intact.
+    /// Which entry is taken is unspecified (HashMap traversal order), but
+    /// exactly one must be consumed.
+    #[test]
+    fn take_branch_by_tip_removes_exactly_one_when_two_peers_share_same_tip() {
+        let peer_a: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let peer_b: SocketAddr = "5.6.7.8:9999".parse().unwrap();
+        let mut buf = ForkBuffer::new(regtest_params());
+
+        let active = build_chain(1_700_000_000, 11, BlockHash::all_zeros());
+        let ancestor_height = (active.len() as u32) - 1;
+        let ancestor = *active.last().unwrap();
+
+        let fork = build_chain(1_700_000_000 + 12 * 600, 2, ancestor.block_hash());
+        let tip = fork.last().unwrap().block_hash();
+
+        buf.ingest(peer_a, &fork, ancestor_height, ancestor, &active).expect("ingest a");
+        buf.ingest(peer_b, &fork, ancestor_height, ancestor, &active).expect("ingest b");
+        assert_eq!(buf.len(), 2);
+
+        let candidate = buf.take_branch_by_tip(&tip).expect("some branch must be found");
+        assert_eq!(
+            *candidate.headers.last().unwrap().hash(),
+            tip,
+            "returned candidate must end at the requested tip"
+        );
+        assert_eq!(buf.len(), 1, "exactly one of the two same-tip branches must be removed");
+    }
+
     /// When two branches from different peers share the same ancestor but have
     /// different tip hashes, `take_branch_by_tip` removes only the targeted
     /// branch and leaves the other intact.
