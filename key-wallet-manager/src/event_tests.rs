@@ -1,6 +1,6 @@
 use super::test_helpers::*;
 use super::*;
-use crate::wallet_interface::WalletInterface;
+use crate::wallet_interface::{RewindError, WalletInterface};
 use dashcore::block::{Block, Header, Version};
 use dashcore::blockdata::script::Builder;
 use dashcore::blockdata::transaction::special_transaction::asset_lock::AssetLockPayload;
@@ -1268,4 +1268,288 @@ async fn test_block_processed_chainlocked_flag_matches_record_context() {
         assert!(chain_lock.is_none());
         assert!(matches!(inserted[0].context, TransactionContext::InBlock(_)));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reorg path
+// ---------------------------------------------------------------------------
+
+/// Build a transaction that spends a specific outpoint of a previous
+/// transaction (mimicking a child) paying back to one of the wallet's
+/// addresses.
+fn spend_from(parent_txid: Txid, parent_vout: u32, addr: &Address, value: u64) -> Transaction {
+    Transaction {
+        version: 2,
+        lock_time: 0,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent_txid,
+                vout: parent_vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value,
+            script_pubkey: addr.script_pubkey(),
+        }],
+        special_transaction_payload: None,
+    }
+}
+
+#[tokio::test]
+async fn test_rewind_demotes_single_above_cut_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xb0);
+    let block = make_block(vec![tx.clone()], 0xb0, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 11, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    let result = manager.rewind_to_height(10).await.expect("rewind below cut succeeds");
+    assert_eq!(result.demoted_txids, vec![tx.txid()]);
+    assert!(result.conflicted_txids.is_empty());
+
+    let events = drain_events(&mut rx);
+    let reorg = events
+        .iter()
+        .find_map(|e| match e {
+            WalletEvent::Reorg {
+                fork_height,
+                demoted_txids,
+                conflicted_txids,
+                balance,
+                ..
+            } => Some((*fork_height, demoted_txids.clone(), conflicted_txids.clone(), *balance)),
+            _ => None,
+        })
+        .expect("Reorg event must be emitted for a wallet whose state changed");
+    assert_eq!(reorg.0, 10);
+    assert_eq!(reorg.1, vec![tx.txid()]);
+    assert!(reorg.2.is_empty());
+    assert_eq!(reorg.3.confirmed(), 0, "demoted record must drop out of confirmed balance");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+}
+
+#[tokio::test]
+async fn test_rewind_cascades_to_descendant_in_same_account() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx_a = create_tx_paying_to(&addr, 0xc1);
+    let block_a = make_block(vec![tx_a.clone()], 0xc1, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block_a, 11, &wallets).await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    let block_b = make_block(vec![tx_b.clone()], 0xc2, 200);
+    manager.process_block_for_wallets(&block_b, 12, &wallets).await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    assert!(demoted.contains(&tx_a.txid()), "parent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "child spending parent must cascade");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+
+    // Rewind to Mempool leaves the child still spending the parent's
+    // output, so only the child's own output reaches the spendable
+    // set. Without `rebuild_utxos`'s order-independent spent-outpoint
+    // guard the child's output could be wrongly resurrected as still
+    // spent, or the parent's output wrongly resurrected as spendable,
+    // depending on txid sort order.
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 2,
+        "after rewind the child still spends the parent in mempool, only the child's output is a UTXO (got balance {balance:?})",
+    );
+}
+
+#[tokio::test]
+async fn test_rewind_cascades_three_levels() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+
+    let tx_a = create_tx_paying_to(&addr, 0xd0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xd0, 100), 11, &wallets)
+        .await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xd1, 200), 12, &wallets)
+        .await;
+
+    let tx_c = spend_from(tx_b.txid(), 0, &addr, TX_AMOUNT / 4);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_c.clone()], 0xd2, 300), 13, &wallets)
+        .await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    // Wave 2 of the frontier cascade only fires if wave 1 propagated the
+    // newly-demoted parent into the next frontier. A regression that drops
+    // descendants beyond the first hop would still pass the two-level test
+    // above but fail here.
+    assert!(demoted.contains(&tx_a.txid()), "grandparent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "parent must cascade (wave 1)");
+    assert!(demoted.contains(&tx_c.txid()), "child must cascade (wave 2)");
+
+    // Beyond the first cascade hop, `rebuild_utxos` must still produce a
+    // correct UTXO set: a regression that double-removes the intermediate
+    // tx_b's output, or that resurrects a spent ancestor, would inflate or
+    // deflate the balance without affecting the demotion list above.
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 4,
+        "after 3-level cascade only tx_c's output remains spendable (got balance {balance:?})",
+    );
+}
+
+#[tokio::test]
+async fn test_rewind_restores_is_trusted_on_mempool_change() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let (_, _, change_addr) = pool_state(&manager, &wallet_id, AddressPoolType::Internal);
+
+    let tx_a = create_tx_paying_to(&addr, 0xe0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xe0, 100), 11, &wallets)
+        .await;
+
+    // tx_b spends the wallet's UTXO from tx_a and pays change back to our
+    // own internal pool: after rewind tx_b ends up in mempool, so the
+    // change output is a trusted-change UTXO that must be credited to
+    // `confirmed()`, not `unconfirmed()`.
+    let tx_b = spend_from(tx_a.txid(), 0, &change_addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xe1, 200), 12, &wallets)
+        .await;
+
+    manager.rewind_to_height(10).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    assert_eq!(
+        balance.confirmed(),
+        TX_AMOUNT / 2,
+        "trusted mempool change must be credited to confirmed() after rebuild (got {balance:?})",
+    );
+    assert_eq!(balance.unconfirmed(), 0, "no untrusted mempool outputs remain");
+}
+
+#[tokio::test]
+async fn test_rewind_retains_instant_send_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xd3);
+
+    // First sighting is an IS-locked mempool tx.
+    let islock = dummy_instant_lock(tx.txid());
+    manager.process_mempool_transaction(&tx, Some(islock.clone())).await;
+
+    let _ = manager.rewind_to_height(0).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let mut found = false;
+    for account in info.accounts().all_accounts() {
+        if let Some(record) = account.transactions().get(&tx.txid()) {
+            assert!(
+                matches!(record.context, TransactionContext::InstantSend(_)),
+                "IS-locked record must be retained as InstantSend after rewind, got {:?}",
+                record.context,
+            );
+            found = true;
+        }
+    }
+    assert!(found, "the IS-locked transaction record must still be present after rewind");
+}
+
+#[tokio::test]
+async fn test_rewind_refuses_below_chainlock_floor() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    manager.apply_chain_lock(ChainLock::dummy(50));
+
+    let err = manager
+        .rewind_to_height(49)
+        .await
+        .expect_err("rewind below chainlock floor must be rejected");
+    match err {
+        RewindError::BelowChainLockFloor {
+            requested,
+            floor,
+            wallet_id: rejecting,
+        } => {
+            assert_eq!(requested, 49);
+            assert_eq!(floor, 50);
+            assert_eq!(rejecting, wallet_id);
+        }
+    }
+
+    // Rewinding to the floor itself is allowed.
+    manager.rewind_to_height(50).await.expect("rewind at the floor is allowed");
+}
+
+#[tokio::test]
+async fn test_rewind_rolls_back_last_processed_and_synced_height() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xee, 100);
+    manager.process_block_for_wallets(&block, 500, &wallets).await;
+    manager.update_wallet_synced_height(&wallet_id, 500);
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 500);
+    assert_eq!(info.synced_height(), 500);
+
+    manager.rewind_to_height(250).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 250);
+    assert_eq!(info.synced_height(), 250);
+}
+
+#[tokio::test]
+async fn test_rewind_below_current_does_not_advance_heights_upward() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xef, 100);
+    manager.process_block_for_wallets(&block, 100, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    manager.rewind_to_height(1000).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(
+        info.last_processed_height(),
+        100,
+        "rewinding to a height above current must not advance the wallet forward",
+    );
+
+    let reorg_events: Vec<_> = drain_events(&mut rx)
+        .into_iter()
+        .filter(|e| matches!(e, WalletEvent::Reorg { .. }))
+        .collect();
+    assert!(reorg_events.is_empty(), "no-op rewind must not emit Reorg, got {reorg_events:?}",);
+}
+
+#[tokio::test]
+async fn test_get_transaction_returns_stored_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xa9);
+    let block = make_block(vec![tx.clone()], 0xa9, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 50, &wallets).await;
+
+    let fetched = manager.get_transaction(&tx.txid()).await.expect("tx must be retrievable");
+    assert_eq!(fetched.txid(), tx.txid());
+
+    let missing = manager.get_transaction(&Txid::from_byte_array([0xff; 32])).await;
+    assert!(missing.is_none(), "unknown txid must return None");
 }

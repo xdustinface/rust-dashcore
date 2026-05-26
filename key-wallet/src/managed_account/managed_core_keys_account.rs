@@ -149,6 +149,47 @@ impl ManagedCoreKeysAccount {
         promoted
     }
 
+    /// Demote every transaction record whose mined height is strictly
+    /// greater than `height` back to [`TransactionContext::Mempool`]
+    /// and return the demoted txids. Mirrors
+    /// [`ManagedCoreFundsAccount::demote_records_above`] for the
+    /// keys-only side, where there is no UTXO state to rebuild.
+    ///
+    /// Records currently in `InstantSend`, `Conflicted`, or
+    /// `Abandoned` are left alone (see `demote_records_above` for the
+    /// rationale).
+    pub(crate) fn demote_records_above(&mut self, height: CoreBlockHeight) -> Vec<Txid> {
+        let mut demoted = Vec::new();
+        let to_demote: Vec<Txid> = self
+            .transactions
+            .iter()
+            .filter_map(|(txid, record)| match record.context.block_info() {
+                Some(info) if info.height() > height => Some(*txid),
+                _ => None,
+            })
+            .collect();
+        for txid in to_demote {
+            if let Some(record) = self.transactions.get_mut(&txid) {
+                record.update_context(TransactionContext::Mempool);
+                demoted.push(txid);
+            }
+        }
+        demoted
+    }
+
+    /// Demote a specific transaction by txid to `Mempool`. Returns
+    /// `true` when the record existed and was actually demoted.
+    pub(crate) fn demote_record(&mut self, txid: &Txid) -> bool {
+        let Some(record) = self.transactions.get_mut(txid) else {
+            return false;
+        };
+        if record.context.block_info().is_none() {
+            return false;
+        }
+        record.update_context(TransactionContext::Mempool);
+        true
+    }
+
     /// Create a `ManagedCoreKeysAccount` from an [`Account`](super::super::Account).
     pub fn from_account(account: &super::super::Account) -> Self {
         let key_source = address_pool::KeySource::Public(account.account_xpub);

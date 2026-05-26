@@ -1,3 +1,4 @@
+use crate::wallet_interface::{RewindError, RewindResult};
 use crate::{
     BlockProcessingResult, MempoolTransactionResult, WalletEvent, WalletId, WalletInterface,
 };
@@ -257,6 +258,23 @@ impl WalletInterface for MockWallet {
     fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
         panic!("apply_chain_lock not supported for MockWallet");
     }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        if height < self.last_processed_height {
+            self.last_processed_height = height;
+        }
+        if height < self.synced_height {
+            self.synced_height = height;
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
+        None
+    }
 }
 
 /// Mock wallet that returns false for filter checks
@@ -365,6 +383,23 @@ impl WalletInterface for NonMatchingMockWallet {
 
     fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
         panic!("apply_chain_lock not supported for NonMatchingMockWallet");
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        if height < self.last_processed_height {
+            self.last_processed_height = height;
+        }
+        if height < self.synced_height {
+            self.synced_height = height;
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
+        None
     }
 
     async fn describe(&self) -> String {
@@ -512,6 +547,25 @@ impl WalletInterface for MultiMockWallet {
 
     fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
         panic!("apply_chain_lock not supported for MultiMockWallet");
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        for state in self.wallets.values_mut() {
+            if height < state.last_processed_height {
+                state.last_processed_height = height;
+            }
+            if height < state.synced_height {
+                state.synced_height = height;
+            }
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
+        None
     }
 
     async fn describe(&self) -> String {

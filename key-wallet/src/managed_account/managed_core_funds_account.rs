@@ -507,6 +507,146 @@ impl ManagedCoreFundsAccount {
         self.keys.apply_chain_lock(cl_height)
     }
 
+    /// Demote every transaction record on this account whose mined
+    /// height is strictly greater than `height` back to a
+    /// pre-confirmation context, and return the demoted txids in the
+    /// order they were visited (highest height first).
+    ///
+    /// `InBlock` / `InChainLockedBlock` above the cut are demoted to
+    /// [`TransactionContext::Mempool`]. Records currently in
+    /// `InstantSend` are retained as-is even when their (formerly
+    /// confirmed) block height is above the cut, since the IS lock
+    /// itself is independent of the demoted block. Re-validating the
+    /// IS lock against the post-reorg quorum set is the caller's
+    /// responsibility (the wallet has no view of the masternode list).
+    /// Records already in an inactive context (`Conflicted`,
+    /// `Abandoned`) are left alone.
+    ///
+    /// This routine only mutates `transactions`. UTXO / spent-outpoint
+    /// state must be rebuilt afterwards via [`Self::rebuild_utxos`]
+    /// once the wallet-level descendant cascade has fully converged,
+    /// so the rebuild observes the final post-rewind context for every
+    /// record.
+    pub(crate) fn demote_records_above(&mut self, height: CoreBlockHeight) -> Vec<Txid> {
+        self.keys.demote_records_above(height)
+    }
+
+    /// Demote a specific transaction by txid to `Mempool` (used for
+    /// the wallet-level descendant cascade). Returns `true` when the
+    /// record existed and was actually demoted (i.e. was not already
+    /// in `Mempool` / `InstantSend` / inactive).
+    pub(crate) fn demote_record(&mut self, txid: &Txid) -> bool {
+        self.keys.demote_record(txid)
+    }
+
+    /// Drop the cached UTXO set and spent-outpoint tracking, then
+    /// rebuild both from the current `transactions` map in height
+    /// order. Mirrors the post-deserialization rebuild used by the
+    /// serde `Deserialize` impl.
+    ///
+    /// Records with an inactive context (`Conflicted`, `Abandoned`) are
+    /// excluded from both the UTXO inserts and the spent-outpoint
+    /// inserts so their outputs do not pollute the spendable set and
+    /// their inputs do not block predecessor UTXOs from being
+    /// re-credited.
+    pub(crate) fn rebuild_utxos(&mut self) {
+        self.utxos.clear();
+        self.spent_outpoints.clear();
+        if !matches!(
+            self.keys.managed_account_type(),
+            ManagedAccountType::Standard { .. }
+                | ManagedAccountType::CoinJoin { .. }
+                | ManagedAccountType::DashpayReceivingFunds { .. }
+                | ManagedAccountType::DashpayExternalAccount { .. }
+        ) {
+            self.keys.bump_monitor_revision();
+            return;
+        }
+
+        let network = self.keys.network();
+        let mut records: Vec<&TransactionRecord> = self
+            .keys
+            .transactions()
+            .values()
+            .filter(|record| !record.context.is_inactive())
+            .collect();
+        records.sort_by_key(|record| record.context.block_info().map(|info| info.height()));
+
+        // Collect every owned outpoint up front so `has_owned_input` below
+        // is independent of record visit order. The in-loop `spent_outpoints`
+        // set cannot serve here: it only sees already-processed inputs, so a
+        // mempool child sorted before its block parent would observe an
+        // empty set and miss the trusted-change signal.
+        let account_type = self.keys.managed_account_type();
+        let mut owned_outpoints: HashSet<OutPoint> = HashSet::new();
+        for record in &records {
+            let txid = record.transaction.txid();
+            for (vout, output) in record.transaction.output.iter().enumerate() {
+                let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
+                    continue;
+                };
+                if account_type.contains_address(&addr) {
+                    owned_outpoints.insert(OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    });
+                }
+            }
+        }
+
+        for record in records {
+            let tx = &record.transaction;
+            let txid = tx.txid();
+            let context = &record.context;
+
+            let has_owned_input =
+                tx.input.iter().any(|input| owned_outpoints.contains(&input.previous_output));
+
+            for (vout, output) in tx.output.iter().enumerate() {
+                let Ok(addr) = Address::from_script(&output.script_pubkey, network) else {
+                    continue;
+                };
+                if !self.keys.managed_account_type().contains_address(&addr) {
+                    continue;
+                }
+                let outpoint = OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                // Order-independence: a record processed earlier in the
+                // sort may have already claimed this outpoint as spent.
+                // Inserting now would resurrect a spent UTXO into the
+                // spendable set.
+                if self.spent_outpoints.contains(&outpoint) {
+                    continue;
+                }
+                let is_change = self
+                    .keys
+                    .managed_account_type()
+                    .address_pools()
+                    .iter()
+                    .any(|pool| pool.is_internal() && pool.contains_address(&addr));
+                let txout = dashcore::TxOut {
+                    value: output.value,
+                    script_pubkey: output.script_pubkey.clone(),
+                };
+                let block_height = context.block_info().map_or(0, |info| info.height);
+                let mut utxo = Utxo::new(outpoint, txout, addr, block_height, tx.is_coin_base());
+                utxo.is_confirmed = context.confirmed();
+                utxo.is_instantlocked = matches!(context, TransactionContext::InstantSend(_));
+                utxo.is_trusted = has_owned_input && is_change;
+                self.utxos.insert(outpoint, utxo);
+            }
+
+            for input in &tx.input {
+                self.spent_outpoints.insert(input.previous_output);
+                self.utxos.remove(&input.previous_output);
+            }
+        }
+
+        self.keys.bump_monitor_revision();
+    }
+
     /// Update the account balance.
     ///
     /// Mature, non-locked UTXOs land in either the `confirmed` bucket
