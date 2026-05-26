@@ -224,10 +224,8 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// [`RewindRejection::BelowChainLockFloor`] in that case.
     fn rewind_to_height(
         &mut self,
-        _height: CoreBlockHeight,
-    ) -> Result<RewindOutcome, RewindRejection> {
-        Ok(RewindOutcome::default())
-    }
+        height: CoreBlockHeight,
+    ) -> Result<RewindOutcome, RewindRejection>;
 
     /// Update chain state and process any matured transactions
     /// This should be called when the chain tip advances to a new height
@@ -483,12 +481,17 @@ impl WalletInfoInterface for ManagedWalletInfo {
         // their outputs, so any in-wallet transaction (possibly on a
         // different account) whose inputs spend those outputs must
         // also demote. Iterate to a fixed point.
+        //
+        // `frontier` carries only the txids demoted in the previous
+        // wave: any newly reachable descendant must spend an output of
+        // that wave, so re-scanning earlier waves would be wasted work.
         let mut already_demoted: BTreeSet<Txid> = demoted_txids.iter().copied().collect();
+        let mut frontier: Vec<Txid> = demoted_txids.clone();
         loop {
             let mut released_outpoints: BTreeSet<OutPoint> = BTreeSet::new();
             for account in self.accounts.all_accounts() {
                 let txs = account.transactions();
-                for txid in &already_demoted {
+                for txid in &frontier {
                     if let Some(record) = txs.get(txid) {
                         for vout in 0..record.transaction.output.len() as u32 {
                             released_outpoints.insert(OutPoint {
@@ -538,7 +541,8 @@ impl WalletInfoInterface for ManagedWalletInfo {
             for txid in &new_demoted {
                 already_demoted.insert(*txid);
             }
-            demoted_txids.extend(new_demoted);
+            demoted_txids.extend(new_demoted.iter().copied());
+            frontier = new_demoted;
         }
 
         // UTXO rebuild on every funds account so the spendable set
