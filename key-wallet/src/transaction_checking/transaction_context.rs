@@ -161,6 +161,26 @@ mod tests {
         assert_eq!(format!("{}", abandoned), "abandoned");
     }
 
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip_conflicted() {
+        let original = TransactionContext::Conflicted {
+            previous: Box::new(TransactionContext::InBlock(sample_block_info())),
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: TransactionContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip_abandoned() {
+        let original = TransactionContext::Abandoned;
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: TransactionContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+    }
+
     #[test]
     fn conflicted_preserves_previous_in_block_context() {
         let previous = TransactionContext::InBlock(sample_block_info());
