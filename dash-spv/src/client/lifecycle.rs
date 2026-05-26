@@ -50,7 +50,10 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // Clamp wallet heights to the (possibly repaired) block-header tip so
         // a mid-cascade crash recovery cannot leave wallet metadata pointing
         // above a height the local header chain no longer contains.
-        if let Some(tip) = storage.block_headers().read().await.get_tip_height().await {
+        // Bind the tip into a local so the block-header read guard is dropped
+        // before the wallet write lock is acquired.
+        let tip_after_repair = storage.block_headers().read().await.get_tip_height().await;
+        if let Some(tip) = tip_after_repair {
             wallet.write().await.clamp_heights_to(tip).await;
         }
 
