@@ -1168,6 +1168,48 @@ mod tests {
     }
 
     #[test]
+    fn transaction_context_from_ffi_conflicted_returns_none() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::Conflicted,
+            &FFIBlockInfo::empty(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_abandoned_returns_none() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::Abandoned,
+            &FFIBlockInfo::empty(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ffi_transaction_context_type_from_conflicted() {
+        let ctx = TransactionContext::Conflicted {
+            previous: Box::new(TransactionContext::Mempool),
+        };
+        assert!(matches!(
+            FFITransactionContextType::from(ctx),
+            FFITransactionContextType::Conflicted
+        ));
+    }
+
+    #[test]
+    fn test_ffi_transaction_context_type_from_abandoned() {
+        let ctx = TransactionContext::Abandoned;
+        assert!(matches!(
+            FFITransactionContextType::from(ctx),
+            FFITransactionContextType::Abandoned
+        ));
+    }
+
+    #[test]
     fn test_ffi_transaction_context_from_in_block() {
         let hash = dashcore::BlockHash::from_byte_array([0xab; 32]);
         let block_info = BlockInfo::new(1000, hash, 1700000000);
