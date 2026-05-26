@@ -425,15 +425,19 @@ impl PeerNetworkManager {
     }
 
     /// Remove a peer from the pool, decrement the connected count, and emit
-    /// PeerDisconnected / PeersUpdated events.
+    /// PeerDisconnected / PeersUpdated events. Returns `true` when the peer was
+    /// present and removed, `false` when it was already absent.
     async fn remove_peer_and_notify(
         pool: &PeerPool,
         addr: &SocketAddr,
         connected_peer_count: &AtomicUsize,
         network_event_sender: &broadcast::Sender<NetworkEvent>,
-    ) {
+    ) -> bool {
         if pool.remove_peer(addr).await.is_some() {
             Self::notify_peer_removed(pool, addr, connected_peer_count, network_event_sender).await;
+            true
+        } else {
+            false
         }
     }
 
@@ -1338,7 +1342,7 @@ impl PeerNetworkManager {
     ) -> Result<(), Error> {
         tracing::info!("Disconnecting peer {}, reason: {}", addr, reason.as_str());
 
-        Self::remove_peer_and_notify(
+        let removed = Self::remove_peer_and_notify(
             &self.pool,
             addr,
             &self.connected_peer_count,
@@ -1346,7 +1350,9 @@ impl PeerNetworkManager {
         )
         .await;
 
-        self.reputation_manager.record_disconnect(*addr, reason).await;
+        if removed {
+            self.reputation_manager.record_disconnect(*addr, reason).await;
+        }
 
         Ok(())
     }
