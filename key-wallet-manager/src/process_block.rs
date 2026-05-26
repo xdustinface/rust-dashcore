@@ -3,7 +3,6 @@ use crate::wallet_interface::{
     BlockProcessingResult, MempoolTransactionResult, RewindError, RewindResult, WalletInterface,
 };
 use crate::{WalletEvent, WalletId, WalletManager};
-use key_wallet::wallet::managed_wallet_info::wallet_info_interface::RewindRejection;
 use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
@@ -13,6 +12,7 @@ use dashcore::{Address, Block, Transaction};
 use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::{BlockInfo, DerivedAddressInfo, TransactionContext};
+use key_wallet::wallet::managed_wallet_info::wallet_info_interface::RewindRejection;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::WalletCoreBalance;
 use std::collections::{BTreeMap, BTreeSet};
