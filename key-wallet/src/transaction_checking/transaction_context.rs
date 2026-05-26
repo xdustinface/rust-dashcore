@@ -76,7 +76,26 @@ impl std::fmt::Display for TransactionContext {
             }
             TransactionContext::Conflicted {
                 previous,
-            } => write!(f, "conflicted (was {})", previous),
+            } => {
+                // The `Conflicted.previous` invariant forbids nesting, but
+                // a corrupted on-disk state could still deserialize a
+                // chain. Walk iteratively to avoid a stack overflow and
+                // bail out if the chain is unexpectedly deep.
+                const MAX_DEPTH: usize = 16;
+                let mut depth = 0usize;
+                let mut cur: &TransactionContext = previous;
+                while let TransactionContext::Conflicted {
+                    previous: inner,
+                } = cur
+                {
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return write!(f, "conflicted (deeply nested)");
+                    }
+                    cur = inner;
+                }
+                write!(f, "conflicted (was {})", cur)
+            }
             TransactionContext::Abandoned => write!(f, "abandoned"),
         }
     }
@@ -184,6 +203,17 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: TransactionContext = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn deeply_nested_conflicted_display_does_not_overflow() {
+        let mut ctx = TransactionContext::Mempool;
+        for _ in 0..1000 {
+            ctx = TransactionContext::Conflicted {
+                previous: Box::new(ctx),
+            };
+        }
+        assert_eq!(format!("{}", ctx), "conflicted (deeply nested)");
     }
 
     #[test]
