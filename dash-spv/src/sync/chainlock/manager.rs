@@ -134,11 +134,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 BlockHashVerification::Match | BlockHashVerification::Unknown => {
                     if self.validate_signature(&pending).await {
                         self.progress.add_valid(1);
-                        self.progress.update_best_validated_height(pending.block_height);
-                        let height = pending.block_height;
-                        self.best_chainlock = Some(pending);
-                        self.chainlock_height.store(height, Ordering::Release);
-                        self.save_best_chainlock().await;
+                        self.commit_validated_chainlock(&pending).await;
                     } else {
                         self.progress.add_invalid(1);
                     }
@@ -148,12 +144,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                 } => {
                     if self.validate_signature(&pending).await {
                         self.progress.add_valid(1);
-                        self.progress.update_best_validated_height(pending.block_height);
-                        let height = pending.block_height;
-                        let fork_height = height.saturating_sub(1);
-                        self.best_chainlock = Some(pending.clone());
-                        self.chainlock_height.store(height, Ordering::Release);
-                        self.save_best_chainlock().await;
+                        let fork_height = pending.block_height.saturating_sub(1);
                         return vec![SyncEvent::ChainLockForcedReorg {
                             chain_lock: pending,
                             fork_height,
@@ -173,6 +164,21 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         } else {
             vec![]
         }
+    }
+
+    /// Advance the best-chainlock state to `cl` and persist to disk.
+    ///
+    /// Called whenever a chainlock has been BLS-validated and the active
+    /// chain agrees with its block hash (`Match` / `Unknown` paths). The
+    /// `Mismatch` path deliberately does not call this: the cascade must
+    /// commit before the floor advances so the node never holds a persisted
+    /// chainlock that disagrees with the active chain tip.
+    async fn commit_validated_chainlock(&mut self, cl: &ChainLock) {
+        let height = cl.block_height;
+        self.progress.update_best_validated_height(height);
+        self.best_chainlock = Some(cl.clone());
+        self.chainlock_height.store(height, Ordering::Release);
+        self.save_best_chainlock().await;
     }
 
     pub(super) fn is_masternode_ready(&self) -> bool {
@@ -671,14 +677,11 @@ mod tests {
         assert_eq!(manager.progress.valid(), 0);
     }
 
-    /// `on_masternode_ready` with a pending `Mismatch` chainlock and a valid BLS
-    /// signature must emit `ChainLockForcedReorg` and advance `best_chainlock`.
-    /// Because the unit-test engine has no quorum keys and always rejects BLS
-    /// signatures, this test exercises the invalid-signature branch of the same
-    /// `Mismatch` arm to verify the path is reachable and the side-effects of the
-    /// invalid-sig branch (invalid counter, no best_chainlock update) are correct.
-    /// The valid-sig branch (ChainLockForcedReorg + best_chainlock update) is
-    /// covered by the dashd integration test suite.
+    /// `on_masternode_ready` with a pending `Mismatch` chainlock exercises the
+    /// invalid-signature branch: invalid counter incremented, no `best_chainlock`
+    /// update, no event emitted. The valid-sig branch emits `ChainLockForcedReorg`
+    /// without advancing `best_chainlock` (the floor advances only after the
+    /// cascade commits) and is covered by the dashd integration test suite.
     #[tokio::test]
     async fn test_on_masternode_ready_mismatch_invalid_sig_counts_invalid() {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
