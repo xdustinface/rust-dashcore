@@ -746,6 +746,7 @@ impl<'de> Deserialize<'de> for ManagedCoreFundsAccount {
             .keys
             .transactions()
             .values()
+            .filter(|record| !record.context.is_inactive())
             .flat_map(|record| &record.transaction.input)
             .map(|input| input.previous_output)
             .collect();
