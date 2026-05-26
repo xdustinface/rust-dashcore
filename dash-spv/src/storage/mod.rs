@@ -34,6 +34,7 @@ pub use crate::storage::filter_headers::{FilterHeaderStorage, PersistentFilterHe
 pub use crate::storage::filters::{FilterStorage, PersistentFilterStorage};
 pub use crate::storage::masternode::{MasternodeStateStorage, PersistentMasternodeStateStorage};
 pub use crate::storage::metadata::{MetadataStorage, PersistentMetadataStorage};
+use crate::storage::metadata::REORG_SENTINEL_FILE;
 pub use crate::storage::peers::{PeerStorage, PersistentPeerStorage};
 
 pub use types::*;
@@ -400,12 +401,31 @@ impl metadata::MetadataStorage for DiskStorageManager {
         self.metadata.read().await.load_metadata(key).await
     }
 
+    async fn delete_metadata(&mut self, key: &str) -> StorageResult<()> {
+        self.metadata.write().await.delete_metadata(key).await
+    }
+
     async fn store_last_target_height(&mut self, height: CoreBlockHeight) -> StorageResult<()> {
         self.metadata.write().await.store_last_target_height(height).await
     }
 
     async fn load_last_target_height(&self) -> StorageResult<CoreBlockHeight> {
         self.metadata.read().await.load_last_target_height().await
+    }
+
+    async fn write_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.write_reorg_sentinel().await
+    }
+
+    async fn clear_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.clear_reorg_sentinel().await
+    }
+
+    fn is_reorg_sentinel_set(&self) -> bool {
+        self.storage_path
+            .join(PersistentMetadataStorage::FOLDER_NAME)
+            .join(REORG_SENTINEL_FILE)
+            .exists()
     }
 }
 
