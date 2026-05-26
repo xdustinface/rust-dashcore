@@ -140,6 +140,12 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// default implementation is a no-op; implementations that track per-wallet
     /// heights must iterate their internal wallets and bound both metadata
     /// fields with `min(current, tip)`.
+    ///
+    /// The return type is intentionally `()`. This operation is a pure in-memory
+    /// clamp of wallet metadata, so it must not perform any fallible I/O or
+    /// validation. Implementors that need to persist the clamped state must do
+    /// so eagerly during ordinary operation, not from inside this call, so the
+    /// startup path remains infallible.
     async fn clamp_heights_to(&mut self, _tip: CoreBlockHeight) {}
 
     /// Return a revision counter that increments whenever the set of monitored
