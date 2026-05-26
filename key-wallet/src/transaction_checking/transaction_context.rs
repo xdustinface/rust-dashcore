@@ -47,6 +47,17 @@ pub enum TransactionContext {
     InBlock(BlockInfo),
     /// Transaction is in a chain-locked block at the given height
     InChainLockedBlock(BlockInfo),
+    /// Transaction was reorganized out and is now superseded by a
+    /// double-spending transaction on the active chain. `previous`
+    /// remembers the last confirmed-or-mempool context so the UI can
+    /// surface what state the tx was in before the conflict.
+    Conflicted {
+        previous: Box<TransactionContext>,
+    },
+    /// Transaction was reorganized out and is not expected to confirm
+    /// again (e.g. its inputs have been spent elsewhere and the user
+    /// has chosen to drop it). Terminal state.
+    Abandoned,
 }
 
 impl std::fmt::Display for TransactionContext {
@@ -58,6 +69,10 @@ impl std::fmt::Display for TransactionContext {
             TransactionContext::InChainLockedBlock(info) => {
                 write!(f, "chainlocked block {}", info.height)
             }
+            TransactionContext::Conflicted {
+                previous,
+            } => write!(f, "conflicted (was {})", previous),
+            TransactionContext::Abandoned => write!(f, "abandoned"),
         }
     }
 }
@@ -74,7 +89,7 @@ impl TransactionContext {
     }
 
     /// Returns whether the transaction has been mined in a block that is
-    /// itself chainlocked — the strongest finality signal we have, and
+    /// itself chainlocked, the strongest finality signal we have, and
     /// the only one we treat as truly "finalized".
     ///
     /// `InBlock` alone is not enough (the block can still be reorganized
@@ -89,7 +104,12 @@ impl TransactionContext {
     /// Returns the block info if confirmed.
     pub fn block_info(&self) -> Option<&BlockInfo> {
         match self {
-            TransactionContext::Mempool | TransactionContext::InstantSend(_) => None,
+            TransactionContext::Mempool
+            | TransactionContext::InstantSend(_)
+            | TransactionContext::Conflicted {
+                ..
+            }
+            | TransactionContext::Abandoned => None,
             TransactionContext::InBlock(info) | TransactionContext::InChainLockedBlock(info) => {
                 Some(info)
             }

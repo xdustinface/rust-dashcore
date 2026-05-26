@@ -86,6 +86,7 @@ pub(crate) fn transaction_context_from_ffi(
             }
             Some(TransactionContext::InChainLockedBlock(block_info.to_block_info()))
         }
+        FFITransactionContextType::Conflicted | FFITransactionContextType::Abandoned => None,
     }
 }
 
@@ -684,6 +685,12 @@ pub enum FFITransactionContextType {
     InBlock = 2,
     /// Transaction is in a chain-locked block at the given height
     InChainLockedBlock = 3,
+    /// Transaction was reorganized out and is superseded by a conflicting
+    /// transaction. The previous context is not surfaced across the FFI
+    /// boundary.
+    Conflicted = 4,
+    /// Transaction was reorganized out and is not expected to confirm again.
+    Abandoned = 5,
 }
 
 impl From<TransactionContext> for FFITransactionContextType {
@@ -695,6 +702,10 @@ impl From<TransactionContext> for FFITransactionContextType {
             TransactionContext::InChainLockedBlock(_) => {
                 FFITransactionContextType::InChainLockedBlock
             }
+            TransactionContext::Conflicted {
+                ..
+            } => FFITransactionContextType::Conflicted,
+            TransactionContext::Abandoned => FFITransactionContextType::Abandoned,
         }
     }
 }
