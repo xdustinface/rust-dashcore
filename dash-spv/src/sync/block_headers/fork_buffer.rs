@@ -909,11 +909,12 @@ mod tests {
         assert_eq!(buf.len(), 2);
 
         let candidate = buf.take_branch_by_tip(&tip_a).expect("branch a must be found");
-        assert_eq!(*candidate.headers.last().unwrap().hash(), tip_a, "returned candidate must be branch A");
-        assert_eq!(buf.len(), 1, "only branch A must be removed");
-        assert!(
-            buf.branches.contains_key(&(peer_b, tip_b)),
-            "branch B must remain in the buffer"
+        assert_eq!(
+            *candidate.headers.last().unwrap().hash(),
+            tip_a,
+            "returned candidate must be branch A"
         );
+        assert_eq!(buf.len(), 1, "only branch A must be removed");
+        assert!(buf.branches.contains_key(&(peer_b, tip_b)), "branch B must remain in the buffer");
     }
 }

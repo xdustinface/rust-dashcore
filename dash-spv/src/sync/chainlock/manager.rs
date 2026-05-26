@@ -143,7 +143,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                         self.progress.add_invalid(1);
                     }
                 }
-                BlockHashVerification::Mismatch { .. } => {
+                BlockHashVerification::Mismatch {
+                    ..
+                } => {
                     if self.validate_signature(&pending).await {
                         self.progress.add_valid(1);
                         let fork_height = pending.block_height.saturating_sub(1);

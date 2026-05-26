@@ -1797,12 +1797,7 @@ mod tests {
         // Pre-populate the deny-list for the fork tip so `drive_reorg` returns
         // `None` without cascading. The deny-list check runs before any storage
         // mutation, so no truncation occurs.
-        manager
-            .reorg_state
-            .lock()
-            .await
-            .deny_list
-            .insert(fork_tip_hash, u32::MAX);
+        manager.reorg_state.lock().await.deny_list.insert(fork_tip_hash, u32::MAX);
         manager.cl_forced_reorg_pending = Some(ChainLock {
             block_height: 6,
             block_hash: fork_tip_hash,
