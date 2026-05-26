@@ -16,6 +16,7 @@ mod message_type;
 mod tests;
 
 pub use event::NetworkEvent;
+pub use reputation::DisconnectReason;
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
@@ -252,8 +253,13 @@ pub trait NetworkManager: Send + Sync + 'static {
     /// should be processed through the same pipeline as peer-received messages.
     async fn dispatch_local(&self, message: NetworkMessage);
 
-    /// Disconnect a specific peer by address.
-    async fn disconnect_peer(&self, _addr: &SocketAddr, _reason: &str) -> NetworkResult<()>;
+    /// Disconnect a specific peer by address. The `reason` is recorded against
+    /// the peer's reputation so subsequent selection passes can use it.
+    async fn disconnect_peer(
+        &self,
+        _addr: &SocketAddr,
+        _reason: DisconnectReason,
+    ) -> NetworkResult<()>;
 
     /// Subscribe to network events (peer connections, disconnections).
     ///

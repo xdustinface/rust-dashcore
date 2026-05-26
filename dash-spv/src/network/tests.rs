@@ -19,9 +19,11 @@ mod peer_tests {
 
 #[cfg(test)]
 mod pool_tests {
+    use crate::network::constants::TARGET_PEERS;
     use crate::network::manager::PeerNetworkManager;
     use crate::network::peer::Peer;
     use crate::network::pool::PeerPool;
+    use crate::network::reputation::{misbehavior_scores, DisconnectReason};
     use crate::test_utils::test_socket_address;
     use dashcore::network::constants::ServiceFlags;
     use dashcore::Network;
@@ -99,6 +101,193 @@ mod pool_tests {
         assert!(manager.test_is_connected(&p2).await);
         assert!(!manager.test_is_connected(&p3).await);
         assert!(!manager.test_is_connected(&p4).await);
+    }
+
+    #[tokio::test]
+    async fn test_next_peer_skips_banned_and_favours_low_score() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let good = test_socket_address(11);
+        let neutral = test_socket_address(12);
+        let banned = test_socket_address(13);
+
+        manager.insert_test_peer(good, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(neutral, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(banned, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        reputation.update_reputation(good, -50, "best").await;
+        for _ in 0..10 {
+            reputation
+                .update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse")
+                .await;
+        }
+        assert!(reputation.is_banned(&banned).await);
+
+        let samples = 2_000;
+        let mut good_hits = 0u32;
+        let mut neutral_hits = 0u32;
+        for _ in 0..samples {
+            match manager.test_next_peer_from_pool().await {
+                Some(addr) if addr == good => good_hits += 1,
+                Some(addr) if addr == neutral => neutral_hits += 1,
+                Some(addr) if addr == banned => panic!("banned peer must never be selected"),
+                Some(other) => panic!("unexpected peer {}", other),
+                None => panic!("expected a selectable peer"),
+            }
+        }
+        assert_eq!(good_hits + neutral_hits, samples);
+
+        // Weight good = max(1, 100 - (-50)) = 150, weight neutral = max(1, 100 - 0) = 100.
+        // Good should dominate by ~1.5x, so good_hits must exceed neutral_hits.
+        assert!(
+            good_hits > neutral_hits,
+            "good (weight 150) must beat neutral (weight 100): good={}, neutral={}",
+            good_hits,
+            neutral_hits
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_peer_returns_none_when_all_peers_banned() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let a = test_socket_address(14);
+        let b = test_socket_address(15);
+
+        manager.insert_test_peer(a, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(b, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        for _ in 0..10 {
+            reputation.update_reputation(a, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+            reputation.update_reputation(b, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(reputation.is_banned(&a).await);
+        assert!(reputation.is_banned(&b).await);
+
+        assert!(
+            manager.test_next_peer_from_pool().await.is_none(),
+            "next_peer must return None when all peers are banned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_peer_weighted_selection_distribution() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let high = test_socket_address(21);
+        let zero = test_socket_address(22);
+
+        manager.insert_test_peer(high, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(zero, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        // score=100 is the ban threshold, push score to 99 to keep peer eligible.
+        reputation.update_reputation(high, 99, "near-ban score for weighting").await;
+
+        let samples = 4_000;
+        let mut high_hits = 0u32;
+        let mut zero_hits = 0u32;
+        for _ in 0..samples {
+            match manager.test_next_peer_from_pool().await.expect("peer present") {
+                addr if addr == high => high_hits += 1,
+                addr if addr == zero => zero_hits += 1,
+                other => panic!("unexpected peer {}", other),
+            }
+        }
+
+        // Weight high (score 99) = max(1, 100 - 99) = 1, weight zero (score 0) = 100 - 0 = 100.
+        // zero should dominate by ~100x. Use a loose lower bound to stay robust.
+        let ratio = zero_hits as f64 / high_hits.max(1) as f64;
+        assert!(
+            ratio > 20.0,
+            "neutral peer (weight 100) should massively outpace near-ban peer (weight 1): zero={}, high={}, ratio={}",
+            zero_hits,
+            high_hits,
+            ratio
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eviction_guard_replaces_worst_when_score_is_strictly_worse() {
+        let cf = ServiceFlags::NETWORK;
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let reputation = manager.test_reputation_manager();
+
+        // Fill the pool to capacity. TARGET_PEERS = 3.
+        let peers: Vec<_> = (0..TARGET_PEERS).map(|i| test_socket_address(i as u8 + 30)).collect();
+        for &addr in &peers {
+            manager.insert_test_peer(addr, cf).await;
+            reputation.update_reputation(addr, 10, "mild").await;
+        }
+        // Make one peer the clear worst.
+        let worst = peers[0];
+        reputation.update_reputation(worst, 60, "bad").await; // total score = 70
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS);
+
+        // Incoming peer with score 0 is better: eviction must fire and remove `worst`.
+        let incoming = test_socket_address(99);
+        let evicted = manager.try_evict_for_incoming(incoming).await;
+        assert!(evicted, "better incoming peer must trigger eviction");
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS - 1, "pool must shrink by one");
+        assert!(!manager.test_is_connected(&worst).await, "worst peer must be gone after eviction");
+
+        let reputations = reputation.get_all_reputations().await;
+        assert_eq!(
+            reputations[&worst].last_disconnect_reason,
+            Some(DisconnectReason::PoolFull),
+            "evicted peer must have PoolFull recorded as disconnect reason"
+        );
+
+        // Re-fill to capacity for the guard-rejection scenario.
+        let filler = test_socket_address(100);
+        manager.insert_test_peer(filler, cf).await;
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS);
+
+        // Incoming peer with high score (worse than all existing peers): no eviction.
+        let bad_incoming = test_socket_address(101);
+        reputation.update_reputation(bad_incoming, 80, "newcomer is bad").await;
+        let evicted = manager.try_evict_for_incoming(bad_incoming).await;
+        assert!(!evicted, "incoming peer worse than the worst must not trigger eviction");
+        assert_eq!(manager.test_peer_count().await, TARGET_PEERS, "pool size must not change");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_targets_skip_banned_peers() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let good = test_socket_address(51);
+        let banned = test_socket_address(52);
+        let good2 = test_socket_address(53);
+
+        manager.insert_test_peer(good, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(banned, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(good2, ServiceFlags::NETWORK).await;
+
+        let reputation = manager.test_reputation_manager();
+        for _ in 0..10 {
+            reputation
+                .update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse")
+                .await;
+        }
+        assert!(reputation.is_banned(&banned).await);
+
+        let targets = manager.test_broadcast_targets().await;
+        assert!(targets.contains(&good), "good peer must be a broadcast target");
+        assert!(targets.contains(&good2), "second good peer must also be a broadcast target");
+        assert!(!targets.contains(&banned), "banned peer must not be a broadcast target");
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_peer_absent_does_not_record_reputation() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let absent = test_socket_address(200);
+
+        manager.disconnect_peer(&absent, DisconnectReason::Manual).await.unwrap();
+
+        let reps = manager.test_reputation_manager().get_all_reputations().await;
+        assert!(
+            reps.get(&absent).and_then(|r| r.last_disconnect_reason).is_none(),
+            "disconnect_peer on absent peer must not record a disconnect reason"
+        );
     }
 
     #[tokio::test(start_paused = true)]

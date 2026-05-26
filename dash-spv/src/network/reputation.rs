@@ -83,6 +83,9 @@ const MAX_MISBEHAVIOR_SCORE: i32 = 100;
 /// Minimum score (most positive reputation)
 const MIN_MISBEHAVIOR_SCORE: i32 = -50;
 
+/// Minimum weight a non-banned peer can receive during weighted peer selection.
+const MIN_SELECTION_WEIGHT: u32 = 1;
+
 const MAX_BAN_COUNT: u32 = 1000;
 
 const MAX_ACTION_COUNT: u64 = 1_000_000;
@@ -211,6 +214,11 @@ pub struct PeerReputation {
     /// Failures since the last success. Resets to 0 on a successful handshake.
     #[serde(deserialize_with = "clamp_peer_consecutive_failures")]
     pub consecutive_failures: u32,
+
+    /// Cause of the most recent disconnect, if any. Defaulted on load so older
+    /// reputation files without this field continue to deserialize.
+    #[serde(default)]
+    pub last_disconnect_reason: Option<DisconnectReason>,
 }
 
 impl Default for PeerReputation {
@@ -228,6 +236,7 @@ impl Default for PeerReputation {
             last_success: None,
             last_tried: None,
             consecutive_failures: 0,
+            last_disconnect_reason: None,
         }
     }
 }
@@ -245,7 +254,8 @@ impl PeerReputation {
 
     /// Check if the peer is currently banned
     pub fn is_banned(&self) -> bool {
-        self.banned_until.is_some_and(|until| Instant::now() < until)
+        self.score >= MAX_MISBEHAVIOR_SCORE
+            || self.banned_until.is_some_and(|until| Instant::now() < until)
     }
 
     /// Get remaining ban time
@@ -281,7 +291,7 @@ impl PeerReputation {
             self.positive_actions += 1;
         }
 
-        let should_ban = self.score >= MAX_MISBEHAVIOR_SCORE && !self.is_banned();
+        let should_ban = self.score >= MAX_MISBEHAVIOR_SCORE && self.banned_until.is_none();
         if should_ban {
             self.banned_until = Some(Instant::now() + BAN_DURATION);
             self.ban_count += 1;
@@ -324,9 +334,44 @@ impl PeerReputation {
             self.last_update = now;
         }
 
-        // Check if ban has expired
-        if self.is_banned() && self.ban_time_remaining().is_none() {
+        // Check if a time-based ban has expired.
+        if self.banned_until.is_some() && self.ban_time_remaining().is_none() {
             self.banned_until = None;
+        }
+    }
+}
+
+/// Reason a peer connection was terminated. Recorded against the peer's
+/// reputation so future selection passes and operators can distinguish, for
+/// example, a single decode error from a peer that fails every handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisconnectReason {
+    Timeout,
+    HandshakeFailure,
+    ProtocolViolation,
+    DecodeError,
+    PingTimeout,
+    CapabilityMismatch,
+    Manual,
+    PoolFull,
+    Shutdown,
+    RemoteDisconnect,
+}
+
+impl DisconnectReason {
+    /// Short stable string used in logs and reputation event reasons.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DisconnectReason::Timeout => "timeout",
+            DisconnectReason::HandshakeFailure => "handshake failure",
+            DisconnectReason::ProtocolViolation => "protocol violation",
+            DisconnectReason::DecodeError => "decode error",
+            DisconnectReason::PingTimeout => "ping timeout",
+            DisconnectReason::CapabilityMismatch => "capability mismatch",
+            DisconnectReason::Manual => "manual",
+            DisconnectReason::PoolFull => "pool full",
+            DisconnectReason::Shutdown => "shutdown",
+            DisconnectReason::RemoteDisconnect => "remote disconnect",
         }
     }
 }
@@ -404,6 +449,115 @@ impl PeerReputationManager {
             let drain_count = events.len() - self.max_events;
             events.drain(0..drain_count);
         }
+    }
+
+    /// Pick the eviction candidate from `peers`. The codebase scores misbehavior
+    /// upward (higher = worse), so the worst reputation has the highest score.
+    /// Ties at the worst score are broken by selecting the peer with the most
+    /// recent negative reputation event so chronic offenders are preferred over
+    /// quiet peers. Returns the chosen peer together with the score observed
+    /// under the same lock acquisition that selected it, so callers can compare
+    /// against an incoming peer's score without racing a concurrent reputation
+    /// update. Returns `None` if `peers` is empty.
+    pub(crate) async fn pick_worst<T>(
+        &self,
+        peers: &[(SocketAddr, T)],
+    ) -> Option<(SocketAddr, i32)> {
+        if peers.is_empty() {
+            return None;
+        }
+
+        let scores: HashMap<SocketAddr, i32> = {
+            let mut reputations = self.reputations.write().await;
+            peers
+                .iter()
+                .map(|(addr, _)| {
+                    let score = reputations
+                        .get_mut(addr)
+                        .map(|rep| {
+                            rep.apply_decay();
+                            rep.score
+                        })
+                        .unwrap_or(0);
+                    (*addr, score)
+                })
+                .collect()
+        };
+
+        let worst_score = *scores.values().max().expect("peers is non-empty");
+        let tied: Vec<SocketAddr> = peers
+            .iter()
+            .filter(|(addr, _)| scores.get(addr).copied().unwrap_or(0) == worst_score)
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        if tied.len() == 1 {
+            return Some((tied[0], worst_score));
+        }
+
+        let mut latest_negative: HashMap<SocketAddr, Instant> = HashMap::new();
+        let events = self.recent_events.read().await;
+        for ev in events.iter() {
+            if ev.change > 0 && tied.contains(&ev.peer) {
+                latest_negative
+                    .entry(ev.peer)
+                    .and_modify(|t| {
+                        if ev.timestamp > *t {
+                            *t = ev.timestamp;
+                        }
+                    })
+                    .or_insert(ev.timestamp);
+            }
+        }
+        drop(events);
+
+        let victim = tied
+            .into_iter()
+            .max_by_key(|addr| latest_negative.get(addr).copied())
+            .unwrap_or(peers[0].0);
+        Some((victim, worst_score))
+    }
+
+    /// Compute weights for `peers` so that lower (better) scores yield higher weights.
+    /// Score range `-50..100` maps to weights `150..1`. Unknown peers receive the
+    /// neutral weight (`MAX_MISBEHAVIOR_SCORE - 0 = 100`). Banned peers receive
+    /// weight 0 and are effectively excluded.
+    pub(crate) async fn selection_weights<T>(&self, peers: &[(SocketAddr, T)]) -> Vec<u32> {
+        let mut reputations = self.reputations.write().await;
+        peers
+            .iter()
+            .map(|(addr, _)| {
+                let Some(rep) = reputations.get_mut(addr) else {
+                    return MAX_MISBEHAVIOR_SCORE as u32;
+                };
+                rep.apply_decay();
+                if rep.is_banned() {
+                    0
+                } else {
+                    (MAX_MISBEHAVIOR_SCORE - rep.score).max(MIN_SELECTION_WEIGHT as i32) as u32
+                }
+            })
+            .collect()
+    }
+
+    /// Remove banned peers from `peers`. Applies decay so a ban that has just
+    /// expired is no longer enforced. Returns the surviving subset preserving
+    /// the input order.
+    pub(crate) async fn filter_unbanned<T>(
+        &self,
+        peers: Vec<(SocketAddr, T)>,
+    ) -> Vec<(SocketAddr, T)> {
+        let mut reputations = self.reputations.write().await;
+        peers
+            .into_iter()
+            .filter(|(addr, _)| {
+                let Some(rep) = reputations.get_mut(addr) else {
+                    return true;
+                };
+                rep.apply_decay();
+                !rep.is_banned()
+            })
+            .collect()
     }
 
     /// Check if a peer is banned
@@ -501,6 +655,25 @@ impl PeerReputationManager {
         self.record_event(event).await;
 
         should_ban
+    }
+
+    /// Record a peer disconnect with its cause. Updates `last_disconnect_reason`
+    /// on the peer's reputation entry and appends a `ReputationEvent` so the
+    /// event log retains the cause for monitoring.
+    pub(crate) async fn record_disconnect(&self, peer: SocketAddr, reason: DisconnectReason) {
+        {
+            let mut reputations = self.reputations.write().await;
+            let reputation = reputations.entry(peer).or_default();
+            reputation.last_disconnect_reason = Some(reason);
+        }
+
+        let event = ReputationEvent {
+            peer,
+            change: 0,
+            reason: format!("disconnect: {}", reason.as_str()),
+            timestamp: Instant::now(),
+        };
+        self.record_event(event).await;
     }
 
     /// Get all peer reputations

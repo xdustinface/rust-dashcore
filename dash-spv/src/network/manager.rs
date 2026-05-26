@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::thread_rng;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time;
@@ -17,7 +20,7 @@ use crate::network::constants::*;
 use crate::network::discovery::DnsDiscovery;
 use crate::network::pool::PeerPool;
 use crate::network::reputation::{
-    misbehavior_scores, positive_scores, PeerReputationManager, ReputationAware,
+    misbehavior_scores, positive_scores, DisconnectReason, PeerReputationManager, ReputationAware,
 };
 use crate::network::{
     HandshakeManager, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
@@ -77,8 +80,6 @@ pub struct PeerNetworkManager {
     request_tx: UnboundedSender<NetworkRequest>,
     /// Request queue receiver (consumed by send loop).
     request_rx: Arc<Mutex<Option<UnboundedReceiver<NetworkRequest>>>>,
-    /// Round-robin counter for distributing requests across peers.
-    round_robin_counter: Arc<AtomicUsize>,
     /// Network event bus for notifying about network/peer related changes.
     network_event_sender: broadcast::Sender<NetworkEvent>,
 }
@@ -137,7 +138,6 @@ impl PeerNetworkManager {
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
             request_tx,
             request_rx: Arc::new(Mutex::new(Some(request_rx))),
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
             network_event_sender: broadcast::Sender::new(DEFAULT_NETWORK_EVENT_CAPACITY),
         })
     }
@@ -242,18 +242,7 @@ impl PeerNetworkManager {
         // Record connection attempt
         self.reputation_manager.record_connection_attempt(addr).await;
 
-        let pool = self.pool.clone();
-        let network = self.network;
-        let addrv2_handler = self.addrv2_handler.clone();
-        let shutdown_token = self.shutdown_token.clone();
-        let reputation_manager = self.reputation_manager.clone();
-        let user_agent = self.user_agent.clone();
-        let required_services = self.required_services;
-        let capability_rejected = self.capability_rejected.clone();
-        let connected_peer_count = self.connected_peer_count.clone();
-        let headers2_disabled = self.headers2_disabled.clone();
-        let message_dispatcher = self.message_dispatcher.clone();
-        let network_event_sender = self.network_event_sender.clone();
+        let manager = self.clone();
 
         // Spawn connection task — use select to avoid blocking on the lock during shutdown
         let mut tasks = tokio::select! {
@@ -267,10 +256,10 @@ impl PeerNetworkManager {
             tracing::debug!("Attempting to connect to {}", addr);
 
             let connect_result = tokio::select! {
-                result = Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), network) => result,
-                _ = shutdown_token.cancelled() => {
+                result = Peer::connect(addr, CONNECTION_TIMEOUT.as_secs(), manager.network) => result,
+                _ = manager.shutdown_token.cancelled() => {
                     tracing::debug!("Connection to {} cancelled by shutdown", addr);
-                    pool.remove_peer(&addr).await;
+                    manager.pool.remove_peer(&addr).await;
                     return;
                 }
             };
@@ -278,27 +267,31 @@ impl PeerNetworkManager {
             match connect_result {
                 Ok(mut peer) => {
                     // Perform handshake
-                    let mut handshake_manager = HandshakeManager::new(network, user_agent);
+                    let mut handshake_manager = HandshakeManager::new(manager.network, manager.user_agent.clone());
                     match handshake_manager.perform_handshake(&mut peer).await {
                         Ok(_) => {
                             if PeerNetworkManager::should_reject_after_handshake(
-                                &pool,
+                                &manager.pool,
                                 &peer,
-                                required_services,
+                                manager.required_services,
                             )
                             .await
                             {
                                 tracing::info!(
                                     "Rejecting peer {} during handshake - missing required services ({}) while a capable peer is connected",
                                     addr,
-                                    required_services
+                                    manager.required_services
                                 );
                                 PeerNetworkManager::record_capability_rejection_in(
-                                    &capability_rejected,
+                                    &manager.capability_rejected,
                                     addr,
                                 )
                                 .await;
-                                pool.remove_peer(&addr).await;
+                                manager.pool.remove_peer(&addr).await;
+                                manager
+                                    .reputation_manager
+                                    .record_disconnect(addr, DisconnectReason::CapabilityMismatch)
+                                    .await;
                                 return;
                             }
                             tracing::info!("Successfully connected to {}", addr);
@@ -313,25 +306,33 @@ impl PeerNetworkManager {
                                 handshake_manager.peer_services().unwrap_or(ServiceFlags::NETWORK);
 
                             // Record successful connection
-                            reputation_manager.record_successful_connection(addr).await;
+                            manager
+                                .reputation_manager
+                                .record_successful_connection(addr)
+                                .await;
+
+                            // If the pool is at capacity, evict the worst-scored peer
+                            // before adding so a fresh candidate with reputation 0 can
+                            // displace a peer whose score has drifted into negative territory.
+                            manager.try_evict_for_incoming(addr).await;
 
                             // Add to pool
-                            if let Err(e) = pool.add_peer(addr, peer).await {
+                            if let Err(e) = manager.pool.add_peer(addr, peer).await {
                                 tracing::error!("Failed to add peer to pool: {}", e);
                                 return;
                             }
 
                             // Increment connected peer counter on successful add
-                            connected_peer_count.fetch_add(1, Ordering::Relaxed);
+                            manager.connected_peer_count.fetch_add(1, Ordering::Relaxed);
 
                             // Emit peer connected event
-                            let count = connected_peer_count.load(Ordering::Relaxed);
-                            let addresses = pool.get_connected_addresses().await;
-                            let best_height = pool.get_best_height().await;
-                            let _ = network_event_sender.send(NetworkEvent::PeerConnected {
+                            let count = manager.connected_peer_count.load(Ordering::Relaxed);
+                            let addresses = manager.pool.get_connected_addresses().await;
+                            let best_height = manager.pool.get_best_height().await;
+                            let _ = manager.network_event_sender.send(NetworkEvent::PeerConnected {
                                 address: addr,
                             });
-                            let _ = network_event_sender.send(NetworkEvent::PeersUpdated {
+                            let _ = manager.network_event_sender.send(NetworkEvent::PeersUpdated {
                                 connected_count: count,
                                 addresses,
                                 best_height,
@@ -339,32 +340,37 @@ impl PeerNetworkManager {
 
                             // Bump the AddrV2 time on direct observation, using the peer's
                             // actual advertised services from the version message.
-                            addrv2_handler.mark_seen(addr, peer_services).await;
+                            manager.addrv2_handler.mark_seen(addr, peer_services).await;
 
                             // // Start message reader for this peer
                             Self::start_peer_reader(
                                 addr,
-                                pool.clone(),
-                                addrv2_handler,
-                                shutdown_token,
-                                reputation_manager.clone(),
-                                connected_peer_count.clone(),
-                                headers2_disabled.clone(),
-                                message_dispatcher,
-                                network_event_sender.clone(),
+                                manager.pool.clone(),
+                                manager.addrv2_handler.clone(),
+                                manager.shutdown_token.clone(),
+                                manager.reputation_manager.clone(),
+                                manager.connected_peer_count.clone(),
+                                manager.headers2_disabled.clone(),
+                                manager.message_dispatcher.clone(),
+                                manager.network_event_sender.clone(),
                             )
                             .await;
                         }
                         Err(e) => {
                             tracing::warn!("Handshake failed with {}: {}", addr, e);
                             // Only clears connecting set. Peer was never added, so no count/event needed.
-                            pool.remove_peer(&addr).await;
-                            reputation_manager
+                            manager.pool.remove_peer(&addr).await;
+                            manager
+                                .reputation_manager
                                 .record_failure_with_penalty(
                                     addr,
                                     misbehavior_scores::INVALID_MESSAGE,
                                     "Handshake failed",
                                 )
+                                .await;
+                            manager
+                                .reputation_manager
+                                .record_disconnect(addr, DisconnectReason::HandshakeFailure)
                                 .await;
                             // For handshake failures, try again later
                             tokio::time::sleep(RECONNECT_DELAY).await;
@@ -374,13 +380,18 @@ impl PeerNetworkManager {
                 Err(e) => {
                     tracing::debug!("Failed to connect to {}: {}", addr, e);
                     // Only clears connecting set. Peer was never added, so no count/event needed.
-                    pool.remove_peer(&addr).await;
-                    reputation_manager
+                    manager.pool.remove_peer(&addr).await;
+                    manager
+                        .reputation_manager
                         .record_failure_with_penalty(
                             addr,
                             misbehavior_scores::TIMEOUT / 2,
                             "Connection failed",
                         )
+                        .await;
+                    manager
+                        .reputation_manager
+                        .record_disconnect(addr, DisconnectReason::Timeout)
                         .await;
                 }
             }
@@ -414,15 +425,19 @@ impl PeerNetworkManager {
     }
 
     /// Remove a peer from the pool, decrement the connected count, and emit
-    /// PeerDisconnected / PeersUpdated events.
+    /// PeerDisconnected / PeersUpdated events. Returns `true` when the peer was
+    /// present and removed, `false` when it was already absent.
     async fn remove_peer_and_notify(
         pool: &PeerPool,
         addr: &SocketAddr,
         connected_peer_count: &AtomicUsize,
         network_event_sender: &broadcast::Sender<NetworkEvent>,
-    ) {
+    ) -> bool {
         if pool.remove_peer(addr).await.is_some() {
             Self::notify_peer_removed(pool, addr, connected_peer_count, network_event_sender).await;
+            true
+        } else {
+            false
         }
     }
 
@@ -443,6 +458,7 @@ impl PeerNetworkManager {
             tracing::debug!("Starting peer reader loop for {}", addr);
             let mut loop_iteration = 0;
             let mut headers2_state = CompressionState::default();
+            let mut disconnect_reason: Option<DisconnectReason> = None;
 
             loop {
                 loop_iteration += 1;
@@ -450,6 +466,7 @@ impl PeerNetworkManager {
                 // Check shutdown signal first with detailed logging
                 if shutdown_token.is_cancelled() {
                     tracing::info!("Breaking peer reader loop for {} - shutdown signal received (iteration {})", addr, loop_iteration);
+                    disconnect_reason = Some(DisconnectReason::Shutdown);
                     break;
                 }
 
@@ -469,6 +486,7 @@ impl PeerNetworkManager {
                     if !peer_guard.is_connected() {
                         tracing::warn!("Breaking peer reader loop for {} - peer no longer connected (iteration {})", addr, loop_iteration);
                         drop(peer_guard);
+                        disconnect_reason = Some(DisconnectReason::Timeout);
                         break;
                     }
                     drop(peer_guard);
@@ -484,6 +502,7 @@ impl PeerNetworkManager {
                         },
                         _ = shutdown_token.cancelled() => {
                             tracing::info!("Breaking peer reader loop for {} - shutdown signal received while reading (iteration {})", addr, loop_iteration);
+                            disconnect_reason = Some(DisconnectReason::Shutdown);
                             break;
                         }
                     }
@@ -540,6 +559,7 @@ impl PeerNetworkManager {
                                     // If we can't send pong, connection is likely broken
                                     if matches!(e, NetworkError::ConnectionFailed(_)) {
                                         tracing::warn!("Breaking peer reader loop for {} - failed to send pong response (iteration {})", addr, loop_iteration);
+                                        disconnect_reason = Some(DisconnectReason::Timeout);
                                         break;
                                     }
                                 }
@@ -691,6 +711,7 @@ impl PeerNetworkManager {
                         match e {
                             NetworkError::PeerDisconnected => {
                                 tracing::info!("Peer {} disconnected", addr);
+                                disconnect_reason = Some(DisconnectReason::RemoteDisconnect);
                                 break;
                             }
                             NetworkError::Timeout => {
@@ -707,6 +728,11 @@ impl PeerNetworkManager {
                             }
                             _ => {
                                 tracing::error!("Fatal error reading from {}: {}", addr, e);
+
+                                disconnect_reason = Some(match &e {
+                                    NetworkError::Serialization(_) => DisconnectReason::DecodeError,
+                                    _ => DisconnectReason::ProtocolViolation,
+                                });
 
                                 // Check if this is a serialization error that might have context
                                 if let NetworkError::Serialization(ref decode_error) = e {
@@ -769,13 +795,19 @@ impl PeerNetworkManager {
 
             // Remove from pool and notify consumers
             tracing::warn!("Disconnecting from {} (peer reader loop ended)", addr);
-            Self::remove_peer_and_notify(
-                &pool,
-                &addr,
-                &connected_peer_count,
-                &network_event_sender,
-            )
-            .await;
+            let removed = pool.remove_peer(&addr).await.is_some();
+            if removed {
+                Self::notify_peer_removed(
+                    &pool,
+                    &addr,
+                    &connected_peer_count,
+                    &network_event_sender,
+                )
+                .await;
+                reputation_manager
+                    .record_disconnect(addr, disconnect_reason.unwrap_or(DisconnectReason::Timeout))
+                    .await;
+            }
 
             headers2_disabled.lock().await.remove(&addr);
 
@@ -935,12 +967,7 @@ impl PeerNetworkManager {
         );
         for addr in mismatched.into_iter().take(drop_count) {
             self.record_capability_rejection(addr).await;
-            let _ = self
-                .disconnect_peer(
-                    &addr,
-                    &format!("missing required services ({})", self.required_services),
-                )
-                .await;
+            let _ = self.disconnect_peer(&addr, DisconnectReason::CapabilityMismatch).await;
         }
     }
 
@@ -1020,7 +1047,7 @@ impl PeerNetworkManager {
             let has_expired = peer_guard.remove_expired_pings();
             drop(peer_guard);
             if has_expired {
-                let _ = self.disconnect_peer(&addr, "ping timeout").await;
+                let _ = self.disconnect_peer(&addr, DisconnectReason::PingTimeout).await;
             }
         }
 
@@ -1113,7 +1140,7 @@ impl PeerNetworkManager {
 
     /// Send a message to a single peer selected by message type requirements.
     async fn send_to_single_peer(&self, message: NetworkMessage) -> NetworkResult<()> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
 
         if peers.is_empty() {
             return Err(NetworkError::ConnectionFailed("No connected peers".to_string()));
@@ -1132,26 +1159,31 @@ impl PeerNetworkManager {
             _ => None,
         };
 
-        let (addr, peer) = if let Some((flags, required)) = preferred_service {
-            match self.pool.peer_with_service(flags).await {
-                Some((address, peer)) => {
-                    tracing::debug!(
-                        "Selected peer {} with {} for {}",
-                        address,
-                        flags,
-                        message.cmd()
-                    );
-                    (address, peer)
-                }
-                None if required => {
+        let selected = if let Some((flags, required)) = preferred_service {
+            let capable = self
+                .reputation_manager
+                .filter_unbanned(self.pool.peers_with_service(flags).await)
+                .await;
+            if capable.is_empty() {
+                if required {
                     tracing::warn!("No peers support {}, cannot send {}", flags, message.cmd());
                     return Err(NetworkError::ProtocolError(format!("No peers support {}", flags)));
                 }
-                None => self.next_peer(&peers),
+                self.next_peer(&peers).await
+            } else {
+                tracing::debug!(
+                    "Selecting peer with {} for {} (reputation-weighted)",
+                    flags,
+                    message.cmd()
+                );
+                self.next_peer(&capable).await
             }
         } else {
-            self.next_peer(&peers)
+            self.next_peer(&peers).await
         };
+
+        let (addr, peer) = selected
+            .ok_or_else(|| NetworkError::ConnectionFailed("No eligible peers".to_string()))?;
 
         self.send_message_to_peer(&addr, &peer, message).await
     }
@@ -1163,7 +1195,7 @@ impl PeerNetworkManager {
     /// - Headers (GetHeaders/GetHeaders2): prefers headers2 peers, upgrades GetHeaders if supported
     /// - Other (blocks, masternode data, etc.): uses all connected peers
     async fn send_distributed(&self, message: NetworkMessage) -> NetworkResult<()> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
 
         if peers.is_empty() {
             return Err(NetworkError::ConnectionFailed("No connected peers".to_string()));
@@ -1172,15 +1204,23 @@ impl PeerNetworkManager {
         // Select eligible peers based on message type
         let (selected_peers, require_capability) = match &message {
             NetworkMessage::GetCFHeaders(_) | NetworkMessage::GetCFilters(_) => {
-                let filter_peers =
-                    self.pool.peers_with_service(ServiceFlags::COMPACT_FILTERS).await;
+                let filter_peers = self
+                    .reputation_manager
+                    .filter_unbanned(
+                        self.pool.peers_with_service(ServiceFlags::COMPACT_FILTERS).await,
+                    )
+                    .await;
                 (filter_peers, true)
             }
             NetworkMessage::GetHeaders(_) | NetworkMessage::GetHeaders2(_) => {
                 // Prefer headers2 peers (excluding disabled), fall back to all
                 let disabled = self.headers2_disabled.lock().await;
-                let mut headers2_peers =
-                    self.pool.peers_with_service(ServiceFlags::NODE_HEADERS_COMPRESSED).await;
+                let mut headers2_peers = self
+                    .reputation_manager
+                    .filter_unbanned(
+                        self.pool.peers_with_service(ServiceFlags::NODE_HEADERS_COMPRESSED).await,
+                    )
+                    .await;
                 headers2_peers.retain(|(addr, _)| !disabled.contains(addr));
                 drop(disabled);
                 if headers2_peers.is_empty() {
@@ -1203,20 +1243,27 @@ impl PeerNetworkManager {
             };
         }
 
-        let (addr, peer) = self.next_peer(&selected_peers);
+        let (addr, peer) = self
+            .next_peer(&selected_peers)
+            .await
+            .ok_or_else(|| NetworkError::ConnectionFailed("No eligible peers".to_string()))?;
 
         tracing::debug!("Distributing {} request to peer {}", message.cmd(), addr);
 
         self.send_message_to_peer(&addr, &peer, message).await
     }
 
-    /// Pick the next peer from `peers` using round-robin rotation.
-    fn next_peer(
+    async fn next_peer(
         &self,
         peers: &[(SocketAddr, Arc<RwLock<Peer>>)],
-    ) -> (SocketAddr, Arc<RwLock<Peer>>) {
-        let idx = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % peers.len();
-        (peers[idx].0, peers[idx].1.clone())
+    ) -> Option<(SocketAddr, Arc<RwLock<Peer>>)> {
+        let weights = self.reputation_manager.selection_weights(peers).await;
+        let mut rng = thread_rng();
+        let idx = match WeightedIndex::new(&weights) {
+            Ok(dist) => dist.sample(&mut rng),
+            Err(_) => return None,
+        };
+        Some((peers[idx].0, peers[idx].1.clone()))
     }
 
     /// Send a message to the given peer.
@@ -1247,9 +1294,15 @@ impl PeerNetworkManager {
             .map_err(|e| NetworkError::ProtocolError(format!("Failed to send to {}: {}", addr, e)))
     }
 
+    /// Peers eligible for a broadcast: every connected peer minus those banned
+    /// by the reputation manager.
+    async fn broadcast_targets(&self) -> Vec<(SocketAddr, Arc<RwLock<Peer>>)> {
+        self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await
+    }
+
     /// Broadcast a message to all connected peers
     pub async fn broadcast(&self, message: NetworkMessage) -> Vec<Result<(), Error>> {
-        let peers = self.pool.get_all_peers().await;
+        let peers = self.broadcast_targets().await;
         let mut handles = Vec::new();
 
         // Spawn tasks for concurrent sending
@@ -1286,17 +1339,26 @@ impl PeerNetworkManager {
         results
     }
 
-    /// Disconnect a specific peer
-    pub async fn disconnect_peer(&self, addr: &SocketAddr, reason: &str) -> Result<(), Error> {
-        tracing::info!("Disconnecting peer {} - reason: {}", addr, reason);
+    /// Disconnect a specific peer. The `reason` is logged and recorded against
+    /// the peer's reputation entry so future selection can take it into account.
+    pub async fn disconnect_peer(
+        &self,
+        addr: &SocketAddr,
+        reason: DisconnectReason,
+    ) -> Result<(), Error> {
+        tracing::info!("Disconnecting peer {}, reason: {}", addr, reason.as_str());
 
-        Self::remove_peer_and_notify(
+        let removed = Self::remove_peer_and_notify(
             &self.pool,
             addr,
             &self.connected_peer_count,
             &self.network_event_sender,
         )
         .await;
+
+        if removed {
+            self.reputation_manager.record_disconnect(*addr, reason).await;
+        }
 
         Ok(())
     }
@@ -1309,10 +1371,9 @@ impl PeerNetworkManager {
 
     /// Ban a specific peer manually
     pub async fn ban_peer(&self, addr: &SocketAddr, reason: &str) -> Result<(), Error> {
-        tracing::info!("Manually banning peer {} - reason: {}", addr, reason);
+        tracing::info!("Manually banning peer {}, reason: {}", addr, reason);
 
-        // Disconnect the peer first
-        self.disconnect_peer(addr, reason).await?;
+        self.disconnect_peer(addr, DisconnectReason::Manual).await?;
 
         // Update reputation to trigger ban
         self.reputation_manager
@@ -1420,7 +1481,6 @@ impl Clone for PeerNetworkManager {
             message_dispatcher: self.message_dispatcher.clone(),
             request_tx: self.request_tx.clone(),
             request_rx: self.request_rx.clone(),
-            round_robin_counter: self.round_robin_counter.clone(),
             network_event_sender: self.network_event_sender.clone(),
         }
     }
@@ -1501,7 +1561,11 @@ impl NetworkManager for PeerNetworkManager {
         self.message_dispatcher.lock().await.dispatch(&msg);
     }
 
-    async fn disconnect_peer(&self, addr: &SocketAddr, reason: &str) -> NetworkResult<()> {
+    async fn disconnect_peer(
+        &self,
+        addr: &SocketAddr,
+        reason: DisconnectReason,
+    ) -> NetworkResult<()> {
         PeerNetworkManager::disconnect_peer(self, addr, reason)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
@@ -1509,6 +1573,45 @@ impl NetworkManager for PeerNetworkManager {
 
     fn subscribe_network_events(&self) -> broadcast::Receiver<NetworkEvent> {
         self.network_event_sender.subscribe()
+    }
+}
+
+impl PeerNetworkManager {
+    /// Evict the worst-scored peer from the pool if the pool is at capacity and
+    /// the incoming peer's score is strictly better than the worst existing peer.
+    /// Returns `true` when an eviction occurred, `false` otherwise.
+    pub(crate) async fn try_evict_for_incoming(&self, incoming_addr: SocketAddr) -> bool {
+        if self.pool.peer_count().await < TARGET_PEERS {
+            return false;
+        }
+        let candidates = self.pool.get_all_peers().await;
+        let incoming_score = self.reputation_manager.get_score(&incoming_addr).await;
+        if let Some((victim, victim_score)) = self.reputation_manager.pick_worst(&candidates).await
+        {
+            if victim_score > incoming_score {
+                tracing::info!(
+                    "Pool at capacity, evicting peer {} (score {}) for incoming peer {} (score {})",
+                    victim,
+                    victim_score,
+                    incoming_addr,
+                    incoming_score
+                );
+                if self.pool.remove_peer(&victim).await.is_some() {
+                    Self::notify_peer_removed(
+                        &self.pool,
+                        &victim,
+                        &self.connected_peer_count,
+                        &self.network_event_sender,
+                    )
+                    .await;
+                    self.reputation_manager
+                        .record_disconnect(victim, DisconnectReason::PoolFull)
+                        .await;
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1540,7 +1643,6 @@ impl PeerNetworkManager {
             message_dispatcher: Arc::new(Mutex::new(MessageDispatcher::default())),
             request_tx,
             request_rx: Arc::new(Mutex::new(Some(request_rx))),
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
             network_event_sender: broadcast::Sender::new(DEFAULT_NETWORK_EVENT_CAPACITY),
         }
     }
@@ -1577,5 +1679,24 @@ impl PeerNetworkManager {
 
     pub(crate) async fn test_should_reject_after_handshake(&self, peer: &Peer) -> bool {
         Self::should_reject_after_handshake(&self.pool, peer, self.required_services).await
+    }
+
+    /// Test-only access to the reputation manager for seeding scores before
+    /// exercising selection paths.
+    pub(crate) fn test_reputation_manager(&self) -> &PeerReputationManager {
+        &self.reputation_manager
+    }
+
+    /// Test-only wrapper that exposes the addresses `broadcast` would target,
+    /// so a regression in the underlying filtering is observable from tests.
+    pub(crate) async fn test_broadcast_targets(&self) -> Vec<SocketAddr> {
+        self.broadcast_targets().await.into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    /// Test-only wrapper that filters banned peers from the pool then samples
+    /// one with the same reputation-weighted policy `send_to_single_peer` uses.
+    pub(crate) async fn test_next_peer_from_pool(&self) -> Option<SocketAddr> {
+        let peers = self.reputation_manager.filter_unbanned(self.pool.get_all_peers().await).await;
+        self.next_peer(&peers).await.map(|(addr, _)| addr)
     }
 }

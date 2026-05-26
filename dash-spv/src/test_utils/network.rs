@@ -1,8 +1,8 @@
 use crate::error::{NetworkError, NetworkResult};
 use crate::network::peer::Peer;
 use crate::network::{
-    Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager, NetworkRequest,
-    RequestSender,
+    DisconnectReason, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
+    NetworkRequest, RequestSender,
 };
 use async_trait::async_trait;
 use dashcore::{
@@ -177,7 +177,11 @@ impl NetworkManager for MockNetworkManager {
         self.message_dispatcher.lock().await.dispatch(&msg);
     }
 
-    async fn disconnect_peer(&self, _addr: &SocketAddr, _reason: &str) -> NetworkResult<()> {
+    async fn disconnect_peer(
+        &self,
+        _addr: &SocketAddr,
+        _reason: DisconnectReason,
+    ) -> NetworkResult<()> {
         panic!("Disconnect peer not implemented for MockNetworkManager");
     }
 

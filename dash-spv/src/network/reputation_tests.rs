@@ -439,4 +439,180 @@ mod tests {
             "non-zero streak must be preserved when last_tried is valid"
         );
     }
+
+    #[tokio::test]
+    async fn test_filter_unbanned_excludes_banned_entries() {
+        let manager = PeerReputationManager::new();
+        let good: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let bad: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        let unknown: SocketAddr = "127.0.0.1:5003".parse().unwrap();
+
+        manager.update_reputation(good, -10, "good").await;
+        for _ in 0..10 {
+            manager.update_reputation(bad, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(manager.is_banned(&bad).await);
+
+        let input = vec![(good, ()), (bad, ()), (unknown, ())];
+        let surviving = manager.filter_unbanned(input).await;
+        let addrs: Vec<SocketAddr> = surviving.iter().map(|(a, _)| *a).collect();
+
+        assert!(addrs.contains(&good));
+        assert!(addrs.contains(&unknown));
+        assert!(!addrs.contains(&bad), "banned peer must be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_score_based_ban_survives_restart() {
+        let peer: SocketAddr = "127.0.0.1:5010".parse().unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
+            .await
+            .expect("Failed to open PersistentPeerStorage");
+
+        // Accumulate score to the ban threshold in the first session.
+        let session_one = PeerReputationManager::new();
+        for _ in 0..10 {
+            session_one.update_reputation(peer, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+        assert!(session_one.is_banned(&peer).await, "peer must be banned in session one");
+        session_one.save_to_storage(&peer_storage).await.unwrap();
+
+        // Load into a fresh manager (simulating a restart — `banned_until` is not persisted).
+        let session_two = PeerReputationManager::new();
+        session_two.load_from_storage(&peer_storage).await.unwrap();
+
+        assert!(
+            session_two.is_banned(&peer).await,
+            "score-based ban must survive restart even when banned_until is not persisted"
+        );
+
+        let input = vec![(peer, ())];
+        let surviving = session_two.filter_unbanned(input).await;
+        assert!(
+            surviving.is_empty(),
+            "filter_unbanned must exclude a peer whose score is at the ban threshold after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_selection_weights_match_score_offset() {
+        let manager = PeerReputationManager::new();
+        let best: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let neutral: SocketAddr = "127.0.0.1:6002".parse().unwrap();
+        let worst: SocketAddr = "127.0.0.1:6003".parse().unwrap();
+        let banned: SocketAddr = "127.0.0.1:6004".parse().unwrap();
+
+        manager.update_reputation(best, -50, "great").await;
+        manager.update_reputation(worst, 90, "bad").await;
+        for _ in 0..10 {
+            manager.update_reputation(banned, misbehavior_scores::INVALID_MESSAGE, "abuse").await;
+        }
+
+        let peers = vec![(best, ()), (neutral, ()), (worst, ()), (banned, ())];
+        let weights = manager.selection_weights(&peers).await;
+        assert_eq!(weights.len(), 4);
+        assert_eq!(weights[0], 150, "score -50 maps to weight 150 (highest priority)");
+        assert_eq!(weights[1], 100, "score 0 maps to weight 100 (neutral)");
+        assert_eq!(weights[2], 10, "score 90 maps to weight 10 (near-ban, rarely selected)");
+        assert_eq!(weights[3], 0, "banned peer must have weight 0");
+    }
+
+    #[tokio::test]
+    async fn test_pick_worst_uses_highest_score() {
+        let manager = PeerReputationManager::new();
+        let mild: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let bad: SocketAddr = "127.0.0.1:7002".parse().unwrap();
+        let neutral: SocketAddr = "127.0.0.1:7003".parse().unwrap();
+
+        manager.update_reputation(mild, 20, "mild").await;
+        manager.update_reputation(bad, 80, "bad").await;
+
+        let peers = vec![(mild, ()), (bad, ()), (neutral, ())];
+        let (victim, victim_score) = manager.pick_worst(&peers).await.expect("non-empty input");
+        assert_eq!(victim, bad);
+        assert_eq!(victim_score, 80, "returned score must match the worst observed score");
+    }
+
+    #[tokio::test]
+    async fn test_pick_worst_tie_breaks_on_most_recent_negative_event() {
+        let manager = PeerReputationManager::new();
+        let stale: SocketAddr = "127.0.0.1:7101".parse().unwrap();
+        let fresh: SocketAddr = "127.0.0.1:7102".parse().unwrap();
+
+        manager.update_reputation(stale, 30, "first abuse").await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        manager.update_reputation(fresh, 30, "later abuse").await;
+
+        let peers = vec![(stale, ()), (fresh, ())];
+        let (victim, victim_score) = manager.pick_worst(&peers).await.expect("non-empty input");
+        assert_eq!(victim, fresh, "tie at score 30 should pick the most recent offender");
+        assert_eq!(victim_score, 30, "returned score must match the tied worst score");
+    }
+
+    #[tokio::test]
+    async fn test_pick_worst_all_neutral_returns_some_peer() {
+        let manager = PeerReputationManager::new();
+        let a: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+        let peers = vec![(a, ()), (b, ())];
+        let (victim, victim_score) =
+            manager.pick_worst(&peers).await.expect("must return Some for non-empty input");
+        assert!(
+            victim == a || victim == b,
+            "any peer is valid when scores are equal and no events exist"
+        );
+        assert_eq!(victim_score, 0, "neutral peers must report score 0");
+    }
+
+    #[tokio::test]
+    async fn test_record_disconnect_sets_last_reason_and_event() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:7201".parse().unwrap();
+
+        manager.record_disconnect(peer, DisconnectReason::PingTimeout).await;
+
+        let reputations = manager.get_all_reputations().await;
+        let rep = &reputations[&peer];
+        assert_eq!(rep.last_disconnect_reason, Some(DisconnectReason::PingTimeout));
+
+        let events = manager.get_recent_events().await;
+        let event = events.iter().rev().find(|e| e.peer == peer).expect("disconnect event present");
+        let expected = format!("disconnect: {}", DisconnectReason::PingTimeout.as_str());
+        assert_eq!(event.reason, expected, "event reason must encode the disconnect cause exactly");
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_reason_persists_across_save_load() {
+        let manager = PeerReputationManager::new();
+        let peer: SocketAddr = "127.0.0.1:7301".parse().unwrap();
+
+        manager.record_disconnect(peer, DisconnectReason::DecodeError).await;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let peer_storage = PersistentPeerStorage::open(temp_dir.path())
+            .await
+            .expect("Failed to open PersistentPeerStorage");
+        manager.save_to_storage(&peer_storage).await.unwrap();
+
+        let restored = PeerReputationManager::new();
+        restored.load_from_storage(&peer_storage).await.unwrap();
+        let reputations = restored.get_all_reputations().await;
+        assert_eq!(
+            reputations[&peer].last_disconnect_reason,
+            Some(DisconnectReason::DecodeError),
+            "disconnect reason must survive save/load round trip"
+        );
+    }
+
+    #[test]
+    fn test_reputation_loads_without_last_disconnect_reason_field() {
+        let json = r#"{"score":5,"ban_count":0,"positive_actions":0,"negative_actions":0,"connection_attempts":0,"successful_connections":0,"last_success":null,"last_tried":null,"consecutive_failures":0}"#;
+        let rep: PeerReputation = serde_json::from_str(json).expect("legacy file must deserialize");
+        assert!(
+            rep.last_disconnect_reason.is_none(),
+            "missing field must default to None for backward compatibility"
+        );
+    }
 }

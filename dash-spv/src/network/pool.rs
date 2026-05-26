@@ -150,20 +150,6 @@ impl PeerPool {
         }
     }
 
-    /// Find the first connected peer that advertises the given service flags.
-    pub(crate) async fn peer_with_service(
-        &self,
-        flags: ServiceFlags,
-    ) -> Option<(SocketAddr, Arc<RwLock<Peer>>)> {
-        let peers = self.peers.read().await;
-        for (addr, peer) in peers.iter() {
-            if peer.read().await.has_service(flags) {
-                return Some((*addr, Arc::clone(peer)));
-            }
-        }
-        None
-    }
-
     /// Collect all connected peers that advertise the given service flags.
     pub(crate) async fn peers_with_service(
         &self,
@@ -270,13 +256,11 @@ mod tests {
         let combined = compact_filters | ServiceFlags::NODE_HEADERS_COMPRESSED;
 
         // No matches on empty pool
-        assert!(pool.peer_with_service(compact_filters).await.is_none());
         assert!(pool.peers_with_service(compact_filters).await.is_empty());
 
         // No matches when peers lack the requested flag
         let addr1: SocketAddr = "127.0.0.1:1001".parse().unwrap();
         pool.insert_peer_with_services(addr1, ServiceFlags::NETWORK).await;
-        assert!(pool.peer_with_service(compact_filters).await.is_none());
         assert!(pool.peers_with_service(compact_filters).await.is_empty());
 
         // Single-flag lookup returns matching peers
@@ -285,10 +269,6 @@ mod tests {
         pool.insert_peer_with_services(addr2, ServiceFlags::NETWORK | compact_filters).await;
         pool.insert_peer_with_services(addr3, ServiceFlags::NETWORK | combined).await;
 
-        let (found_addr, found_peer) = pool.peer_with_service(compact_filters).await.unwrap();
-        assert!(found_addr == addr2 || found_addr == addr3);
-        assert!(found_peer.read().await.has_service(compact_filters));
-
         let filter_peers: HashMap<SocketAddr, _> =
             pool.peers_with_service(compact_filters).await.into_iter().collect();
         assert_eq!(filter_peers.len(), 2);
@@ -296,14 +276,11 @@ mod tests {
         assert!(filter_peers.contains_key(&addr3));
 
         // Combined flags require all bits present
-        let (found_addr, _) = pool.peer_with_service(combined).await.unwrap();
-        assert_eq!(found_addr, addr3);
         let combined_peers = pool.peers_with_service(combined).await;
         assert_eq!(combined_peers.len(), 1);
         assert_eq!(combined_peers[0].0, addr3);
 
         // NONE matches every peer in the pool
-        assert!(pool.peer_with_service(ServiceFlags::NONE).await.is_some());
         let all = pool.peers_with_service(ServiceFlags::NONE).await;
         assert_eq!(all.len(), 3);
     }
