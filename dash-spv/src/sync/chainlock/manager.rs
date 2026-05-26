@@ -516,7 +516,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for ChainLockMan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::{MessageType, RequestSender};
+    use crate::network::{MessageType, NetworkRequest, RequestSender};
     use crate::storage::{
         DiskStorageManager, PersistentBlockHeaderStorage, PersistentMetadataStorage, StorageManager,
     };
@@ -1039,7 +1039,7 @@ mod tests {
         );
         assert!(manager.masternode_ready);
         // The empty engine cannot validate the signature, so the chainlock is
-        // counted as invalid and best_chainlock stays None — events is empty.
+        // counted as invalid and best_chainlock stays None. Events is empty.
         // The invariant is that pending_validation was consumed (not silently
         // dropped), which is covered by the is_none() assertion above.
         assert!(events.is_empty());
@@ -1367,7 +1367,7 @@ mod tests {
         );
         let req = rx.try_recv().expect("misbehavior report must be queued");
         match req {
-            crate::network::NetworkRequest::ReportMisbehavior(reported_peer, kind) => {
+            NetworkRequest::ReportMisbehavior(reported_peer, kind) => {
                 assert_eq!(reported_peer, peer);
                 assert_eq!(kind, MisbehaviorKind::InvalidChainLockSignature);
             }

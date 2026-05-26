@@ -212,11 +212,13 @@ async fn repair_blocks_above_tip(
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::ephemerealdata::chain_lock::ChainLock;
     use dashcore::hash_types::FilterHeader;
-    use dashcore::Header as BlockHeader;
+    use dashcore::{BlockHash, Header as BlockHeader};
     use dashcore_hashes::Hash;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
@@ -232,9 +234,9 @@ mod tests {
     use super::check_and_repair_consistency;
 
     async fn open_all(
-        path: &std::path::Path,
+        path: &Path,
     ) -> (
-        std::path::PathBuf,
+        PathBuf,
         Arc<RwLock<PersistentBlockHeaderStorage>>,
         Arc<RwLock<PersistentFilterHeaderStorage>>,
         Arc<RwLock<PersistentFilterStorage>>,
@@ -257,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn highest_valid_tip_returns_full_chain_when_intact() {
         let tmp = TempDir::new().unwrap();
-        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(5, BlockHash::all_zeros());
         let storage = PersistentBlockHeaderStorage::open(tmp.path()).await.unwrap();
         let mut storage = storage;
         storage.store_headers(&chain).await.unwrap();
@@ -287,7 +289,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
 
-        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(5, BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
         fh.write().await.store_filter_headers(&FilterHeader::dummy_batch(0..10)).await.unwrap();
         assert_eq!(fh.read().await.get_filter_tip_height().await.unwrap(), Some(9));
@@ -302,7 +304,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
 
-        let chain = BlockHeader::dummy_chain(10, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(10, BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
         fh.write().await.store_filter_headers(&FilterHeader::dummy_batch(0..5)).await.unwrap();
         for h in 0..8 {
@@ -322,7 +324,7 @@ mod tests {
 
         // Header tip at 4, block storage holds a block at heights 3 and 10.
         // Block 3 is within bounds, block 10 is stale and must be dropped.
-        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(5, BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
         b.write().await.store_block(3, HashedBlock::dummy(3, vec![])).await.unwrap();
         b.write().await.store_block(10, HashedBlock::dummy(10, vec![])).await.unwrap();
@@ -338,13 +340,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
 
-        let chain = BlockHeader::dummy_chain(5, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(5, BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
 
         let chainlock = ChainLock {
             block_height: 100,
-            block_hash: dashcore::BlockHash::all_zeros(),
-            signature: dashcore::bls_sig_utils::BLSSignature::from([0u8; 96]),
+            block_hash: BlockHash::all_zeros(),
+            signature: BLSSignature::from([0u8; 96]),
         };
         let bytes = serde_json::to_vec(&chainlock).unwrap();
         m.write().await.store_metadata(BEST_CHAINLOCK_KEY, &bytes).await.unwrap();
@@ -360,7 +362,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (path, bh, fh, f, b, m) = open_all(tmp.path()).await;
 
-        let chain = BlockHeader::dummy_chain(10, dashcore::BlockHash::all_zeros());
+        let chain = BlockHeader::dummy_chain(10, BlockHash::all_zeros());
         bh.write().await.store_headers(&chain).await.unwrap();
         m.write().await.write_reorg_sentinel().await.unwrap();
         assert!(m.read().await.is_reorg_sentinel_set());

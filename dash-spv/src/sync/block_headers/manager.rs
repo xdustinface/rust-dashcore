@@ -688,6 +688,7 @@ mod tests {
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
     use dashcore::block::Version;
     use dashcore::bls_sig_utils::BLSSignature;
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
     use dashcore::network::message::NetworkMessage;
     use dashcore::{CompactTarget, TxMerkleNode};
     use dashcore_hashes::Hash;
@@ -1649,9 +1650,6 @@ mod tests {
     /// the generation, and storage reflects the chainlocked branch.
     #[tokio::test]
     async fn chainlock_forced_reorg_drives_cascade_for_lighter_branch() {
-        use dashcore::bls_sig_utils::BLSSignature;
-        use dashcore::ephemerealdata::chain_lock::ChainLock;
-
         let easy_bits = CompactTarget::from_consensus(0x207fffff);
         let (mut manager, chain) = create_regtest_manager_with_chain(8).await;
         let tip = manager.tip().await.unwrap();

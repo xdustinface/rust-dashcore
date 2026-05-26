@@ -773,7 +773,7 @@ mod tests {
             state.lock().await.deny_list.contains_key(&candidate_tip),
             "rejected candidate must land on deny-list"
         );
-        assert_eq!(generation.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
 
         // force=true: chainlock floor is bypassed, cascade runs, ChainReorg is emitted.
         let state2 = Mutex::new(ReorgState::default());
@@ -817,11 +817,7 @@ mod tests {
             }
             other => panic!("expected ChainReorg, got {:?}", other),
         }
-        assert_eq!(
-            generation2.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "forced cascade must bump generation"
-        );
+        assert_eq!(generation2.load(Ordering::SeqCst), 1, "forced cascade must bump generation");
         assert!(
             !state2.lock().await.deny_list.contains_key(&candidate_tip),
             "forced reorg must not land on the deny-list"
