@@ -116,47 +116,56 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
     /// Apply the masternode-ready transition.
     ///
     /// Validates any chainlock cached in `pending_validation` (i.e. a
-    /// chainlock that arrived before masternode state was available)
-    /// and promotes it to `best_chainlock` on success. Returns the
-    /// chainlock that should be re-broadcast to downstream consumers,
-    /// preferring a freshly-promoted one over the persisted-from-disk
-    /// `best_chainlock`. Returns `None` if there's nothing to surface.
+    /// chainlock that arrived before masternode state was available).
+    /// Returns the events to emit to downstream consumers:
     ///
-    /// Re-runs `verify_block_hash` on the pending chainlock before
-    /// validating the BLS signature: at the time the chainlock was
-    /// cached the header for that height may still have been missing
-    /// (in which case `verify_block_hash` returned `true` permissively),
-    /// but by the time masternode state is ready the header has
-    /// usually arrived. If the resolved header's hash now disagrees
-    /// with the chainlock's claimed block hash, the chainlock is
-    /// dropped instead of moving the finality boundary onto a block
-    /// the local chain doesn't match.
-    pub(super) async fn on_masternode_ready(&mut self) -> Option<ChainLock> {
+    /// - `Match` / `Unknown`: validates the BLS signature; on success emits
+    ///   `ChainLockReceived { validated: true }` and re-broadcasts the best
+    ///   chainlock (including the persisted-from-disk one if no pending).
+    /// - `Mismatch`: the resolved header disagrees with the chainlock's claimed
+    ///   hash. If the BLS signature validates, emits `ChainLockForcedReorg` so
+    ///   the block-headers manager can drive a cascade toward the chainlocked
+    ///   chain. If the signature is invalid, the chainlock is dropped silently.
+    pub(super) async fn on_masternode_ready(&mut self) -> Vec<SyncEvent> {
         self.masternode_ready = true;
 
         if let Some(pending) = self.pending_validation.take() {
-            // `Mismatch` means the resolved header disagrees with the cached
-            // chainlock's claimed hash. Drop the chainlock rather than move
-            // the finality boundary onto a block the local chain doesn't
-            // match. `Match` and `Unknown` (header still missing) take the
-            // signature-validation path.
-            let header_ok = !matches!(
-                self.verify_block_hash(&pending).await,
-                BlockHashVerification::Mismatch { .. }
-            );
-            if header_ok && self.validate_signature(&pending).await {
-                self.progress.add_valid(1);
-                self.progress.update_best_validated_height(pending.block_height);
-                let height = pending.block_height;
-                self.best_chainlock = Some(pending);
-                self.chainlock_height.store(height, Ordering::Release);
-                self.save_best_chainlock().await;
-            } else {
-                self.progress.add_invalid(1);
+            match self.verify_block_hash(&pending).await {
+                BlockHashVerification::Match | BlockHashVerification::Unknown => {
+                    if self.validate_signature(&pending).await {
+                        self.progress.add_valid(1);
+                        self.progress.update_best_validated_height(pending.block_height);
+                        let height = pending.block_height;
+                        self.best_chainlock = Some(pending);
+                        self.chainlock_height.store(height, Ordering::Release);
+                        self.save_best_chainlock().await;
+                    } else {
+                        self.progress.add_invalid(1);
+                    }
+                }
+                BlockHashVerification::Mismatch { .. } => {
+                    if self.validate_signature(&pending).await {
+                        self.progress.add_valid(1);
+                        let fork_height = pending.block_height.saturating_sub(1);
+                        return vec![SyncEvent::ChainLockForcedReorg {
+                            chain_lock: pending,
+                            fork_height,
+                        }];
+                    } else {
+                        self.progress.add_invalid(1);
+                    }
+                }
             }
         }
 
-        self.best_chainlock.clone()
+        if let Some(chain_lock) = self.best_chainlock.clone() {
+            vec![SyncEvent::ChainLockReceived {
+                chain_lock,
+                validated: true,
+            }]
+        } else {
+            vec![]
+        }
     }
 
     pub(super) fn is_masternode_ready(&self) -> bool {
@@ -646,8 +655,8 @@ mod tests {
             .await
             .expect("store header at 100");
 
-        let rebroadcast = manager.on_masternode_ready().await;
-        assert!(rebroadcast.is_none(), "mismatched chainlock must not be re-broadcast");
+        let events = manager.on_masternode_ready().await;
+        assert!(events.is_empty(), "mismatched chainlock must not be re-broadcast");
         assert!(manager.best_chainlock().is_none(), "mismatched chainlock must not be persisted");
         assert!(manager.pending_validation.is_none(), "pending_validation must be consumed");
         assert_eq!(manager.progress.invalid(), 1);
@@ -666,8 +675,8 @@ mod tests {
         // With the default empty engine, validation fails — the
         // pending chainlock is consumed (cleared) and counted as
         // invalid; `best_chainlock` stays `None`.
-        let rebroadcast = manager.on_masternode_ready().await;
-        assert!(rebroadcast.is_none());
+        let events = manager.on_masternode_ready().await;
+        assert!(events.is_empty());
         assert!(manager.pending_validation.is_none());
         assert!(manager.best_chainlock().is_none());
         assert_eq!(manager.progress.invalid(), 1);
@@ -932,9 +941,9 @@ mod tests {
         );
         assert!(!manager.masternode_ready);
 
-        let returned = manager.on_masternode_ready().await;
+        let events = manager.on_masternode_ready().await;
         assert!(
-            returned.is_none(),
+            events.is_empty(),
             "on_masternode_ready must not re-validate a stale chainlock cleared by reorg"
         );
         assert!(
@@ -975,7 +984,7 @@ mod tests {
         );
         assert!(!manager.masternode_ready, "masternode_ready must be cleared on disconnect");
 
-        let returned = manager.on_masternode_ready().await;
+        let events = manager.on_masternode_ready().await;
 
         assert!(
             manager.pending_validation.is_none(),
@@ -983,10 +992,10 @@ mod tests {
         );
         assert!(manager.masternode_ready);
         // The empty engine cannot validate the signature, so the chainlock is
-        // counted as invalid and best_chainlock stays None — returned is None.
+        // counted as invalid and best_chainlock stays None — events is empty.
         // The invariant is that pending_validation was consumed (not silently
         // dropped), which is covered by the is_none() assertion above.
-        assert!(returned.is_none());
+        assert!(events.is_empty());
         assert_eq!(manager.progress.invalid(), 1);
     }
 
