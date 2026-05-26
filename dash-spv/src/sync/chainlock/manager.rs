@@ -247,7 +247,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
                     block_hash
                 );
                 self.pending_unknown_hash
-                    .insert(block_hash, (chainlock.clone(), peer, Instant::now()));
+                    .entry(block_hash)
+                    .or_insert_with(|| (chainlock.clone(), peer, Instant::now()));
                 return Ok(vec![SyncEvent::PendingChainLockQueued {
                     chainlock: chainlock.clone(),
                 }]);
