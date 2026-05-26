@@ -255,9 +255,11 @@ mod pool_tests {
         let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
         let good = test_socket_address(51);
         let banned = test_socket_address(52);
+        let good2 = test_socket_address(53);
 
         manager.insert_test_peer(good, ServiceFlags::NETWORK).await;
         manager.insert_test_peer(banned, ServiceFlags::NETWORK).await;
+        manager.insert_test_peer(good2, ServiceFlags::NETWORK).await;
 
         let reputation = manager.test_reputation_manager();
         for _ in 0..10 {
@@ -268,7 +270,24 @@ mod pool_tests {
         assert!(reputation.is_banned(&banned).await);
 
         let targets = manager.test_broadcast_targets().await;
-        assert_eq!(targets, vec![good], "broadcast must skip banned peers");
+        assert!(targets.contains(&good), "good peer must be a broadcast target");
+        assert!(targets.contains(&good2), "second good peer must also be a broadcast target");
+        assert!(!targets.contains(&banned), "banned peer must not be a broadcast target");
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_peer_absent_does_not_record_reputation() {
+        let manager = PeerNetworkManager::new_for_test(ServiceFlags::NONE).await;
+        let absent = test_socket_address(200);
+
+        manager.disconnect_peer(&absent, DisconnectReason::Manual).await.unwrap();
+
+        let reps = manager.test_reputation_manager().get_all_reputations().await;
+        assert!(
+            reps.get(&absent).and_then(|r| r.last_disconnect_reason).is_none(),
+            "disconnect_peer on absent peer must not record a disconnect reason"
+        );
     }
 
     #[tokio::test(start_paused = true)]
