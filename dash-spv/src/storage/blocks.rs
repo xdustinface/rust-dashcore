@@ -22,6 +22,17 @@ pub trait BlockStorage: Send + Sync + 'static {
 
     /// Load a single block by height.
     async fn load_block(&self, height: CoreBlockHeight) -> StorageResult<Option<HashedBlock>>;
+
+    /// Drop all blocks with `height > target_height`.
+    ///
+    /// Truncating above the current tip is a no-op, truncating below
+    /// `start_height` returns an error. Changes are applied in-memory and
+    /// flushed on the next `persist`.
+    ///
+    /// The truncation is not durable until the next successful `persist` call.
+    /// A crash between `truncate_above` and `persist` may leave orphaned segment
+    /// files on disk and cause the storage to reopen at the pre-truncation tip.
+    async fn truncate_above(&mut self, target_height: CoreBlockHeight) -> StorageResult<()>;
 }
 
 /// Persistent storage for full blocks using segmented files.
@@ -66,12 +77,17 @@ impl BlockStorage for PersistentBlockStorage {
     async fn load_block(&self, height: u32) -> StorageResult<Option<HashedBlock>> {
         self.blocks.write().await.get_item(height).await
     }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.blocks.write().await.truncate_above(target_height).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_store_and_load_block() {
@@ -110,6 +126,21 @@ mod tests {
 
         let loaded = storage.load_block(999).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_truncate_above_wrapper_smoke() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockStorage::open(temp_dir.path()).await.unwrap();
+
+        for height in 0..5 {
+            storage.store_block(height, HashedBlock::dummy(height, vec![])).await.unwrap();
+        }
+
+        storage.truncate_above(2).await.unwrap();
+
+        assert_eq!(storage.load_block(2).await.unwrap(), Some(HashedBlock::dummy(2, vec![])));
+        assert_eq!(storage.load_block(3).await.unwrap(), None);
     }
 
     #[tokio::test]
