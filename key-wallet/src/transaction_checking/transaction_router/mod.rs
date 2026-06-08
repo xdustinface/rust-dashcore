@@ -79,18 +79,33 @@ impl TransactionRouter {
         }
     }
 
+    /// All account types that hold spendable funds on the Core chain.
+    ///
+    /// Ownership of a transaction is membership-based across every keychain, exactly like
+    /// Dash Core's `IsMine`, which tests each scriptPubKey against all script-pubkey managers
+    /// uniformly (regular external, internal, and the CoinJoin descriptor). A transaction's
+    /// shape (`TransactionType::Standard` vs `TransactionType::CoinJoin`) is only a downstream
+    /// label, never a precondition for discovery, so both shapes must consult the full set of
+    /// fund-bearing accounts. An account only matches when a scriptPubKey or spent UTXO actually
+    /// belongs to it, so checking extra accounts never produces false positives.
+    fn fund_bearing_account_types() -> Vec<AccountTypeToCheck> {
+        vec![
+            AccountTypeToCheck::StandardBIP44,
+            AccountTypeToCheck::StandardBIP32,
+            AccountTypeToCheck::CoinJoin,
+            AccountTypeToCheck::DashpayReceivingFunds,
+            AccountTypeToCheck::DashpayExternalAccount,
+        ]
+    }
+
     /// Determine which account types should be checked for a given transaction type
     pub fn get_relevant_account_types(tx_type: &TransactionType) -> Vec<AccountTypeToCheck> {
         match tx_type {
-            TransactionType::Standard => {
-                vec![
-                    AccountTypeToCheck::StandardBIP44,
-                    AccountTypeToCheck::StandardBIP32,
-                    AccountTypeToCheck::DashpayReceivingFunds,
-                    AccountTypeToCheck::DashpayExternalAccount,
-                ]
+            // Standard and CoinJoin transactions are distinguished only by their stored label;
+            // discovery is membership-based, so both check every fund-bearing account.
+            TransactionType::Standard | TransactionType::CoinJoin => {
+                Self::fund_bearing_account_types()
             }
-            TransactionType::CoinJoin => vec![AccountTypeToCheck::CoinJoin],
             TransactionType::ProviderRegistration => vec![
                 AccountTypeToCheck::ProviderOwnerKeys,
                 AccountTypeToCheck::ProviderOperatorKeys,
@@ -141,7 +156,12 @@ impl TransactionRouter {
         }
     }
 
-    /// Check if a transaction appears to be a CoinJoin transaction
+    /// Check if a transaction appears to be a CoinJoin transaction.
+    ///
+    /// This heuristic only determines the stored [`TransactionType`] label; it never gates which
+    /// accounts are consulted for ownership (that is membership-based across all keychains, like
+    /// Dash Core). A small denomination spend that fails this heuristic is still discovered by the
+    /// CoinJoin account because that account owns the relevant scriptPubKeys.
     fn is_coinjoin_transaction(tx: &Transaction) -> bool {
         // CoinJoin transactions typically have:
         // - Multiple inputs from different addresses
@@ -154,13 +174,14 @@ impl TransactionRouter {
 
     /// Check if transaction has denomination outputs typical of CoinJoin
     fn has_denomination_outputs(tx: &Transaction) -> bool {
-        // Check for standard CoinJoin denominations
+        // Standard CoinJoin denominations, each including the per-round fee
+        // (Dash Core `coinjoin/common.h`): denom + denom/1000 + 1, with COIN = 100_000_000.
         const COINJOIN_DENOMINATIONS: [u64; 5] = [
-            100_000_000, // 1 DASH
-            10_000_000,  // 0.1 DASH
-            1_000_000,   // 0.01 DASH
-            100_000,     // 0.001 DASH
-            10_000,      // 0.0001 DASH
+            1_000_010_000, // 10 DASH + fee
+            100_001_000,   // 1 DASH + fee
+            10_000_100,    // 0.1 DASH + fee
+            1_000_010,     // 0.01 DASH + fee
+            100_001,       // 0.001 DASH + fee
         ];
 
         let mut denomination_count = 0;

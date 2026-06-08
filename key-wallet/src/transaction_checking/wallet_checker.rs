@@ -397,9 +397,11 @@ mod tests {
             let result =
                 managed_wallet.check_core_transaction(&tx, context, &mut wallet, true, true).await;
 
-            // Since this is not a coinjoin looking transaction, we should not pick up on it.
-            assert!(!result.is_relevant);
-            assert_eq!(result.total_received, 0);
+            // The tx does not look like CoinJoin (it classifies as Standard), but routing checks
+            // every fund-bearing account, so a payment to our CoinJoin address is still picked up.
+            // Discovery is membership-based, like Dash Core's `IsMine`, not gated on the tx shape.
+            assert!(result.is_relevant);
+            assert_eq!(result.total_received, 75_000);
         }
     }
 
@@ -1655,7 +1657,7 @@ mod tests {
         };
 
         // Build a CoinJoin-like tx: 3+ inputs, 3+ outputs with denomination amounts
-        let denomination = 100_000u64; // 0.001 DASH
+        let denomination = 100_001u64; // 0.001 DASH + per-round fee
         let external_addr = Address::dummy(Network::Testnet, 99);
         let tx = Transaction {
             version: 2,
