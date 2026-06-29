@@ -12,11 +12,13 @@ mod instantsend;
 mod masternodes;
 mod mempool;
 mod progress;
+pub(crate) mod reorg;
 mod sync_coordinator;
 mod sync_manager;
 
 pub use block_headers::{BlockHeadersManager, BlockHeadersProgress};
 pub use blocks::{BlocksManager, BlocksProgress};
+pub(crate) use chainlock::BEST_CHAINLOCK_KEY;
 pub use chainlock::{ChainLockManager, ChainLockProgress};
 pub use filter_headers::{FilterHeadersManager, FilterHeadersProgress};
 pub use filters::{FiltersManager, FiltersProgress};

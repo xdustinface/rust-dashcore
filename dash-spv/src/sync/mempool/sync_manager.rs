@@ -22,6 +22,12 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
         self.progress.set_state(state);
     }
 
+    fn update_target_height(&mut self, height: u32) {
+        if height > self.current_tip_height {
+            self.current_tip_height = height;
+        }
+    }
+
     fn wanted_message_types(&self) -> &'static [MessageType] {
         &[MessageType::Inv, MessageType::Tx]
     }
@@ -39,7 +45,7 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
         Ok(vec![])
     }
 
-    fn clear_in_flight_state(&mut self) {
+    fn on_disconnect(&mut self) {
         self.clear_pending();
     }
 
@@ -88,6 +94,9 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
                 // Remove confirmed transactions from mempool.
                 // Bloom filter rebuild is handled by the tick's revision check.
                 if !confirmed_txids.is_empty() {
+                    for txid in confirmed_txids {
+                        self.pending_rebroadcast.remove(txid);
+                    }
                     self.remove_confirmed(confirmed_txids);
                 }
                 Ok(vec![])
@@ -119,6 +128,12 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
 
         // Rebroadcast unconfirmed self-sent transactions on a randomized interval
         self.rebroadcast_if_due(requests).await;
+
+        // Drain WalletEvents to pick up reorg-demoted txids and new-chain
+        // confirmations, then drive the reorg rebroadcast queue. Both
+        // calls are no-ops when there is no pending state.
+        self.drain_wallet_events().await;
+        self.drive_reorg_rebroadcast(requests).await;
 
         // Rebuild bloom filter if the wallet's monitored set has changed.
         //
@@ -195,18 +210,35 @@ mod tests {
     use dashcore::hashes::Hash;
     use key_wallet_manager::test_utils::MockWallet;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
     use tokio::sync::{mpsc, RwLock};
 
     fn create_test_manager(
     ) -> (MempoolManager<MockWallet>, RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
+        let (manager, _wallet, requests, rx) = create_test_manager_with_wallet();
+        (manager, requests, rx)
+    }
+
+    fn create_test_manager_with_wallet() -> (
+        MempoolManager<MockWallet>,
+        Arc<RwLock<MockWallet>>,
+        RequestSender,
+        mpsc::UnboundedReceiver<NetworkRequest>,
+    ) {
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
         let (tx, rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let manager = MempoolManager::new(wallet, MempoolStrategy::FetchAll, 1000, 0);
+        let manager = MempoolManager::new(
+            wallet.clone(),
+            MempoolStrategy::FetchAll,
+            1000,
+            0,
+            Arc::new(AtomicU32::new(0)),
+        );
 
-        (manager, requests, rx)
+        (manager, wallet, requests, rx)
     }
 
     #[test]
@@ -351,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_processed_removes_confirmed_txids() {
-        let (mut manager, requests, _rx) = create_test_manager();
+        let (mut manager, wallet, requests, _rx) = create_test_manager_with_wallet();
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
 
@@ -361,7 +393,9 @@ mod tests {
         };
         manager.handle_sync_event(&sync, &requests).await.unwrap();
 
-        // Add transactions to mempool
+        // Add transactions to mempool, and stage the first one as a
+        // pending rebroadcast so we can assert the BlockProcessed handler
+        // wipes it on confirmation.
         let mut txids = Vec::new();
         for i in 0..2u32 {
             let tx = dashcore::Transaction {
@@ -373,6 +407,7 @@ mod tests {
             };
             let txid = tx.txid();
             txids.push(txid);
+            wallet.write().await.insert_stored_transaction(tx.clone());
             manager.transactions.insert(
                 txid,
                 crate::types::UnconfirmedTransaction::new(
@@ -385,6 +420,16 @@ mod tests {
                 ),
             );
         }
+        manager
+            .enqueue_demoted_for_rebroadcast_for_test(
+                key_wallet_manager::test_utils::MOCK_WALLET_ID,
+                &[txids[0]],
+            )
+            .await;
+        assert!(
+            manager.pending_rebroadcast.contains_key(&txids[0]),
+            "seed step must place the demoted tx into pending_rebroadcast"
+        );
 
         let event = SyncEvent::BlockProcessed {
             block_hash: dashcore::BlockHash::all_zeros(),
@@ -397,6 +442,10 @@ mod tests {
         assert!(events.is_empty());
 
         assert!(manager.transactions.is_empty());
+        assert!(
+            !manager.pending_rebroadcast.contains_key(&txids[0]),
+            "confirmed txid must be removed from pending_rebroadcast"
+        );
     }
 
     #[tokio::test]
@@ -556,7 +605,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let mut manager = MempoolManager::new(wallet, MempoolStrategy::BloomFilter, 1000, 0);
+        let mut manager = MempoolManager::new(
+            wallet,
+            MempoolStrategy::BloomFilter,
+            1000,
+            0,
+            Arc::new(AtomicU32::new(0)),
+        );
 
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
@@ -631,6 +686,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -686,7 +742,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NetworkRequest>();
         let requests = RequestSender::new(tx);
 
-        let mut manager = MempoolManager::new(wallet.clone(), MempoolStrategy::FetchAll, 1000, 0);
+        let mut manager = MempoolManager::new(
+            wallet.clone(),
+            MempoolStrategy::FetchAll,
+            1000,
+            0,
+            Arc::new(AtomicU32::new(0)),
+        );
 
         let peer = test_socket_address(1);
         manager.handle_peer_connected(peer);
@@ -740,6 +802,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);
@@ -789,6 +852,7 @@ mod tests {
             MempoolStrategy::BloomFilter,
             1000,
             initial_revision,
+            Arc::new(AtomicU32::new(0)),
         );
 
         let peer = test_socket_address(1);

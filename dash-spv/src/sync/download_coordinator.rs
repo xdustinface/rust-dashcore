@@ -58,6 +58,9 @@ pub(crate) struct DownloadCoordinator<K: Hash + Eq + Clone> {
     pending: VecDeque<K>,
     /// Items currently in-flight (key -> sent time).
     in_flight: HashMap<K, Instant>,
+    /// Generation snapshot taken when each in-flight key was marked sent.
+    /// Used by reorg-aware pipelines to drop stale responses.
+    generations: HashMap<K, u64>,
     /// Retry counts per key.
     retry_counts: HashMap<K, u32>,
     /// Configuration.
@@ -78,6 +81,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
         Self {
             pending: VecDeque::new(),
             in_flight: HashMap::new(),
+            generations: HashMap::new(),
             retry_counts: HashMap::new(),
             config,
             last_progress: Instant::now(),
@@ -88,8 +92,29 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
     pub(crate) fn clear(&mut self) {
         self.pending.clear();
         self.in_flight.clear();
+        self.generations.clear();
         self.retry_counts.clear();
         self.last_progress = Instant::now();
+    }
+
+    /// Move all in-flight items back to the front of the pending queue.
+    ///
+    /// Used on peer disconnect: the requests went to a now-dead peer, but the
+    /// items themselves are still wanted. Retry counts are preserved so a peer
+    /// that consistently fails to deliver an item still trips the normal retry
+    /// budget. Without this hook, items would only be retried once their
+    /// timeout elapsed.
+    pub(crate) fn requeue_in_flight(&mut self) {
+        let items: Vec<K> = self.in_flight.drain().map(|(k, _)| k).collect();
+        if items.is_empty() {
+            return;
+        }
+        for item in &items {
+            self.generations.remove(item);
+        }
+        for item in items.into_iter().rev() {
+            self.pending.push_front(item);
+        }
     }
 
     /// Queue items for download.
@@ -135,17 +160,46 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
         }
     }
 
+    /// Mark items as sent and tag them with a generation snapshot, so a later
+    /// `receive` from a stale generation can be detected and dropped.
+    pub(crate) fn mark_sent_with_generation(&mut self, items: &[K], generation: u64) {
+        let now = Instant::now();
+        for item in items {
+            self.in_flight.insert(item.clone(), now);
+            self.generations.insert(item.clone(), generation);
+        }
+    }
+
+    /// Read the generation snapshot recorded for an in-flight key.
+    pub(crate) fn generation_for(&self, key: &K) -> Option<u64> {
+        self.generations.get(key).copied()
+    }
+
     /// Handle a received item.
     ///
     /// Returns true if the item was being tracked, false if unexpected.
     pub(crate) fn receive(&mut self, key: &K) -> bool {
         if self.in_flight.remove(key).is_some() {
+            self.generations.remove(key);
             self.retry_counts.remove(key);
             self.last_progress = Instant::now();
             true
         } else {
             false
         }
+    }
+
+    /// Drop a key from the pending queue without touching in-flight state.
+    ///
+    /// Used when a pending item is satisfied through a side channel: a late
+    /// response from a disconnected peer can complete a batch that
+    /// `requeue_in_flight` just moved from in-flight back to pending. Without
+    /// this hook, the key would stay in `pending` with no tracker, and the
+    /// next `take_pending` would resurrect a finished batch.
+    pub(crate) fn cancel_pending(&mut self, key: &K) {
+        self.pending.retain(|k| k != key);
+        self.retry_counts.remove(key);
+        self.generations.remove(key);
     }
 
     /// Check if an item is currently in-flight.
@@ -168,6 +222,7 @@ impl<K: Hash + Eq + Clone> DownloadCoordinator<K> {
 
         for key in &timed_out {
             self.in_flight.remove(key);
+            self.generations.remove(key);
         }
 
         if !timed_out.is_empty() {
@@ -313,6 +368,80 @@ mod tests {
         let timed_out = coord.check_timeouts();
         assert_eq!(timed_out.len(), 2);
         assert!(coord.in_flight.is_empty());
+    }
+
+    #[test]
+    fn test_requeue_in_flight_moves_items_to_pending_front() {
+        let mut coord: DownloadCoordinator<u32> = DownloadCoordinator::default();
+        coord.enqueue([10, 11]);
+        coord.mark_sent(&[1, 2, 3]);
+
+        coord.requeue_in_flight();
+
+        assert_eq!(coord.active_count(), 0);
+        // Requeued items go to the front, original pending follows.
+        let items = coord.take_pending(5);
+        assert_eq!(items.len(), 5);
+        assert_eq!(&items[3..], &[10, 11]);
+        let mut requeued = items[..3].to_vec();
+        requeued.sort();
+        assert_eq!(requeued, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_requeue_in_flight_preserves_retry_counts() {
+        let mut coord: DownloadCoordinator<u32> = DownloadCoordinator::default();
+        coord.enqueue_retry(7);
+        let items = coord.take_pending(1);
+        coord.mark_sent(&items);
+        assert_eq!(coord.retry_counts.get(&7), Some(&1));
+
+        coord.requeue_in_flight();
+
+        assert_eq!(coord.retry_counts.get(&7), Some(&1));
+        assert!(!coord.is_in_flight(&7));
+        assert_eq!(coord.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_requeue_in_flight_no_op_when_empty() {
+        let mut coord: DownloadCoordinator<u32> = DownloadCoordinator::default();
+        coord.enqueue([1, 2]);
+
+        coord.requeue_in_flight();
+
+        assert_eq!(coord.pending_count(), 2);
+        assert_eq!(coord.active_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_pending_removes_from_pending_only() {
+        let mut coord: DownloadCoordinator<u32> = DownloadCoordinator::default();
+        coord.enqueue([1, 2, 3]);
+        coord.mark_sent(&[10]);
+        coord.enqueue_retry(2);
+        assert_eq!(coord.retry_counts.get(&2), Some(&1));
+
+        coord.cancel_pending(&2);
+
+        assert_eq!(coord.pending_count(), 2);
+        assert!(coord.is_in_flight(&10));
+        assert_eq!(coord.retry_counts.get(&2), None);
+
+        let items = coord.take_pending(2);
+        assert_eq!(items, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cancel_pending_unknown_key_is_noop() {
+        let mut coord: DownloadCoordinator<u32> = DownloadCoordinator::default();
+        coord.enqueue([1, 2]);
+        coord.mark_sent(&[5]);
+
+        coord.cancel_pending(&99);
+
+        assert_eq!(coord.pending_count(), 2);
+        assert_eq!(coord.active_count(), 1);
     }
 
     #[test]

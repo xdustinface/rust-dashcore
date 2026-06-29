@@ -26,9 +26,9 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         &[MessageType::CLSig, MessageType::Inv]
     }
 
-    fn clear_in_flight_state(&mut self) {
+    fn on_disconnect(&mut self) {
         self.requested_chainlocks.clear();
-        self.masternode_ready = false;
+        self.reset_for_disconnect();
     }
 
     async fn handle_message(
@@ -36,8 +36,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
         msg: Message,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        let peer = msg.peer_address();
         match msg.inner() {
-            NetworkMessage::CLSig(chainlock) => self.process_chainlock(chainlock).await,
+            NetworkMessage::CLSig(chainlock) => {
+                self.process_chainlock(chainlock, Some(peer), requests).await
+            }
             NetworkMessage::Inv(inv) => {
                 // Check for ChainLock inventory items, filtering out already-requested ones
                 let chainlocks_to_request: Vec<Inventory> = inv
@@ -76,25 +79,51 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     async fn handle_sync_event(
         &mut self,
         event: &SyncEvent,
-        _requests: &RequestSender,
+        requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
-        // Enable ChainLock validation when masternode state is available
-        if let SyncEvent::MasternodeStateUpdated {
+        if let SyncEvent::ChainReorg {
+            fork_height,
             ..
         } = event
         {
-            self.set_masternode_ready();
-            if matches!(self.state(), SyncState::Syncing | SyncState::WaitForEvents) {
-                self.set_state(SyncState::Synced);
-                tracing::info!("ChainLock manager synced (masternode data available)");
-            }
+            tracing::info!(
+                fork_height,
+                "ChainLockManager: cascading ChainReorg, hard-blocking validation"
+            );
+            self.reset_for_reorg();
+            return Ok(vec![]);
         }
 
-        Ok(vec![])
+        if matches!(event, SyncEvent::BlockHeadersStored { .. }) {
+            return self.retry_pending_unknown_hash(requests).await;
+        }
+
+        // `MasternodeStateUpdated` fires on every MnListDiff / QRInfo
+        // update; the work below is strictly one-shot startup work, so
+        // gate the entire branch on the not-ready transition. Also drop
+        // buffered events that arrive between `stop_sync` and the next
+        // `start_sync`, otherwise the one-shot would force `Synced` while
+        // peerless. `MasternodeStateUpdated` re-fires once `MasternodesManager`
+        // completes a sync cycle after reconnect.
+        if !matches!(event, SyncEvent::MasternodeStateUpdated { .. })
+            || self.is_masternode_ready()
+            || self.state() == SyncState::WaitingForConnections
+        {
+            return Ok(vec![]);
+        }
+
+        let events = self.on_masternode_ready().await;
+        self.set_state(SyncState::Synced);
+        tracing::info!("ChainLock manager synced (masternode data available)");
+
+        Ok(events)
     }
 
     async fn tick(&mut self, _requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
-        // No periodic work needed
+        let evicted = self.drain_expired_pending();
+        if evicted > 0 {
+            tracing::debug!("Evicted {} expired pending-unknown-hash chainlocks", evicted);
+        }
         Ok(vec![])
     }
 

@@ -133,6 +133,20 @@ extern "C" fn on_sync_complete(header_tip: u32, cycle: u32, _user_data: *mut c_v
     println!("[Sync] Sync complete at height: {} (cycle {})", header_tip, cycle);
 }
 
+extern "C" fn on_chain_reorg(
+    fork_height: u32,
+    _old_tip: *const [u8; 32],
+    _new_tip: *const [u8; 32],
+    generation: u64,
+    _user_data: *mut c_void,
+) {
+    println!("[Sync] Chain reorg at fork_height={} generation={}", fork_height, generation);
+}
+
+extern "C" fn on_deep_reorg_detected(fork_height: u32, depth: u32, _user_data: *mut c_void) {
+    println!("[Sync] Deep reorg detected at fork_height={} depth={}", fork_height, depth);
+}
+
 // ============================================================================
 // Network Event Callbacks
 // ============================================================================
@@ -249,14 +263,23 @@ extern "C" fn on_wallet_block_processed(
     account_balances_count: u32,
     _addresses_derived: *const dash_spv_ffi::FFIDerivedAddress,
     addresses_derived_count: u32,
+    cl_height: u32,
+    cl_hash: *const [u8; 32],
+    _cl_signature: *const [u8; 96],
     _user_data: *mut c_void,
 ) {
     let wallet_short = short_wallet(wallet_id);
     let b = read_balance(balance);
+    let chainlocked = if cl_hash.is_null() {
+        "no".to_string()
+    } else {
+        format!("yes@{}", cl_height)
+    };
     println!(
-        "[Wallet] Block processed: wallet={}..., height={}, inserted={}, updated={}, matured={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}], changed_accounts={}, derived={}",
+        "[Wallet] Block processed: wallet={}..., height={}, chainlock={}, inserted={}, updated={}, matured={}, balance[confirmed={}, unconfirmed={}, immature={}, locked={}], changed_accounts={}, derived={}",
         wallet_short,
         height,
+        chainlocked,
         inserted_count,
         updated_count,
         matured_count,
@@ -266,6 +289,22 @@ extern "C" fn on_wallet_block_processed(
         b.locked,
         account_balances_count,
         addresses_derived_count,
+    );
+}
+
+extern "C" fn on_wallet_chain_lock_processed(
+    wallet_id: *const c_char,
+    cl_height: u32,
+    _cl_hash: *const [u8; 32],
+    _cl_signature: *const [u8; 96],
+    _finalized: *const dash_spv_ffi::FFIChainlockedTxid,
+    finalized_count: u32,
+    _user_data: *mut c_void,
+) {
+    let wallet_short = short_wallet(wallet_id);
+    println!(
+        "[Wallet] ChainLock processed: wallet={}..., cl_height={}, finalized={}",
+        wallet_short, cl_height, finalized_count,
     );
 }
 
@@ -486,6 +525,8 @@ fn main() {
                 on_instantlock_received: Some(on_instantlock_received),
                 on_manager_error: Some(on_manager_error),
                 on_sync_complete: Some(on_sync_complete),
+                on_chain_reorg: Some(on_chain_reorg),
+                on_deep_reorg_detected: Some(on_deep_reorg_detected),
                 user_data: ptr::null_mut(),
             },
             network: FFINetworkEventCallbacks {
@@ -503,6 +544,7 @@ fn main() {
                 on_transaction_instant_locked: Some(on_transaction_instant_locked),
                 on_block_processed: Some(on_wallet_block_processed),
                 on_sync_height_advanced: Some(on_sync_height_advanced),
+                on_chain_lock_processed: Some(on_wallet_chain_lock_processed),
                 user_data: ptr::null_mut(),
             },
             error: FFIClientErrorCallback {
@@ -537,7 +579,6 @@ fn main() {
             let success = wallet_manager_add_wallet_from_mnemonic(
                 wallet_manager as *mut _,
                 mnemonic_c.as_ptr(),
-                ptr::null(), // no passphrase
                 &mut error,
             );
 

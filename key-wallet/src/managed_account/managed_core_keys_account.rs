@@ -17,8 +17,9 @@ use crate::managed_account::managed_account_type::ManagedAccountType;
 use crate::managed_account::transaction_record::TransactionDirection;
 use crate::transaction_checking::account_checker::AccountMatch;
 use crate::transaction_checking::transaction_router::TransactionType;
-use crate::transaction_checking::TransactionContext;
+use crate::transaction_checking::{BlockInfo, TransactionContext};
 use crate::Network;
+use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Transaction, Txid};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,89 @@ impl ManagedCoreKeysAccount {
     pub(crate) fn drop_finalized_transaction(&mut self, txid: &Txid) {
         self.finalized_txids.insert(*txid);
         self.transactions.remove(txid);
+    }
+
+    /// Promote any `InBlock` records at height `<= cl_height` to
+    /// [`TransactionContext::InChainLockedBlock`] and return their txids.
+    ///
+    /// Under the default `keep-finalized-transactions=OFF` feature
+    /// configuration the promoted records are immediately dropped via
+    /// [`Self::drop_finalized_transaction`], with their txids retained
+    /// only in `finalized_txids`. With the feature on the records stay
+    /// in `transactions` with the updated context.
+    ///
+    /// Idempotent: records already in `InChainLockedBlock` or already
+    /// dropped to `finalized_txids` are not revisited and do not appear
+    /// in the result. Records still in `Mempool` or `InstantSend`
+    /// context are intentionally skipped, since chainlock-driven
+    /// promotion only applies to records that have already been mined.
+    pub(crate) fn apply_chain_lock(&mut self, cl_height: CoreBlockHeight) -> Vec<Txid> {
+        let candidates: Vec<(Txid, BlockInfo)> = self
+            .transactions
+            .iter()
+            .filter_map(|(txid, record)| match &record.context {
+                TransactionContext::InBlock(info) if info.height() <= cl_height => {
+                    Some((*txid, *info))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut promoted = Vec::with_capacity(candidates.len());
+        for (txid, info) in candidates {
+            if let Some(record) = self.transactions.get_mut(&txid) {
+                record.update_context(TransactionContext::InChainLockedBlock(info));
+                promoted.push(txid);
+            }
+        }
+
+        #[cfg(not(feature = "keep-finalized-transactions"))]
+        for txid in &promoted {
+            self.drop_finalized_transaction(txid);
+        }
+
+        promoted
+    }
+
+    /// Demote every transaction record whose mined height is strictly
+    /// greater than `height` back to [`TransactionContext::Mempool`]
+    /// and return the demoted txids. Mirrors
+    /// [`ManagedCoreFundsAccount::demote_records_above`] for the
+    /// keys-only side, where there is no UTXO state to rebuild.
+    ///
+    /// Records currently in `InstantSend`, `Conflicted`, or
+    /// `Abandoned` are left alone (see `demote_records_above` for the
+    /// rationale).
+    pub(crate) fn demote_records_above(&mut self, height: CoreBlockHeight) -> Vec<Txid> {
+        let mut demoted = Vec::new();
+        let to_demote: Vec<Txid> = self
+            .transactions
+            .iter()
+            .filter_map(|(txid, record)| match record.context.block_info() {
+                Some(info) if info.height() > height => Some(*txid),
+                _ => None,
+            })
+            .collect();
+        for txid in to_demote {
+            if let Some(record) = self.transactions.get_mut(&txid) {
+                record.update_context(TransactionContext::Mempool);
+                demoted.push(txid);
+            }
+        }
+        demoted
+    }
+
+    /// Demote a specific transaction by txid to `Mempool`. Returns
+    /// `true` when the record existed and was actually demoted.
+    pub(crate) fn demote_record(&mut self, txid: &Txid) -> bool {
+        let Some(record) = self.transactions.get_mut(txid) else {
+            return false;
+        };
+        if record.context.block_info().is_none() {
+            return false;
+        }
+        record.update_context(TransactionContext::Mempool);
+        true
     }
 
     /// Create a `ManagedCoreKeysAccount` from an [`Account`](super::super::Account).

@@ -1,30 +1,29 @@
 use dash_spv::client::config::MempoolStrategy;
 use dash_spv::network::NetworkEvent;
 use dash_spv::storage::{PeerStorage, PersistentPeerStorage, PersistentStorage};
-use dash_spv::test_utils::{retain_test_dir, DashdTestContext, TestChain, TestEventHandler};
+use dash_spv::test_utils::{
+    create_test_wallet, init_test_logging, next_unused_receive_address, retain_test_dir,
+    DashdTestContext, TestChain, TestEventHandler,
+};
 use dash_spv::{
     client::{ClientConfig, DashSpvClient},
     network::PeerNetworkManager,
     storage::DiskStorageManager,
     sync::{ProgressPercentage, SyncEvent, SyncProgress},
-    LevelFilter, LoggingGuard, Network,
+    LoggingGuard, Network,
 };
 use dashcore::network::address::AddrV2Message;
 use dashcore::network::constants::ServiceFlags;
 use dashcore::Txid;
-use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
-use key_wallet::managed_account::managed_account_type::ManagedAccountType;
-use key_wallet::wallet::initialization::WalletAccountCreationOptions;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet_manager::WalletEvent;
 use key_wallet_manager::{WalletId, WalletManager};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, watch, RwLock};
-use tokio_util::sync::CancellationToken;
 
 /// SPV-specific test context wrapping the shared dashd infrastructure.
 ///
@@ -68,17 +67,7 @@ impl TestContext {
 
     fn create(dashd: DashdTestContext) -> Self {
         let storage_dir = TempDir::new().expect("Failed to create temporary directory");
-        let log_dir = storage_dir.path().join("logs");
-        let _log_guard = dash_spv::init_logging(dash_spv::LoggingConfig {
-            level: Some(LevelFilter::DEBUG),
-            console: std::env::var("DASHD_TEST_LOG").is_ok(),
-            file: Some(dash_spv::LogFileConfig {
-                log_dir: log_dir.clone(),
-                max_files: 1,
-            }),
-            thread_local: true,
-        })
-        .expect("Failed to initialize test logging");
+        let _log_guard = init_test_logging(storage_dir.path().join("logs"));
 
         let client_config = create_test_config(storage_dir.path().to_path_buf(), dashd.addr);
 
@@ -134,29 +123,7 @@ impl TestContext {
     }
     /// Retrieves an unused receiving address from the wallet.
     pub(super) async fn receive_address(&self) -> dashcore::Address {
-        let wallet_read = self.wallet.read().await;
-        let wallet_info =
-            wallet_read.get_wallet_info(&self.wallet_id).expect("Wallet info not found");
-
-        let account = wallet_info
-            .accounts()
-            .standard_bip44_accounts
-            .get(&0)
-            .expect("BIP44 account 0 not found");
-
-        let ManagedAccountType::Standard {
-            external_addresses,
-            ..
-        } = account.managed_account_type()
-        else {
-            panic!("Account 0 is not a Standard account type");
-        };
-
-        external_addresses
-            .unused_addresses()
-            .into_iter()
-            .next()
-            .expect("No unused receive address available")
+        next_unused_receive_address(&self.wallet, &self.wallet_id).await
     }
     /// Checks if a transaction with the specified transaction ID (`txid`) exists in the wallet.
     pub(super) async fn has_transaction(&self, txid: &dashcore::Txid) -> bool {
@@ -263,7 +230,7 @@ pub(super) type TestClient =
     DashSpvClient<WalletManager<ManagedWalletInfo>, PeerNetworkManager, DiskStorageManager>;
 
 /// A `ClientHandle` is a utility structure that manages the state and handles for a `TestClient`
-/// required to interact with the synchronization process, various event channels, and cancellation capabilities.
+/// required to interact with the synchronization process and event channels.
 pub(super) struct ClientHandle {
     /// The underlying SPV client instance.
     pub(super) client: TestClient,
@@ -277,16 +244,13 @@ pub(super) struct ClientHandle {
     pub(super) network_event_receiver: broadcast::Receiver<NetworkEvent>,
     /// A channel for receiving wallet events.
     pub(super) wallet_event_receiver: broadcast::Receiver<WalletEvent>,
-    /// A cancellation token for the client's run loop.
-    pub(super) cancel_token: CancellationToken,
 }
 
 impl ClientHandle {
-    /// Stops the execution of the client run loop by canceling its associated token and awaiting the
-    /// termination of the background task.
+    /// Stops the SPV client and awaits the termination of the background run task.
     pub(super) async fn stop(&mut self) {
-        tracing::info!("Cancelling client run loop...");
-        self.cancel_token.cancel();
+        tracing::info!("Stopping client run loop...");
+        self.client.stop().await.expect("client stop failed");
         if let Some(handle) = self.run_handle.take() {
             handle.await.expect("Run task panicked").expect("Run task returned error");
         }
@@ -336,11 +300,9 @@ pub(super) async fn create_and_start_client(
         let w = client.wallet().read().await;
         w.subscribe_events()
     };
-    let cancel_token = CancellationToken::new();
-    let run_token = cancel_token.clone();
     let run_client = client.clone();
 
-    let run_handle = tokio::task::spawn(async move { run_client.run(run_token).await });
+    let run_handle = tokio::task::spawn(async move { run_client.run().await });
 
     ClientHandle {
         client,
@@ -349,32 +311,7 @@ pub(super) async fn create_and_start_client(
         sync_event_receiver,
         network_event_receiver,
         wallet_event_receiver,
-        cancel_token,
     }
-}
-
-/// Account creation options for tests: just a standard BIP44 account 0.
-pub(super) fn test_account_options() -> WalletAccountCreationOptions {
-    WalletAccountCreationOptions::SpecificAccounts(
-        BTreeSet::from([0]),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        None,
-    )
-}
-
-/// Create a test wallet from mnemonic.
-pub(super) fn create_test_wallet(
-    mnemonic: &str,
-    network: Network,
-) -> (Arc<RwLock<WalletManager<ManagedWalletInfo>>>, WalletId) {
-    let mut wallet_manager = WalletManager::<ManagedWalletInfo>::new(network);
-    let wallet_id = wallet_manager
-        .create_wallet_from_mnemonic(mnemonic, "", 0, test_account_options())
-        .expect("Failed to create wallet from mnemonic");
-    (Arc::new(RwLock::new(wallet_manager)), wallet_id)
 }
 
 /// Create test client config pointing to a specific peer (exclusive mode).
