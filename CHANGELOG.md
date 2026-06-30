@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.43.0 - 2026-06-01
+
+### Added
+
+- Devnet support for `dash-spv` (#784) @xdustinface
+- Consolidate devnet config into a `DevnetConfig` struct (#788) @xdustinface
+- `downgrade_to_external_signable` method on wallets (#782) @ZocoLini
+
+### Changed
+
+- **Breaking:** network-scoped wallet-id derivation, the same seed now yields different wallet IDs per network (#793) @QuantumExplorer
+- Derive `Zeroize` on `WalletType` and wipe key material on `drop` (#780) @ZocoLini
+- Avoid rebuilding `script_pubkey`s for BIP158 filter matching (#781) @xdustinface
+- Migrate from `vX.Y-dev` branching model to a single `dev` branch (#778) @xdustinface
+- Bump workspace version to `0.43.0` (#779) @xdustinface
+
+### Fixed
+
+- Handle buffered sync events during `WaitingForConnections` in `dash-spv` (#768) @xdustinface
+
 ## 0.42.0 - 2026-05-15
 
 ### Highlights
