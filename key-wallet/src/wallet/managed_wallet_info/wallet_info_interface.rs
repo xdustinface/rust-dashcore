@@ -374,6 +374,19 @@ impl WalletInfoInterface for ManagedWalletInfo {
                 }));
             }
         }
+        // Dash Core inserts a `ProRegTx`'s `collateralOutpoint` into the block's
+        // compact filter serialized the consensus way — 32-byte txid followed by
+        // the 4-byte little-endian vout, 36 bytes total (see
+        // `ExtractSpecialTxFilterElements`). A wallet that owns the collateral
+        // output but not the masternode's owner/voting keys would otherwise never
+        // match that `ProRegTx` on the scriptPubKey path, so watch each UTXO's
+        // outpoint directly. Every watched outpoint adds one 36-byte element,
+        // marginally raising the compact-filter false-positive rate; scoping to
+        // collateral-sized UTXOs is left out deliberately to avoid hardcoding
+        // network-specific collateral amounts.
+        for utxo in self.utxos() {
+            elements.push(dashcore::consensus::encode::serialize(&utxo.outpoint));
+        }
         elements
     }
 
@@ -503,5 +516,30 @@ impl WalletInfoInterface for ManagedWalletInfo {
 
     fn monitor_revision(&self) -> u64 {
         self.accounts.all_accounts().iter().map(|a| a.monitor_revision()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::TestWalletContext;
+
+    /// A wallet that owns a UTXO must surface that UTXO's outpoint as a bare
+    /// filter element, consensus-serialized to the 36-byte form Dash Core
+    /// inserts for a `ProRegTx`'s `collateralOutpoint`, so a compact-filter
+    /// scan matches a masternode registration against the wallet's collateral
+    /// even when the wallet holds none of the masternode's keys.
+    #[tokio::test]
+    async fn test_watched_utxo_outpoint_is_filter_element() {
+        let (ctx, _tx) = TestWalletContext::new_random().with_mempool_funding(200_000).await;
+        let outpoint = ctx.first_utxo().outpoint;
+        let serialized = dashcore::consensus::encode::serialize(&outpoint);
+        assert_eq!(serialized.len(), 36, "outpoint serializes to txid ++ le-vout");
+
+        let elements = ctx.managed_wallet.monitored_filter_elements();
+        assert!(
+            elements.contains(&serialized),
+            "monitored_filter_elements must carry the watched UTXO's serialized outpoint"
+        );
     }
 }
