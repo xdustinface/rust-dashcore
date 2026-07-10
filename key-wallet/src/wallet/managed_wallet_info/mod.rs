@@ -18,15 +18,19 @@ pub use managed_account_operations::ManagedAccountOperations;
 use super::balance::WalletCoreBalance;
 use super::metadata::WalletMetadata;
 use crate::account::ManagedAccountCollection;
+use crate::managed_account::address_pool::PublicKeyType;
 use crate::managed_account::managed_account_trait::ManagedAccountTrait;
 use crate::wallet::managed_wallet_info::transaction_building::AccountTypePreference;
 use crate::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use crate::{Network, Wallet};
+use dashcore::address::Payload;
+use dashcore::bls_sig_utils::BLSPublicKey;
+use dashcore::hash_types::{ProTxHash, PubkeyHash};
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Txid};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// Information about a managed wallet
 ///
@@ -53,6 +57,20 @@ pub struct ManagedWalletInfo {
     /// Transactions that have received an InstantSend lock.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) instant_send_locks: HashSet<Txid>,
+    /// proTxHashes of the masternodes this wallet controls, watched so a
+    /// masternode-update special transaction is caught by the compact-filter
+    /// scan.
+    ///
+    /// Dash Core inserts a `ProUpServTx`/`ProUpRegTx`/`ProUpRevTx`'s
+    /// `proTxHash` into the block's BIP158 compact filter as a bare 32-byte
+    /// element (raw internal order, `AddHashElement` in
+    /// `evo/specialtx_filter.cpp`). Those transactions carry none of the
+    /// wallet's scriptPubKeys, so the only way to match them is to carry the
+    /// proTxHash directly. This set is populated by the SPV client from the
+    /// synced masternode list (it is transient sync state, not wallet
+    /// identity, so it is never persisted).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) watched_pro_tx_hashes: BTreeSet<ProTxHash>,
 }
 
 impl ManagedWalletInfo {
@@ -67,6 +85,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::new(),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            watched_pro_tx_hashes: BTreeSet::new(),
         }
     }
 
@@ -81,6 +100,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::new(),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            watched_pro_tx_hashes: BTreeSet::new(),
         }
     }
 
@@ -105,6 +125,7 @@ impl ManagedWalletInfo {
             accounts: ManagedAccountCollection::from_account_collection(&wallet.accounts),
             balance: WalletCoreBalance::default(),
             instant_send_locks: HashSet::new(),
+            watched_pro_tx_hashes: BTreeSet::new(),
         }
     }
 
@@ -134,6 +155,55 @@ impl ManagedWalletInfo {
     /// inside this crate.
     pub fn instant_send_locks(&self) -> &HashSet<Txid> {
         &self.instant_send_locks
+    }
+
+    /// The `hash160`s of this wallet's provider voting-key addresses.
+    ///
+    /// These are exactly the `key_id_voting` values a masternode list entry
+    /// (`dashcore::sml::masternode_list_entry::MasternodeListEntry`) carries,
+    /// so a masternode-list sync can match a wallet's voting keys against the
+    /// synced list to recover the proTxHashes it controls. Empty when the
+    /// wallet has no provider-voting-keys account.
+    pub fn provider_voting_key_hashes(&self) -> BTreeSet<PubkeyHash> {
+        let Some(account) = self.accounts.provider_voting_keys.as_ref() else {
+            return BTreeSet::new();
+        };
+        account
+            .all_addresses()
+            .iter()
+            .filter_map(|address| match address.payload() {
+                Payload::PubkeyHash(hash) => Some(*hash),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The BLS public keys of this wallet's provider operator-key account.
+    ///
+    /// These are exactly the `operator_public_key` values a masternode list
+    /// entry (`dashcore::sml::masternode_list_entry::MasternodeListEntry`)
+    /// carries, so a masternode-list sync can match a wallet's operator keys
+    /// against the synced list. The operator account derives P2PKH addresses
+    /// from the `hash160` of each BLS key, so the raw 48-byte key is recovered
+    /// from the address pool's stored public keys rather than from the
+    /// addresses themselves. Empty when the wallet has no
+    /// provider-operator-keys account.
+    pub fn provider_operator_public_keys(&self) -> BTreeSet<BLSPublicKey> {
+        let Some(account) = self.accounts.provider_operator_keys.as_ref() else {
+            return BTreeSet::new();
+        };
+        account
+            .managed_account_type()
+            .address_pools()
+            .iter()
+            .flat_map(|pool| pool.addresses.values())
+            .filter_map(|info| match &info.public_key {
+                Some(PublicKeyType::BLS(bytes)) => {
+                    <[u8; 48]>::try_from(bytes.as_slice()).ok().map(BLSPublicKey::from)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn next_change_address(

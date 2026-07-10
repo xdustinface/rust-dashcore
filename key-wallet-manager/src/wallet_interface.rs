@@ -6,6 +6,7 @@ use crate::{WalletEvent, WalletId};
 use async_trait::async_trait;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
+use dashcore::hash_types::ProTxHash;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use std::collections::{BTreeMap, BTreeSet};
@@ -98,6 +99,23 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// only.
     fn monitored_filter_elements_for(&self, _wallet_id: &WalletId) -> Vec<Vec<u8>> {
         Vec::new()
+    }
+
+    /// Replace the set of masternode proTxHashes watched by `wallet_id` so a
+    /// masternode-update special transaction is caught by the compact-filter
+    /// scan.
+    ///
+    /// Dash Core inserts a `ProUp*`'s `proTxHash` into the block's compact
+    /// filter as a bare 32-byte element, so these join the bare elements
+    /// returned by `monitored_filter_elements_for`. The SPV client computes
+    /// the set by cross-referencing the synced masternode list against the
+    /// wallet's provider keys. The default is a no-op for implementations that
+    /// do not track masternodes.
+    fn set_watched_pro_tx_hashes_for(
+        &mut self,
+        _wallet_id: &WalletId,
+        _hashes: BTreeSet<ProTxHash>,
+    ) {
     }
 
     /// Get all outpoints the wallet is watching (unspent outputs).

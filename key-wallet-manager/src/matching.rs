@@ -82,6 +82,8 @@ mod tests {
     use super::*;
     use dashcore::address::Payload;
     use dashcore::bip158::BlockFilterWriter;
+    use dashcore::hash_types::ProTxHash;
+    use dashcore::hashes::Hash;
     use dashcore::{Address, Block, OutPoint, Transaction, Txid};
     use key_wallet::Network;
 
@@ -300,5 +302,50 @@ mod tests {
         // Carrying the serialized outpoint in `extra_elements` matches.
         let with_element = check_compact_filters_for_elements(&input, &[], &[serialized], 0);
         assert!(with_element.contains(&key), "serialized-outpoint query must match");
+    }
+
+    /// A wallet watching a masternode it controls sees a compact filter that
+    /// carries the masternode-update transaction's `proTxHash` as a bare
+    /// 32-byte element (the way Dash Core's `AddHashElement` inserts a
+    /// `ProUp*`'s `proTxHash`), not as one of the block's scriptPubKeys. The
+    /// scripts-only query must miss it and the query carrying the serialized
+    /// proTxHash must hit it.
+    #[test]
+    fn test_pro_tx_hash_requires_extra_element() {
+        // The proTxHash a peer inserts as a bare element.
+        let pro_tx_hash = ProTxHash::from_byte_array([9u8; 32]);
+        let serialized = dashcore::consensus::encode::serialize(&pro_tx_hash);
+        assert_eq!(serialized.len(), 32, "proTxHash serializes to 32 raw bytes");
+
+        // An unrelated output so the filter is realistic.
+        let unrelated = Address::dummy(Network::Regtest, 99);
+        let tx = Transaction::dummy(&unrelated, 0..0, &[1]);
+        let block = Block::dummy(100, vec![tx]);
+
+        // Build the filter like a Dash Core peer: block output scripts plus the
+        // proTxHash as a bare element.
+        let mut content = Vec::new();
+        {
+            let mut writer = BlockFilterWriter::new(&mut content, &block);
+            writer.add_output_scripts();
+            writer.add_element(&serialized);
+            writer.finish().expect("finish filter");
+        }
+        let filter = BlockFilter::new(&content);
+        let key = FilterMatchKey::new(100, block.block_hash());
+
+        let mut input = HashMap::new();
+        input.insert(key.clone(), filter);
+
+        // A wallet watching only its own addresses (none in this block) does
+        // not carry the bare 32-byte proTxHash element and misses.
+        let watched = Address::dummy(Network::Regtest, 7);
+        let scripts_only =
+            check_compact_filters_for_elements(&input, &scripts_for(&[watched]), &[], 0);
+        assert!(!scripts_only.contains(&key), "scripts-only query must miss the proTxHash");
+
+        // Carrying the serialized proTxHash in `extra_elements` matches.
+        let with_element = check_compact_filters_for_elements(&input, &[], &[serialized], 0);
+        assert!(with_element.contains(&key), "serialized-proTxHash query must match");
     }
 }

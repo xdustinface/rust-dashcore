@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use core::fmt::Write as _;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
+use dashcore::hash_types::ProTxHash;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, BlockHash, ScriptBuf, Transaction};
 use key_wallet::account::AccountType;
@@ -233,6 +234,12 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
             .get(wallet_id)
             .map(|info| info.monitored_filter_elements())
             .unwrap_or_default()
+    }
+
+    fn set_watched_pro_tx_hashes_for(&mut self, wallet_id: &WalletId, hashes: BTreeSet<ProTxHash>) {
+        if let Some(info) = self.wallet_infos.get_mut(wallet_id) {
+            info.set_watched_pro_tx_hashes(hashes);
+        }
     }
 
     fn watched_outpoints(&self) -> Vec<dashcore::OutPoint> {

@@ -19,6 +19,7 @@ use crate::{Network, Utxo, Wallet, WalletCoreBalance};
 use dashcore::address::Payload;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
+use dashcore::hash_types::ProTxHash;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address as DashAddress, ScriptBuf, Transaction, Txid};
 
@@ -102,6 +103,18 @@ pub trait WalletInfoInterface: Sized + WalletTransactionChecker + ManagedAccount
     /// owner/voting address's 20-byte `hash160`; every other account type is
     /// omitted because its scriptPubKeys already cover the query.
     fn monitored_filter_elements(&self) -> Vec<Vec<u8>>;
+
+    /// Replace the set of masternode proTxHashes this wallet watches so a
+    /// masternode-update special transaction is caught by the compact-filter
+    /// scan.
+    ///
+    /// Dash Core inserts a `ProUp*` special transaction's `proTxHash` into the
+    /// block's compact filter as a bare 32-byte element, so these join the
+    /// bare elements returned by `monitored_filter_elements`. The SPV client
+    /// derives the set by cross-referencing the synced masternode list against
+    /// the wallet's provider keys. The default is a no-op for implementations
+    /// that do not track masternodes.
+    fn set_watched_pro_tx_hashes(&mut self, _hashes: BTreeSet<ProTxHash>) {}
 
     /// Get all UTXOs for the wallet
     fn utxos(&self) -> BTreeSet<&Utxo>;
@@ -387,7 +400,19 @@ impl WalletInfoInterface for ManagedWalletInfo {
         for utxo in self.utxos() {
             elements.push(dashcore::consensus::encode::serialize(&utxo.outpoint));
         }
+        // Dash Core inserts a `ProUpServTx`/`ProUpRegTx`/`ProUpRevTx`'s
+        // `proTxHash` into the block's compact filter as a bare 32-byte element
+        // (raw internal order, `AddHashElement` in `evo/specialtx_filter.cpp`).
+        // Such a transaction carries none of the wallet's scriptPubKeys, so
+        // watch the proTxHash of each masternode the wallet controls directly.
+        for pro_tx_hash in &self.watched_pro_tx_hashes {
+            elements.push(dashcore::consensus::encode::serialize(pro_tx_hash));
+        }
         elements
+    }
+
+    fn set_watched_pro_tx_hashes(&mut self, hashes: BTreeSet<ProTxHash>) {
+        self.watched_pro_tx_hashes = hashes;
     }
 
     fn utxos(&self) -> BTreeSet<&Utxo> {
@@ -523,6 +548,7 @@ impl WalletInfoInterface for ManagedWalletInfo {
 mod tests {
     use super::*;
     use crate::test_utils::TestWalletContext;
+    use dashcore::hashes::Hash;
 
     /// A wallet that owns a UTXO must surface that UTXO's outpoint as a bare
     /// filter element, consensus-serialized to the 36-byte form Dash Core
@@ -541,5 +567,50 @@ mod tests {
             elements.contains(&serialized),
             "monitored_filter_elements must carry the watched UTXO's serialized outpoint"
         );
+    }
+
+    /// A wallet watching a masternode it controls must surface that
+    /// masternode's `proTxHash` as a bare 32-byte filter element, serialized
+    /// the way Dash Core inserts a `ProUp*`'s `proTxHash` (raw internal order),
+    /// so a compact-filter scan catches the masternode-update transaction even
+    /// though it carries none of the wallet's scriptPubKeys.
+    #[test]
+    fn test_watched_pro_tx_hash_is_filter_element() {
+        let mut wallet = ManagedWalletInfo::dummy(1);
+        let pro_tx_hash = ProTxHash::from_byte_array([7u8; 32]);
+        let serialized = dashcore::consensus::encode::serialize(&pro_tx_hash);
+        assert_eq!(serialized.len(), 32, "proTxHash serializes to 32 raw bytes");
+
+        wallet.set_watched_pro_tx_hashes(BTreeSet::from([pro_tx_hash]));
+
+        let elements = wallet.monitored_filter_elements();
+        assert!(
+            elements.contains(&serialized),
+            "monitored_filter_elements must carry the watched proTxHash as a 32-byte element"
+        );
+    }
+
+    /// A wallet built with the default account set owns provider voting and
+    /// operator accounts, so the accessors used by the masternode-list
+    /// cross-reference must surface those keys.
+    #[test]
+    fn test_provider_key_accessors_expose_wallet_keys() {
+        let ctx = TestWalletContext::new_random();
+
+        let voting = ctx.managed_wallet.provider_voting_key_hashes();
+        assert!(
+            !voting.is_empty(),
+            "a wallet with a provider-voting account exposes its voting key hashes"
+        );
+
+        // The operator (BLS) account only exists under the `bls` feature.
+        #[cfg(feature = "bls")]
+        {
+            let operator = ctx.managed_wallet.provider_operator_public_keys();
+            assert!(
+                !operator.is_empty(),
+                "a wallet with a provider-operator account exposes its BLS operator keys"
+            );
+        }
     }
 }
