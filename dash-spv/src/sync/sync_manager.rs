@@ -117,12 +117,21 @@ pub trait SyncManager: Send + Sync + std::fmt::Debug {
     /// Called when the network manager loses its peers.
     fn stop_sync(&mut self) {
         self.set_state(SyncState::WaitingForConnections);
-        self.clear_in_flight_state();
+        self.on_disconnect();
     }
 
-    /// Clear all in-flight requests, pipelines, and retry state.
-    /// Called on disconnect when pending network requests become invalid.
-    fn clear_in_flight_state(&mut self);
+    /// Drop peer-bound in-flight state on disconnect.
+    ///
+    /// Each manager keeps as much progress as it can across a disconnect, and
+    /// only invalidates state that was tied to the now-dead peer. Anything
+    /// derivable from durable storage (block headers, filter headers, the
+    /// masternode engine) or from preserved per-batch bookkeeping should
+    /// survive so reconnect resumes instead of restarting.
+    ///
+    /// `BlocksManager` and `FiltersManager` go further and requeue their
+    /// in-flight network slots so the next `send_pending` reissues them
+    /// immediately to the new peer.
+    fn on_disconnect(&mut self);
 
     /// Handle an incoming network message.
     ///
@@ -232,7 +241,7 @@ pub trait SyncManager: Send + Sync + std::fmt::Debug {
                         Ok(events) => {
                             if !events.is_empty() {
                                 for event in &events {
-                                    tracing::debug!("{} emitting: {}", identifier, event.description());
+                                    tracing::debug!("{} emitting: {}", identifier, event);
                                 }
                                 context.emit_sync_events(events);
                             }
@@ -252,13 +261,13 @@ pub trait SyncManager: Send + Sync + std::fmt::Debug {
                 result = sync_event_receiver.recv() => {
                     match result {
                         Ok(event) => {
-                            tracing::trace!("{} received event: {}", identifier, event.description());
+                            tracing::trace!("{} received event: {}", identifier, event);
                             let progress_before = self.progress();
                             match self.handle_sync_event(&event, &context.requests).await {
                                 Ok(events) => {
                                     if !events.is_empty() {
                                         for e in &events {
-                                            tracing::trace!("{} emitting: {}", identifier, e.description());
+                                            tracing::trace!("{} emitting: {}", identifier, e);
                                         }
                                         context.emit_sync_events(events);
                                     }
@@ -279,13 +288,13 @@ pub trait SyncManager: Send + Sync + std::fmt::Debug {
                 result = context.network_event_receiver.recv() => {
                     match result {
                         Ok(event) => {
-                            tracing::debug!("{} received network event: {}", identifier, event.description());
+                            tracing::debug!("{} received network event: {}", identifier, event);
                             let progress_before = self.progress();
                             match self.handle_network_event(&event, &context.requests).await {
                                 Ok(events) => {
                                     if !events.is_empty() {
                                         for e in &events {
-                                            tracing::debug!("{} emitting: {}", identifier, e.description());
+                                            tracing::debug!("{} emitting: {}", identifier, e);
                                         }
                                         context.emit_sync_events(events);
                                     }
@@ -369,7 +378,7 @@ mod tests {
             &[]
         }
 
-        fn clear_in_flight_state(&mut self) {}
+        fn on_disconnect(&mut self) {}
 
         async fn handle_message(
             &mut self,

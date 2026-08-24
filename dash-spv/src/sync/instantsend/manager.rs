@@ -284,12 +284,14 @@ impl std::fmt::Debug for InstantSendManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, RequestSender};
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress, SyncState};
     use dashcore::bls_sig_utils::BLSSignature;
     use dashcore::hash_types::CycleHash;
     use dashcore::hashes::Hash;
+    use dashcore::BlockHash;
     use dashcore::OutPoint;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn create_test_instantlock(txid: Txid) -> InstantLock {
         InstantLock {
@@ -314,6 +316,26 @@ mod tests {
         assert_eq!(manager.identifier(), ManagerIdentifier::InstantSend);
         assert_eq!(manager.state(), SyncState::WaitForEvents);
         assert_eq!(manager.wanted_message_types(), vec![MessageType::ISLock, MessageType::Inv]);
+    }
+
+    /// Buffered `MasternodeStateUpdated` events delivered during
+    /// `WaitingForConnections` must not run validation or transition state.
+    /// `pending_instantlocks` is cleared on disconnect and
+    /// `MasternodesManager` re-emits the event after reconnect.
+    #[tokio::test]
+    async fn test_handle_sync_event_drops_masternode_state_updated_in_waiting_for_connections() {
+        let mut manager = create_test_manager();
+        manager.set_state(SyncState::WaitingForConnections);
+
+        let event = SyncEvent::MasternodeStateUpdated {
+            height: 100,
+            qr_info_result: None,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let events = manager.handle_sync_event(&event, &RequestSender::new(tx)).await.unwrap();
+
+        assert!(events.is_empty());
+        assert_eq!(manager.state(), SyncState::WaitingForConnections);
     }
 
     #[tokio::test]
@@ -414,6 +436,33 @@ mod tests {
         // Unknown txid
         let unknown = Txid::from_byte_array([2u8; 32]);
         assert!(manager.get_instantlock(&unknown).is_none());
+    }
+
+    /// `ChainReorg` drops any pending instantlocks. They were validated
+    /// against the pre-reorg quorum view, so retrying them would either
+    /// succeed under the wrong cycle or fail spuriously. The network re-emits
+    /// IS locks after the reorg settles, and the existing retry path on
+    /// `MasternodeStateUpdated` picks those up.
+    #[tokio::test]
+    async fn test_chain_reorg_drops_pending_instantlocks() {
+        let mut manager = create_test_manager();
+
+        let txid = Txid::from_byte_array([1u8; 32]);
+        let _ = manager.process_instantlock(&create_test_instantlock(txid)).await.unwrap();
+        assert_eq!(manager.pending_count(), 1);
+
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::all_zeros(),
+            new_tip: BlockHash::all_zeros(),
+            generation: 1,
+        };
+        let (tx, _rx) = unbounded_channel();
+        let events =
+            manager.handle_sync_event(&event, &RequestSender::new(tx)).await.expect("handle");
+
+        assert!(events.is_empty());
+        assert_eq!(manager.pending_count(), 0, "ChainReorg must clear pending_instantlocks");
     }
 
     #[tokio::test]

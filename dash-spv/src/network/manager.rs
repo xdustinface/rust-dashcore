@@ -23,8 +23,8 @@ use crate::network::reputation::{
     misbehavior_scores, positive_scores, DisconnectReason, PeerReputationManager, ReputationAware,
 };
 use crate::network::{
-    HandshakeManager, Message, MessageDispatcher, MessageType, NetworkEvent, NetworkManager,
-    NetworkRequest, Peer, RequestSender,
+    HandshakeManager, Message, MessageDispatcher, MessageType, MisbehaviorKind, NetworkEvent,
+    NetworkManager, NetworkRequest, Peer, RequestSender,
 };
 use crate::storage::{PeerStorage, PersistentPeerStorage, PersistentStorage};
 use async_trait::async_trait;
@@ -900,6 +900,18 @@ impl PeerNetworkManager {
                                     }
                                 });
                             }
+                            Some(NetworkRequest::ReportMisbehavior(peer, kind)) => {
+                                let (score, reason) = match kind {
+                                    MisbehaviorKind::InvalidChainLockSignature => (
+                                        misbehavior_scores::INVALID_CHAINLOCK,
+                                        "invalid ChainLock signature",
+                                    ),
+                                };
+                                let reputation_manager = this.reputation_manager.clone();
+                                tokio::spawn(async move {
+                                    reputation_manager.update_reputation(peer, score, reason).await;
+                                });
+                            }
                             Some(NetworkRequest::BroadcastMessage(msg)) => {
                                 tracing::debug!("Request processor: broadcasting {}", msg.cmd());
                                 let this = this.clone();
@@ -1119,7 +1131,7 @@ impl PeerNetworkManager {
                     event = network_events.recv() => {
                         match event {
                             Ok(event) => {
-                                tracing::debug!("Network event in maintenance loop: {}", event.description());
+                                tracing::debug!("Network event in maintenance loop: {}", event);
                                 dns_interval.reset();
                                 this.maintenance_tick().await;
                             }

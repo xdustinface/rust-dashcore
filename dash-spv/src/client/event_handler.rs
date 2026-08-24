@@ -4,15 +4,17 @@
 //! consumers override to receive push-based event notifications. The monitoring
 //! infrastructure subscribes to internal channels and dispatches to the handler.
 
+use std::fmt::Display;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::network::NetworkEvent;
 use crate::sync::{SyncEvent, SyncProgress};
-use key_wallet_manager::WalletEvent;
+use dashcore::ephemerealdata::chain_lock::ChainLock;
+use key_wallet_manager::{WalletEvent, WalletInterface};
 
 /// Trait for receiving SPV client events.
 ///
@@ -36,6 +38,12 @@ impl EventHandler for () {}
 
 /// Spawns a task that monitors a broadcast channel and dispatches events to the handler.
 ///
+/// Every received event is mirrored into `tracing::info!` as `"<name>: <event>"`
+/// before consumer handlers run, so installing a tracing subscriber is enough to
+/// get event log output. To silence event logs without affecting other
+/// subscribers, set a per-target filter such as
+/// `dash_spv::client::event_handler=warn`.
+///
 /// On failure, the error message is sent via `on_failure` so the coordinator can report
 /// it as the single source of error handling.
 pub(crate) fn spawn_broadcast_monitor<E, F>(
@@ -47,7 +55,7 @@ pub(crate) fn spawn_broadcast_monitor<E, F>(
     dispatch_fn: F,
 ) -> JoinHandle<()>
 where
-    E: Clone + Send + 'static,
+    E: Clone + Display + Send + 'static,
     F: Fn(&dyn EventHandler, &E) + Send + 'static,
 {
     tokio::spawn(async move {
@@ -57,6 +65,7 @@ where
                 result = receiver.recv() => {
                     match result {
                         Ok(event) => {
+                            tracing::info!("{}: {}", name, event);
                             for handler in handlers.iter() {
                                 dispatch_fn(handler.as_ref(), &event);
                             }
@@ -86,7 +95,9 @@ where
 
 /// Spawns a task that monitors a watch channel for progress updates.
 ///
-/// Sends the initial progress value, then monitors for changes.
+/// Sends the initial progress value, then monitors for changes. Every value is
+/// mirrored into `tracing::info!` before consumer handlers run, matching
+/// `spawn_broadcast_monitor`'s behavior.
 pub(crate) fn spawn_progress_monitor(
     mut receiver: watch::Receiver<SyncProgress>,
     handlers: Arc<Vec<Arc<dyn EventHandler>>>,
@@ -96,8 +107,13 @@ pub(crate) fn spawn_progress_monitor(
     tokio::spawn(async move {
         tracing::debug!("Progress monitoring task started");
 
-        for handler in handlers.iter() {
-            handler.on_progress(&receiver.borrow_and_update());
+        {
+            let guard = receiver.borrow_and_update();
+            let progress: &SyncProgress = &guard;
+            tracing::info!("SyncProgress: {}", progress);
+            for handler in handlers.iter() {
+                handler.on_progress(progress);
+            }
         }
 
         loop {
@@ -105,8 +121,11 @@ pub(crate) fn spawn_progress_monitor(
                 result = receiver.changed() => {
                     match result {
                         Ok(()) => {
+                            let guard = receiver.borrow_and_update();
+                            let progress: &SyncProgress = &guard;
+                            tracing::info!("SyncProgress: {}", progress);
                             for handler in handlers.iter() {
-                                handler.on_progress(&receiver.borrow_and_update());
+                                handler.on_progress(progress);
                             }
                         }
                         Err(_) if shutdown.is_cancelled() => break,
@@ -122,6 +141,79 @@ pub(crate) fn spawn_progress_monitor(
             }
         }
         tracing::debug!("Progress monitoring task exiting");
+    })
+}
+
+/// Spawns a task that drives chainlock-driven wallet promotion.
+///
+/// Subscribes to [`SyncEvent::ChainLockReceived`] and
+/// [`SyncEvent::SyncComplete`], serializing all `apply_chain_lock`
+/// calls on a single task. During the initial sync cycle (cycle 0)
+/// chainlock arrivals are buffered as the latest-seen height rather
+/// than applied. At `SyncComplete { cycle: 0 }` the buffered height
+/// is applied once, then every subsequent validated chainlock is
+/// applied directly. Only validated chainlocks advance the wallet.
+///
+/// This is the single-writer point that the architecture relies on:
+/// promotions never interleave with each other.
+pub(crate) fn spawn_chainlock_wallet_dispatch<W>(
+    mut sync_event_rx: broadcast::Receiver<SyncEvent>,
+    wallet: Arc<RwLock<W>>,
+    shutdown: CancellationToken,
+    on_failure: mpsc::Sender<String>,
+) -> JoinHandle<()>
+where
+    W: WalletInterface + 'static,
+{
+    const NAME: &str = "ChainLock→wallet dispatch";
+    tokio::spawn(async move {
+        tracing::debug!("{} task started", NAME);
+        let mut initial_sync_complete = false;
+        let mut deferred_chain_lock: Option<ChainLock> = None;
+        loop {
+            tokio::select! {
+                result = sync_event_rx.recv() => {
+                    match result {
+                        Ok(SyncEvent::ChainLockReceived { chain_lock, validated }) => {
+                            if !validated {
+                                continue;
+                            }
+                            if initial_sync_complete {
+                                wallet.write().await.apply_chain_lock(chain_lock);
+                            } else if deferred_chain_lock
+                                .as_ref()
+                                .is_none_or(|buffered| chain_lock.block_height > buffered.block_height)
+                            {
+                                deferred_chain_lock = Some(chain_lock);
+                            }
+                        }
+                        Ok(SyncEvent::SyncComplete { cycle: 0, .. }) => {
+                            initial_sync_complete = true;
+                            if let Some(chain_lock) = deferred_chain_lock.take() {
+                                wallet.write().await.apply_chain_lock(chain_lock);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Closed) if shutdown.is_cancelled() => break,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            let msg = format!("{} channel closed unexpectedly", NAME);
+                            tracing::error!("{}", msg);
+                            let _ = on_failure.try_send(msg);
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) if shutdown.is_cancelled() => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            let msg = format!("{} lagged, missed {} events", NAME, n);
+                            tracing::error!("{}", msg);
+                            let _ = on_failure.try_send(msg);
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown.cancelled() => break,
+            }
+        }
+        tracing::debug!("{} task exiting", NAME);
     })
 }
 

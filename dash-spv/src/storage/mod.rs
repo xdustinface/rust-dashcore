@@ -4,6 +4,7 @@ pub mod types;
 
 mod block_headers;
 mod blocks;
+mod consistency;
 mod filter_headers;
 mod filters;
 mod io;
@@ -135,6 +136,18 @@ impl DiskStorageManager {
 
             _lock_file: lock_file,
         };
+
+        // Runs before `start_worker` so the first persist tick cannot
+        // race the sentinel-driven recovery and pin a stale tip to disk.
+        consistency::check_and_repair_consistency(
+            &storage.storage_path,
+            &storage.block_headers,
+            &storage.filter_headers,
+            &storage.filters,
+            &storage.blocks,
+            &storage.metadata,
+        )
+        .await?;
 
         storage.start_worker().await;
 
@@ -319,6 +332,10 @@ impl BlockHeaderStorage for DiskStorageManager {
     ) -> StorageResult<Option<u32>> {
         self.block_headers.read().await.get_header_height_by_hash(hash).await
     }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.block_headers.write().await.truncate_above(target_height).await
+    }
 }
 
 #[async_trait]
@@ -346,6 +363,10 @@ impl FilterHeaderStorage for DiskStorageManager {
     async fn get_filter_start_height(&self) -> Option<u32> {
         self.filter_headers.read().await.get_filter_start_height().await
     }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.filter_headers.write().await.truncate_above(target_height).await
+    }
 }
 
 #[async_trait]
@@ -361,6 +382,14 @@ impl filters::FilterStorage for DiskStorageManager {
     async fn filter_tip_height(&self) -> StorageResult<u32> {
         self.filters.read().await.filter_tip_height().await
     }
+
+    async fn clear_all(&mut self) -> StorageResult<()> {
+        self.filters.write().await.clear_all().await
+    }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.filters.write().await.truncate_above(target_height).await
+    }
 }
 
 #[async_trait]
@@ -371,6 +400,10 @@ impl BlockStorage for DiskStorageManager {
 
     async fn load_block(&self, height: u32) -> StorageResult<Option<HashedBlock>> {
         self.blocks.read().await.load_block(height).await
+    }
+
+    async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+        self.blocks.write().await.truncate_above(target_height).await
     }
 }
 
@@ -384,12 +417,30 @@ impl metadata::MetadataStorage for DiskStorageManager {
         self.metadata.read().await.load_metadata(key).await
     }
 
+    async fn delete_metadata(&mut self, key: &str) -> StorageResult<()> {
+        self.metadata.write().await.delete_metadata(key).await
+    }
+
     async fn store_last_target_height(&mut self, height: CoreBlockHeight) -> StorageResult<()> {
         self.metadata.write().await.store_last_target_height(height).await
     }
 
     async fn load_last_target_height(&self) -> StorageResult<CoreBlockHeight> {
         self.metadata.read().await.load_last_target_height().await
+    }
+
+    async fn write_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.write_reorg_sentinel().await
+    }
+
+    async fn clear_reorg_sentinel(&mut self) -> StorageResult<()> {
+        self.metadata.write().await.clear_reorg_sentinel().await
+    }
+
+    async fn is_reorg_sentinel_set(&self) -> bool {
+        tokio::fs::try_exists(PersistentMetadataStorage::sentinel_path_for(&self.storage_path))
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -566,6 +617,27 @@ mod tests {
 
         // Verify index is cleared
         assert!(storage.get_header_height_by_hash(&hash).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disk_storage_manager_truncate_above_block_headers() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = ClientConfig::regtest().with_storage_path(temp_dir.path());
+        let mut mgr = DiskStorageManager::new(&config).await.unwrap();
+
+        let headers = BlockHeader::dummy_batch(0..10);
+        mgr.store_headers(&headers).await.unwrap();
+
+        let orphaned_hash = headers[7].block_hash();
+        assert_eq!(mgr.get_header_height_by_hash(&orphaned_hash).await.unwrap(), Some(7));
+
+        <DiskStorageManager as BlockHeaderStorage>::truncate_above(&mut mgr, 5).await.unwrap();
+
+        assert_eq!(mgr.get_tip_height().await, Some(5));
+        assert_eq!(mgr.get_header_height_by_hash(&orphaned_hash).await.unwrap(), None);
+
+        let kept_hash = headers[3].block_hash();
+        assert_eq!(mgr.get_header_height_by_hash(&kept_hash).await.unwrap(), Some(3));
     }
 
     #[tokio::test]

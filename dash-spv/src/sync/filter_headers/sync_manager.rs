@@ -31,7 +31,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
         &[MessageType::CFHeaders]
     }
 
-    fn clear_in_flight_state(&mut self) {
+    fn on_disconnect(&mut self) {
         self.pipeline = FilterHeadersPipeline::default();
         self.checkpoint_start_height = None;
         self.block_headers_synced = false;
@@ -51,6 +51,19 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
             }
             return Ok(vec![]);
         };
+
+        let current_gen = self.current_generation();
+        if let Some(req_gen) = self.pipeline.generation_for_stop_hash(&cfheaders.stop_hash) {
+            if req_gen != current_gen {
+                tracing::debug!(
+                    "dropping stale CFHeaders stop_hash {}: generation {} != {}",
+                    cfheaders.stop_hash,
+                    req_gen,
+                    current_gen
+                );
+                return Ok(vec![]);
+            }
+        }
 
         let mut events = Vec::new();
 
@@ -115,7 +128,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
         }
 
         // Send more requests
-        self.pipeline.send_pending(requests)?;
+        self.pipeline.send_pending_with_generation(requests, self.current_generation())?;
 
         if self.pipeline.is_complete() {
             if let Some(event) = self.try_complete_sync() {
@@ -141,6 +154,20 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
             SyncEvent::BlockHeadersStored {
                 tip_height,
             } => self.handle_new_headers(*tip_height, requests).await,
+            SyncEvent::ChainReorg {
+                fork_height,
+                ..
+            } => {
+                tracing::info!(
+                    "FilterHeadersManager: cascading ChainReorg, resetting pipeline at {}",
+                    fork_height
+                );
+                self.pipeline = FilterHeadersPipeline::default();
+                self.checkpoint_start_height = None;
+                self.progress.update_current_height(*fork_height);
+                self.set_state(SyncState::WaitForEvents);
+                Ok(vec![])
+            }
             _ => Ok(vec![]),
         }
     }
@@ -150,7 +177,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> SyncManager for FilterHeade
         self.pipeline.handle_timeouts();
 
         // Send pending requests (including retries)
-        self.pipeline.send_pending(requests)?;
+        self.pipeline.send_pending_with_generation(requests, self.current_generation())?;
 
         Ok(vec![])
     }

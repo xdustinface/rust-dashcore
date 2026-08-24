@@ -3,6 +3,7 @@
 //! Downloads compact block filter headers (BIP 157/158). Reacts to BlockHeadersStored
 //! events to know when new headers are available. Emits FilterHeadersStored events.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashcore::network::message_filter::CFHeaders;
@@ -40,6 +41,9 @@ pub struct FilterHeadersManager<H: BlockHeaderStorage, FH: FilterHeaderStorage> 
     /// Whether block header sync has completed. Gates FilterHeadersSyncComplete emission
     /// to ensure it never fires before BlockHeaderSyncComplete.
     pub(super) block_headers_synced: bool,
+    /// Shared generation counter used to invalidate stale `CFHeaders`
+    /// responses delivered after a reorg cascade.
+    pub(super) reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> FilterHeadersManager<H, FH> {
@@ -69,6 +73,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> FilterHeadersManager<H, FH>
     pub async fn new(
         header_storage: Arc<RwLock<H>>,
         filter_header_storage: Arc<RwLock<FH>>,
+        reorg_generation: Arc<AtomicU64>,
     ) -> SyncResult<Self> {
         // Load current filter tip
         let filter_tip =
@@ -90,7 +95,13 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> FilterHeadersManager<H, FH>
             pipeline: FilterHeadersPipeline::default(),
             checkpoint_start_height: None,
             block_headers_synced: false,
+            reorg_generation,
         })
+    }
+
+    /// Current reorg generation counter snapshot.
+    pub(super) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
     }
 
     /// Process a CFHeaders response - store headers and update state.
@@ -179,7 +190,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> FilterHeadersManager<H, FH>
         drop(header_storage);
 
         // Send initial requests
-        self.pipeline.send_pending(requests)?;
+        self.pipeline.send_pending_with_generation(requests, self.current_generation())?;
 
         self.set_state(SyncState::Syncing);
 
@@ -227,7 +238,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage> FilterHeadersManager<H, FH>
                         .await?;
                 }
                 drop(header_storage);
-                self.pipeline.send_pending(requests)?;
+                self.pipeline.send_pending_with_generation(requests, self.current_generation())?;
                 Ok(vec![])
             }
             SyncState::WaitingForConnections | SyncState::WaitForEvents => {
@@ -262,9 +273,13 @@ mod tests {
 
     async fn create_test_manager() -> TestFilterHeadersManager {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
-        FilterHeadersManager::new(storage.block_headers(), storage.filter_headers())
-            .await
-            .expect("Failed to create FilterHeadersManager")
+        FilterHeadersManager::new(
+            storage.block_headers(),
+            storage.filter_headers(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("Failed to create FilterHeadersManager")
     }
 
     fn create_test_request_sender(
@@ -380,14 +395,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clear_in_flight_state() {
+    async fn test_on_disconnect() {
         let mut manager = create_test_manager().await;
 
-        // Set all fields that clear_in_flight_state resets
+        // Set all fields that on_disconnect resets
         manager.block_headers_synced = true;
         manager.checkpoint_start_height = Some(500);
 
-        manager.clear_in_flight_state();
+        manager.on_disconnect();
 
         assert!(!manager.block_headers_synced);
         assert!(manager.checkpoint_start_height.is_none());

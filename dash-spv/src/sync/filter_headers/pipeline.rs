@@ -169,8 +169,13 @@ impl FilterHeadersPipeline {
         Ok(())
     }
 
-    /// Send pending requests using a RequestSender (synchronous).
-    pub(super) fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<usize> {
+    /// Send pending requests, tagging each in-flight slot with the current
+    /// reorg generation so stale `CFHeaders` responses can be dropped.
+    pub(super) fn send_pending_with_generation(
+        &mut self,
+        requests: &RequestSender,
+        generation: u64,
+    ) -> SyncResult<usize> {
         let count = self.coordinator.available_to_send();
         if count == 0 {
             return Ok(0);
@@ -189,20 +194,27 @@ impl FilterHeadersPipeline {
 
             requests.request_filter_headers(start_height, stop_hash)?;
 
-            self.coordinator.mark_sent(&[stop_hash]);
+            self.coordinator.mark_sent_with_generation(&[stop_hash], generation);
 
             tracing::debug!(
-                "Sent GetCFHeaders: start={}, stop={} ({} active, {} pending)",
+                "Sent GetCFHeaders: start={}, stop={} ({} active, {} pending, generation {})",
                 start_height,
                 stop_hash,
                 self.coordinator.active_count(),
-                self.coordinator.pending_count()
+                self.coordinator.pending_count(),
+                generation
             );
 
             sent += 1;
         }
 
         Ok(sent)
+    }
+
+    /// Look up the generation snapshot recorded when the batch ending at
+    /// `stop_hash` was sent.
+    pub(super) fn generation_for_stop_hash(&self, stop_hash: &BlockHash) -> Option<u64> {
+        self.coordinator.generation_for(stop_hash)
     }
 
     /// Try to match an incoming message to a pipeline response.
@@ -418,7 +430,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let requests = RequestSender::new(tx);
 
-        let err = pipeline.send_pending(&requests).unwrap_err();
+        let err = pipeline.send_pending_with_generation(&requests, 0).unwrap_err();
         assert!(matches!(err, SyncError::InvalidState(_)));
     }
 

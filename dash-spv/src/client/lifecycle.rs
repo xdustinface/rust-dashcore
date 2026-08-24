@@ -13,8 +13,9 @@ use crate::chain::checkpoints::{mainnet_checkpoints, testnet_checkpoints, Checkp
 use crate::error::{Result, SpvError};
 use crate::network::NetworkManager;
 use crate::storage::{
-    PersistentBlockHeaderStorage, PersistentBlockStorage, PersistentFilterHeaderStorage,
-    PersistentFilterStorage, PersistentMetadataStorage, StorageManager,
+    BlockHeaderStorage, PersistentBlockHeaderStorage, PersistentBlockStorage,
+    PersistentFilterHeaderStorage, PersistentFilterStorage, PersistentMetadataStorage,
+    StorageManager,
 };
 use crate::sync::{
     BlockHeadersManager, BlocksManager, ChainLockManager, FilterHeadersManager, FiltersManager,
@@ -24,8 +25,9 @@ use dashcore::network::constants::NetworkExt;
 use dashcore::sml::masternode_list_engine::MasternodeListEngine;
 use dashcore_hashes::Hash;
 use key_wallet_manager::WalletInterface;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 
 impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, N, S> {
     /// Create a new SPV client with the given configuration, network, storage, and wallet.
@@ -36,12 +38,24 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         wallet: Arc<RwLock<W>>,
         event_handlers: Vec<Arc<dyn EventHandler>>,
     ) -> Result<Self> {
+        tracing::info!("{}", crate::version_info());
+
         // Validate configuration
         config.validate().map_err(SpvError::Config)?;
 
         // Initialize genesis block or checkpoint before creating managers,
         // so they can read the tip from storage during construction.
         Self::initialize_genesis_block(&config, &mut storage).await?;
+
+        // Clamp wallet heights to the (possibly repaired) block-header tip so
+        // a mid-cascade crash recovery cannot leave wallet metadata pointing
+        // above a height the local header chain no longer contains.
+        // Bind the tip into a local so the block-header read guard is dropped
+        // before the wallet write lock is acquired.
+        let tip_after_repair = storage.block_headers().read().await.get_tip_height().await;
+        if let Some(tip) = tip_after_repair {
+            wallet.write().await.clamp_heights_to(tip).await;
+        }
 
         let masternode_engine = {
             if config.enable_masternodes {
@@ -68,19 +82,37 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             _ => Vec::new(),
         };
         let checkpoint_manager = Arc::new(CheckpointManager::new(checkpoints));
+        let reorg_generation = Arc::new(AtomicU64::new(0));
+        let chainlock_height = Arc::new(AtomicU32::new(0));
+        let (filter_header_storage_arg, filter_storage_arg, block_storage_arg) =
+            if config.enable_filters {
+                (Some(storage.filter_headers()), Some(storage.filters()), Some(storage.blocks()))
+            } else {
+                (None, None, None)
+            };
         managers.block_headers = Some(
             BlockHeadersManager::new(
                 storage.block_headers(),
                 storage.metadata(),
+                filter_header_storage_arg,
+                filter_storage_arg,
+                block_storage_arg,
                 checkpoint_manager,
+                config.network,
+                reorg_generation.clone(),
+                chainlock_height.clone(),
             )
             .await?,
         );
 
         if config.enable_filters {
             managers.filter_headers = Some(
-                FilterHeadersManager::new(storage.block_headers(), storage.filter_headers())
-                    .await?,
+                FilterHeadersManager::new(
+                    storage.block_headers(),
+                    storage.filter_headers(),
+                    reorg_generation.clone(),
+                )
+                .await?,
             );
             managers.filters = Some(
                 FiltersManager::new(
@@ -88,11 +120,18 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                     storage.block_headers(),
                     storage.filter_headers(),
                     storage.filters(),
+                    reorg_generation.clone(),
                 )
                 .await,
             );
             managers.blocks = Some(
-                BlocksManager::new(wallet.clone(), storage.block_headers(), storage.blocks()).await,
+                BlocksManager::new(
+                    wallet.clone(),
+                    storage.block_headers(),
+                    storage.blocks(),
+                    reorg_generation.clone(),
+                )
+                .await,
             );
         }
 
@@ -114,6 +153,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                     storage.block_headers(),
                     storage.metadata(),
                     masternode_list_engine.clone(),
+                    chainlock_height.clone(),
                 )
                 .await,
             );
@@ -123,14 +163,22 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // Build mempool manager if tracking is enabled
         if config.enable_mempool_tracking {
             let initial_revision = wallet.read().await.monitor_revision();
-            managers.mempool = Some(MempoolManager::new(
+            let wallet_event_rx = wallet.read().await.subscribe_events();
+            let mut mempool = MempoolManager::new(
                 wallet.clone(),
                 config.mempool_strategy,
                 config.max_mempool_transactions,
                 initial_revision,
-            ));
+                chainlock_height.clone(),
+            );
+            mempool.set_wallet_event_subscription(wallet_event_rx);
+            managers.mempool = Some(mempool);
         }
 
+        // `reorg_generation` is held by each manager (via clones threaded in
+        // above); the coordinator itself never reads it directly, so we
+        // don't need to keep an additional handle past this point.
+        drop(reorg_generation);
         let sync_coordinator = SyncCoordinator::new(managers).await;
 
         // Wrap storage in Arc<Mutex>
@@ -143,7 +191,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             wallet,
             masternode_engine,
             sync_coordinator: Arc::new(Mutex::new(sync_coordinator)),
-            running: Arc::new(RwLock::new(false)),
+            running: Arc::new(watch::Sender::new(false)),
             event_handlers: Arc::new(event_handlers),
         };
 
@@ -161,11 +209,8 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
 
     /// Start the SPV client: spawn sync tasks and connect to the network.
     pub(super) async fn start(&self) -> Result<()> {
-        {
-            let running = self.running.read().await;
-            if *running {
-                return Err(SpvError::Config("Client already running".to_string()));
-            }
+        if self.is_running() {
+            return Err(SpvError::Config("Client already running".to_string()));
         }
 
         // Start all sync tasks before connecting to the network to make sure initial connection
@@ -180,11 +225,10 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // Connect to network
         self.network.lock().await.connect().await?;
 
-        // Only mark as running after all startup operations succeed
-        {
-            let mut running = self.running.write().await;
-            *running = true;
-        }
+        // Only mark as running after all startup operations succeed.
+        // `send_replace` always stores the value regardless of receiver count,
+        // so this is correct even when `run()` has not subscribed yet.
+        self.running.send_replace(true);
 
         Ok(())
     }
@@ -192,12 +236,15 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     /// Stop the SPV client.
     pub async fn stop(&self) -> Result<()> {
         // Check if already stopped
-        {
-            let running = self.running.read().await;
-            if !*running {
-                return Ok(());
-            }
+        if !*self.running.borrow() {
+            return Ok(());
         }
+
+        // Flip the running state before tearing anything down so a concurrent
+        // `run()` loop wakes immediately and breaks out before it can lock the
+        // sync coordinator again. This prevents a tick from racing against the
+        // shutdown below.
+        self.running.send_replace(false);
 
         // Shut down sync coordinator: signals cancellation and waits for manager
         // tasks to drain before we tear down the network and storage layers.
@@ -214,10 +261,6 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             storage.shutdown().await;
             tracing::info!("Storage shutdown completed - all data persisted");
         }
-
-        // Mark as stopped
-        let mut running = self.running.write().await;
-        *running = false;
 
         Ok(())
     }

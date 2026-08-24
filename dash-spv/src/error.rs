@@ -80,6 +80,9 @@ pub enum StorageError {
     #[error("Read failed: {0}")]
     ReadFailed(String),
 
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
@@ -137,6 +140,9 @@ pub enum SyncError {
     /// Storage-related errors (e.g., database failures)
     #[error("Storage error: {0}")]
     Storage(String),
+
+    #[error("Fork chain break: {0}")]
+    ForkChainBreak(String),
 
     /// Masternode sync failed (QRInfo or MnListDiff processing error)
     #[error("Masternode sync failed: {0}")]
