@@ -25,7 +25,7 @@ impl SyncManager for InstantSendManager {
         &[MessageType::ISLock, MessageType::Inv]
     }
 
-    fn clear_in_flight_state(&mut self) {
+    fn on_disconnect(&mut self) {
         self.pending_instantlocks.clear();
     }
 
@@ -62,6 +62,28 @@ impl SyncManager for InstantSendManager {
         event: &SyncEvent,
         _requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                "InstantSendManager: cascading ChainReorg, dropping pending instantlocks"
+            );
+            self.pending_instantlocks.clear();
+            self.progress.update_pending(0);
+            return Ok(vec![]);
+        }
+
+        // Drop buffered events that arrive between `stop_sync` and the next
+        // `start_sync`. `pending_instantlocks` is cleared on disconnect, and
+        // `MasternodesManager` re-emits `MasternodeStateUpdated` once it
+        // completes a sync cycle after reconnect.
+        if self.state() == SyncState::WaitingForConnections {
+            return Ok(vec![]);
+        }
+
         // Validate pending InstantLocks when masternode state is updated
         if let SyncEvent::MasternodeStateUpdated {
             ..

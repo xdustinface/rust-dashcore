@@ -421,12 +421,55 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
     /// Dispatch pipeline completion based on the current `PipelineMode`. Called when
     /// the mnlistdiff pipeline drains, from either the message handler or the tick
     /// handler's timeout-cleanup path.
-    pub(super) async fn complete_pipeline(&mut self) -> SyncResult<Vec<SyncEvent>> {
+    ///
+    /// After an `Incremental` pipeline finishes, re-evaluate `next_pipeline_mode` at
+    /// the now-advanced tip and fire a catch-up QRInfo if the cycle gate now picks
+    /// `QuorumValidation`. Without this, a batch of headers that lands while an
+    /// earlier `Incremental` is in flight can silently skip the cycle's mining
+    /// window: every intermediate `BlockHeadersStored` event is rejected by the
+    /// `has_pending_requests` guard, and the tick handler's
+    /// `current_height < block_header_tip_height` check is false once the
+    /// `Incremental` catches up to the latest tip, so the catch-up branch in
+    /// `next_pipeline_mode` never gets a chance to fire.
+    ///
+    /// The re-evaluation calls `next_pipeline_mode` here, which may advance
+    /// per-cycle bookkeeping (`current_cycle_height`, `last_window_qrinfo_tip`,
+    /// `rotation_cycles`) if the tip crossed a cycle boundary while the
+    /// `Incremental` was in flight. That matches what the per-event handler
+    /// would have done had the intermediate events not been dropped.
+    pub(super) async fn complete_pipeline(
+        &mut self,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
         match std::mem::take(&mut self.sync_state.pipeline_mode) {
             PipelineMode::QuorumValidation {
                 qr_info_result,
             } => self.verify_and_complete(qr_info_result).await,
-            PipelineMode::Incremental => self.complete_incremental_pipeline().await,
+            PipelineMode::Incremental => {
+                let mut events = self.complete_incremental_pipeline().await?;
+                if self.state() == SyncState::Synced && self.sync_state.qrinfo_in_flight.is_none() {
+                    let tip = self.progress.block_header_tip_height();
+                    if matches!(self.next_pipeline_mode(tip), PipelineMode::QuorumValidation { .. })
+                    {
+                        tracing::debug!(
+                            tip,
+                            "Incremental complete, cycle gate now picks QRInfo, firing catch-up"
+                        );
+                        self.sync_state.qrinfo_retry_count = 0;
+                        self.sync_state.clear_pending();
+                        match self.send_qrinfo_for_tip(requests).await {
+                            Ok(extra) => events.extend(extra),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Catch-up QRInfo dispatch failed; \
+                                 `current_cycle_attempts` stays 0 so the next \
+                                 `BlockHeadersStored` will re-fire if the gate still picks QRInfo"
+                            ),
+                        }
+                    }
+                }
+                Ok(events)
+            }
         }
     }
 
@@ -485,11 +528,6 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
             return Ok(vec![]);
         }
 
-        // Only transition to Syncing if not already Synced (incremental updates stay Synced)
-        if self.state() != SyncState::Synced {
-            self.set_state(SyncState::Syncing);
-        }
-
         let base_hashes = {
             let engine = self.engine.read().await;
             match compute_qrinfo_anchor_hash(&engine, self.network, tip_height) {
@@ -503,13 +541,68 @@ impl<H: BlockHeaderStorage> MasternodesManager<H> {
             tip_height,
             base_hashes.len()
         );
+        // Send before mutating state. If the request errors (e.g. no peers
+        // connected during a reconnect race), the `?` propagates and we leave
+        // `WaitingForConnections` intact instead of stranding the manager in
+        // `Syncing` with `qrinfo_in_flight = None`, which `tick` cannot recover.
         requests.request_qr_info(base_hashes, tip_block_hash, true)?;
         self.progress.add_qr_infos_requested(1);
         self.sync_state.record_qrinfo_attempt(tip_height);
-
         self.sync_state.start_waiting_for_qrinfo(tip_block_hash);
 
+        // Only transition to Syncing if not already Synced (incremental updates stay Synced)
+        if self.state() != SyncState::Synced {
+            self.set_state(SyncState::Syncing);
+        }
+
         Ok(vec![])
+    }
+
+    /// Rewind masternode state to `fork_height` after a chain reorg, then fire
+    /// a fresh `QRInfo` for the new tip so the engine catches up. The truncation
+    /// is the engine-side cleanup that complements the storage cascade run by
+    /// `BlockHeadersManager`. After this returns, the manager is in `Syncing`
+    /// with an in-flight QRInfo, and `MasternodeStateUpdated` will fire later
+    /// through the normal QRInfo response path.
+    pub(super) async fn rewind_to_height(
+        &mut self,
+        fork_height: u32,
+        new_tip: BlockHash,
+        requests: &RequestSender,
+    ) -> SyncResult<Vec<SyncEvent>> {
+        let engine_tip_height = {
+            let mut engine = self.engine.write().await;
+            engine.truncate_above(fork_height);
+            let tip_entry = engine.masternode_lists.iter().next_back();
+            self.sync_state.last_synced_block_hash = tip_entry.map(|(_, list)| list.block_hash);
+            tip_entry.map(|(h, _)| *h).unwrap_or(0)
+        };
+
+        self.sync_state.known_mn_list_heights.retain(|h| *h <= fork_height);
+        self.sync_state.validated_cycle_heights.retain(|h| *h <= fork_height);
+        self.sync_state.current_cycle_height = None;
+        self.sync_state.current_cycle_attempts = 0;
+        self.sync_state.last_window_qrinfo_tip = None;
+        self.sync_state.last_processed_qrinfo_tip = None;
+        self.sync_state.clear_pending();
+        self.sync_state.qrinfo_retry_count = 0;
+
+        self.progress.update_current_height(engine_tip_height);
+
+        self.set_state(SyncState::Syncing);
+
+        tracing::info!(
+            fork_height,
+            new_tip = %new_tip,
+            engine_tip_height,
+            "MasternodesManager: rewinding for reorg, dispatching QRInfo for new tip"
+        );
+
+        let result = self.send_qrinfo_for_tip(requests).await;
+        if result.is_err() {
+            self.set_state(SyncState::WaitForEvents);
+        }
+        result
     }
 
     /// Verify quorums and mark complete.
@@ -572,12 +665,15 @@ impl<H: BlockHeaderStorage> std::fmt::Debug for MasternodesManager<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::MessageType;
+    use crate::network::{MessageType, NetworkRequest};
     use crate::storage::{DiskStorageManager, PersistentBlockHeaderStorage, StorageManager};
     use crate::sync::sync_manager::SyncManager;
     use crate::sync::{ManagerIdentifier, SyncManagerProgress};
+    use dashcore::block::Header;
     use dashcore::hashes::Hash;
+    use dashcore::network::message::NetworkMessage;
     use dashcore::sml::masternode_list::MasternodeList;
+    use tokio::sync::mpsc;
 
     type TestMasternodesManager = MasternodesManager<PersistentBlockHeaderStorage>;
 
@@ -589,6 +685,35 @@ mod tests {
 
     async fn create_test_manager() -> TestMasternodesManager {
         create_test_manager_for(dashcore::Network::Testnet).await
+    }
+
+    /// Build a regtest manager whose engine has a single list at `tip` and
+    /// whose block header storage is populated with dummy headers up to
+    /// `tip`, in `Synced` state with `pipeline_mode = Incremental` and
+    /// `block_header_tip_height = tip`. Storage must be populated so that
+    /// `send_qrinfo_for_tip` finds a tip and reaches the network dispatch;
+    /// otherwise it short-circuits at `storage.get_tip()` and the catch-up
+    /// path can't be observed at the network layer. Returns the manager, a
+    /// `RequestSender`, and the matching receiver so the caller binds it
+    /// (the channel closes when the receiver drops).
+    async fn make_synced_incremental_manager(
+        tip: u32,
+    ) -> (TestMasternodesManager, RequestSender, mpsc::UnboundedReceiver<NetworkRequest>) {
+        let storage = DiskStorageManager::with_temp_dir().await.unwrap();
+        let block_headers = storage.block_headers();
+        block_headers.write().await.store_headers(&Header::dummy_batch(0..tip + 1)).await.unwrap();
+        let engine = engine_with_lists(&[(tip, 1)]);
+        let mut manager = MasternodesManager::new(
+            block_headers,
+            Arc::new(RwLock::new(engine)),
+            dashcore::Network::Regtest,
+        )
+        .await;
+        manager.set_state(SyncState::Synced);
+        manager.sync_state.pipeline_mode = PipelineMode::Incremental;
+        manager.progress.update_block_header_tip_height(tip);
+        let (tx, rx) = mpsc::unbounded_channel();
+        (manager, RequestSender::new(tx), rx)
     }
 
     #[tokio::test]
@@ -837,5 +962,239 @@ mod tests {
         let manager = create_test_manager_for(dashcore::Network::Testnet).await;
         assert_eq!(manager.sync_state.last_synced_block_hash, None);
         assert_eq!(manager.progress.current_height(), 0);
+    }
+
+    /// `complete_pipeline` after `Incremental` re-evaluates the cycle gate at
+    /// the latest tip and fires a catch-up QRInfo when the gate picks
+    /// `QuorumValidation`. When a batch of headers lands while a prior
+    /// `Incremental` is in flight, every intermediate `BlockHeadersStored`
+    /// event is rejected by the `has_pending_requests` guard, and the tick
+    /// handler can't re-fire because `current_height == block_header_tip_height`
+    /// once the `Incremental` catches up. For DKG_TEST_DIP0024 (regtest),
+    /// cycle 48 has mining window 60..=68; at tip 70 with no prior attempts,
+    /// the gate picks catch-up QRInfo. The post-completion call to
+    /// `next_pipeline_mode` is the first to enter cycle 48 and bumps
+    /// `rotation_cycles` from 0 to 1.
+    #[tokio::test]
+    async fn test_complete_incremental_fires_catch_up_when_window_missed() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(70).await;
+
+        manager.complete_pipeline(&requests).await.expect("complete_pipeline succeeds");
+
+        assert_eq!(
+            manager.sync_state.current_cycle_height,
+            Some(48),
+            "post-completion re-eval must call `next_pipeline_mode` and enter cycle 48"
+        );
+        assert_eq!(
+            manager.progress.rotation_cycles(),
+            1,
+            "entering cycle 48 once via the catch-up branch bumps `rotation_cycles`"
+        );
+        assert_eq!(
+            manager.progress.qr_infos_requested(),
+            1,
+            "the catch-up branch must reach `send_qrinfo_for_tip` and bump `qr_infos_requested`"
+        );
+        assert!(
+            manager.sync_state.qrinfo_in_flight.is_some(),
+            "the catch-up branch must mark a QRInfo as in flight"
+        );
+        let queued = rx.try_recv().expect("a NetworkRequest must be queued by the catch-up");
+        assert!(
+            matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))),
+            "the queued request must be a `GetQRInfo`, got {:?}",
+            queued
+        );
+    }
+
+    /// `send_qrinfo_for_tip` must not strand the manager in `Syncing` when
+    /// the network send fails. A buffered `BlockHeaderSyncComplete` consumed
+    /// during `WaitingForConnections` reaches `send_qrinfo_for_tip` while no
+    /// peers are connected. If state transitions before the failing send,
+    /// `tick` cannot recover because it gates on `qrinfo_in_flight.is_some()`.
+    #[tokio::test]
+    async fn test_send_qrinfo_for_tip_preserves_state_when_send_fails() {
+        let (mut manager, requests, rx) = make_synced_incremental_manager(70).await;
+        manager.set_state(SyncState::WaitingForConnections);
+        drop(rx);
+
+        let err = manager
+            .send_qrinfo_for_tip(&requests)
+            .await
+            .expect_err("send must fail when the receiver is dropped");
+        assert!(matches!(err, SyncError::Network(_)), "expected Network error, got {:?}", err);
+
+        assert_eq!(manager.state(), SyncState::WaitingForConnections);
+        assert!(manager.sync_state.qrinfo_in_flight.is_none());
+        assert_eq!(manager.progress.qr_infos_requested(), 0);
+    }
+
+    /// When the cycle gate picks `Incremental` after an `Incremental`
+    /// completes (e.g. the tip is still before the mining window), the
+    /// catch-up branch must be a no-op. Cycle 48 mining window is 60..=68
+    /// for DKG_TEST_DIP0024; tip 50 is before the window so the gate falls
+    /// through to `Incremental` and no QRInfo fires.
+    #[tokio::test]
+    async fn test_complete_incremental_does_not_fire_when_gate_picks_incremental() {
+        let (mut manager, requests, _rx) = make_synced_incremental_manager(50).await;
+
+        manager.complete_pipeline(&requests).await.expect("complete_pipeline succeeds");
+
+        assert!(
+            manager.sync_state.qrinfo_in_flight.is_none(),
+            "no QRInfo must fire when the gate picks Incremental"
+        );
+        assert_eq!(
+            manager.progress.qr_infos_requested(),
+            0,
+            "no QRInfo must be requested when the gate picks Incremental"
+        );
+    }
+
+    /// `rewind_to_height` must truncate engine state above the fork height,
+    /// prune the sync-state height sets, refresh `last_synced_block_hash` from
+    /// the engine's new tip, and fire a fresh `QRInfo` request via
+    /// `send_qrinfo_for_tip`. The catch-up dispatch is the entire reason the
+    /// rewind exists, so a successful call must surface as a queued
+    /// `GetQRInfo` and an in-flight marker.
+    #[tokio::test]
+    async fn test_rewind_to_height_truncates_engine_and_dispatches_qrinfo() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(60);
+        manager.sync_state.known_mn_list_heights.insert(96);
+        manager.sync_state.known_mn_list_heights.insert(120);
+        manager.sync_state.validated_cycle_heights.insert(48);
+        manager.sync_state.validated_cycle_heights.insert(96);
+        manager.sync_state.last_processed_qrinfo_tip = Some(BlockHash::from_byte_array([0xAA; 32]));
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(60, MasternodeList::empty(anchor_hash(60), 60));
+            engine.masternode_lists.insert(96, MasternodeList::empty(anchor_hash(96), 96));
+        }
+
+        let fork_height = 80;
+        let new_tip = BlockHash::from_byte_array([0xBB; 32]);
+        manager
+            .rewind_to_height(fork_height, new_tip, &requests)
+            .await
+            .expect("rewind_to_height must succeed");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(engine.masternode_lists.contains_key(&60));
+            assert!(!engine.masternode_lists.contains_key(&96));
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+
+        assert_eq!(
+            manager.sync_state.known_mn_list_heights.iter().copied().collect::<Vec<_>>(),
+            vec![60]
+        );
+        assert_eq!(
+            manager.sync_state.validated_cycle_heights.iter().copied().collect::<Vec<_>>(),
+            vec![48]
+        );
+        assert_eq!(manager.sync_state.last_synced_block_hash, Some(anchor_hash(60)));
+        assert!(manager.sync_state.last_processed_qrinfo_tip.is_none());
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        assert_eq!(manager.progress.qr_infos_requested(), 1);
+        assert_eq!(manager.state(), SyncState::Syncing);
+        let queued = rx.try_recv().expect("rewind_to_height must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// When every masternode list is above the fork height, truncation empties
+    /// the engine. `last_synced_block_hash` must become `None` and progress
+    /// must report height 0.
+    #[tokio::test]
+    async fn test_rewind_to_height_empty_engine_after_truncation() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.extend([100, 120]);
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(100, MasternodeList::empty(anchor_hash(100), 100));
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+
+        manager
+            .rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests)
+            .await
+            .expect("rewind_to_height must succeed");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(engine.masternode_lists.is_empty());
+        }
+        assert_eq!(manager.sync_state.last_synced_block_hash, None);
+        assert_eq!(manager.progress.current_height(), 0);
+        assert!(manager.sync_state.known_mn_list_heights.is_empty());
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        let queued = rx
+            .try_recv()
+            .expect("rewind_to_height must queue a GetQRInfo even when engine is empty");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// A `SyncEvent::ChainReorg` delivered to `handle_sync_event` must invoke
+    /// the rewind path. Engine state above the fork is gone, the manager
+    /// transitions to `Syncing`, and a fresh QRInfo is queued for the new tip.
+    #[tokio::test]
+    async fn test_handle_sync_event_chain_reorg_invokes_rewind() {
+        let (mut manager, requests, mut rx) = make_synced_incremental_manager(120).await;
+        manager.sync_state.known_mn_list_heights.insert(120);
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+
+        let event = SyncEvent::ChainReorg {
+            fork_height: 80,
+            old_tip: BlockHash::from_byte_array([0xAA; 32]),
+            new_tip: BlockHash::from_byte_array([0xBB; 32]),
+            generation: 1,
+        };
+        manager.handle_sync_event(&event, &requests).await.expect("handle_sync_event succeeds");
+
+        {
+            let engine = manager.engine.read().await;
+            assert!(!engine.masternode_lists.contains_key(&120));
+        }
+        assert_eq!(manager.state(), SyncState::Syncing);
+        assert!(manager.sync_state.qrinfo_in_flight.is_some());
+        let queued = rx.try_recv().expect("ChainReorg must queue a GetQRInfo");
+        assert!(matches!(queued, NetworkRequest::SendMessage(NetworkMessage::GetQRInfo(_))));
+    }
+
+    /// When `send_qrinfo_for_tip` fails inside `rewind_to_height` (e.g. the
+    /// channel receiver is dropped), the manager must transition to
+    /// `WaitForEvents` rather than staying in `Syncing`, and must leave no
+    /// in-flight marker so the next `BlockHeaderSyncComplete` can retry.
+    #[tokio::test]
+    async fn test_rewind_to_height_sets_wait_for_events_on_send_failure() {
+        let (mut manager, requests, rx) = make_synced_incremental_manager(120).await;
+        {
+            let mut engine = manager.engine.write().await;
+            engine.masternode_lists.insert(30, MasternodeList::empty(anchor_hash(30), 30));
+            engine.masternode_lists.insert(120, MasternodeList::empty(anchor_hash(120), 120));
+        }
+        drop(rx);
+
+        let result =
+            manager.rewind_to_height(50, BlockHash::from_byte_array([0xBB; 32]), &requests).await;
+        assert!(result.is_err(), "expected error when the channel is closed");
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
+        assert!(manager.sync_state.qrinfo_in_flight.is_none());
+        {
+            let engine = manager.engine.read().await;
+            assert!(
+                engine.masternode_lists.contains_key(&30),
+                "entry below fork_height=50 must survive truncation even when send fails"
+            );
+            assert!(
+                !engine.masternode_lists.contains_key(&120),
+                "entry above fork_height=50 must be dropped even when send fails"
+            );
+        }
     }
 }

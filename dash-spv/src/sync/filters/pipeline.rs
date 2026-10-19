@@ -128,11 +128,14 @@ impl FiltersPipeline {
         }
     }
 
-    /// Send pending filter requests up to the concurrency limit.
+    /// Send pending filter requests up to the concurrency limit, tagging each
+    /// in-flight slot with the current reorg generation so stale responses
+    /// can be dropped.
     pub(super) async fn send_pending(
         &mut self,
         requests: &RequestSender,
         storage: &impl BlockHeaderStorage,
+        generation: u64,
     ) -> SyncResult<usize> {
         let count = self.coordinator.available_to_send();
         if count == 0 {
@@ -153,30 +156,55 @@ impl FiltersPipeline {
                 }
             };
 
-            // Get stop hash for this batch
-            let stop_hash = storage
-                .get_header(batch_end)
-                .await?
-                .ok_or_else(|| {
-                    SyncError::Storage(format!("Missing header at height {}", batch_end))
-                })?
-                .block_hash();
+            // Get stop hash for this batch. If the header isn't available yet,
+            // re-queue for the next tick instead of losing the batch permanently.
+            let header = match storage.get_header(batch_end).await {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    tracing::debug!(
+                        "Header at height {} not yet available, re-queuing filter batch {}",
+                        batch_end,
+                        start_height
+                    );
+                    self.coordinator.enqueue([start_height]);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Error reading header at height {}, re-queuing filter batch {}: {}",
+                        batch_end,
+                        start_height,
+                        e
+                    );
+                    self.coordinator.enqueue([start_height]);
+                    continue;
+                }
+            };
 
-            requests.request_filters(start_height, stop_hash)?;
+            requests.request_filters(start_height, header.block_hash())?;
 
-            self.coordinator.mark_sent(&[start_height]);
+            self.coordinator.mark_sent_with_generation(&[start_height], generation);
 
             tracing::debug!(
-                "Sent GetCFilters: {} to {} ({} active batches)",
+                "Sent GetCFilters: {} to {} ({} active batches, generation {})",
                 start_height,
                 batch_end,
-                self.coordinator.active_count()
+                self.coordinator.active_count(),
+                generation
             );
 
             sent += 1;
         }
 
         Ok(sent)
+    }
+
+    /// Look up the generation snapshot recorded when the batch containing
+    /// `height` was sent. Returns `None` when no in-flight batch covers the
+    /// height (e.g. the response is unsolicited).
+    pub(super) fn generation_for_height(&self, height: u32) -> Option<u64> {
+        let batch_start = self.find_batch_for_height(height)?;
+        self.coordinator.generation_for(&batch_start)
     }
 
     /// Handle a received CFilter message with filter data.
@@ -219,7 +247,9 @@ impl FiltersPipeline {
             self.batch_trackers.get_mut(&batch_start).map(|t| t.take_filters()).unwrap_or_default();
 
         self.batch_trackers.remove(&batch_start);
-        self.coordinator.receive(&batch_start);
+        if !self.coordinator.receive(&batch_start) {
+            self.coordinator.cancel_pending(&batch_start);
+        }
 
         tracing::info!(
             "Filter batch {}-{} complete ({} filters)",
@@ -250,6 +280,15 @@ impl FiltersPipeline {
         for start in self.coordinator.check_timeouts() {
             self.coordinator.enqueue_retry(start);
         }
+    }
+
+    /// Move in-flight `getcfilters` requests back to pending after a peer
+    /// disconnect so the next `send_pending` reissues them to the new peer.
+    /// Per-batch trackers and any partially-received filters within them are
+    /// preserved — `BatchTracker::insert_filter` is idempotent, so duplicates
+    /// from the new peer are harmless.
+    pub(super) fn requeue_in_flight(&mut self) {
+        self.coordinator.requeue_in_flight();
     }
 }
 
@@ -411,7 +450,7 @@ mod tests {
         pipeline.extend_target(5000);
 
         let (sender, _rx) = create_test_request_sender();
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         let mut ranges: Vec<(u32, u32)> = pipeline
             .batch_trackers
@@ -453,6 +492,67 @@ mod tests {
     // =========================================================================
     // Receive Tests
     // =========================================================================
+
+    #[test]
+    fn test_requeue_in_flight_preserves_partial_batch_receipts() {
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.target_height = 99;
+
+        // One batch in-flight (start_height 0). Receive a filter so the
+        // tracker has partial state.
+        pipeline.batch_trackers.insert(0, BatchTracker::new(99));
+        pipeline.coordinator.mark_sent(&[0]);
+        let hash = Header::dummy(50).block_hash();
+        pipeline.receive_with_data(50, hash, &dummy_filter_data(50));
+        assert_eq!(pipeline.filters_received, 1);
+        assert_eq!(pipeline.coordinator.active_count(), 1);
+
+        pipeline.requeue_in_flight();
+
+        // Batch is back in pending; tracker (and the partial filter inside it)
+        // is preserved so the new peer's response merges idempotently.
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
+        let tracker = pipeline.batch_trackers.get(&0).expect("tracker preserved");
+        assert_eq!(tracker.received(), 1);
+        assert_eq!(pipeline.filters_received, 1);
+        assert_eq!(pipeline.highest_received, 50);
+    }
+
+    #[test]
+    fn test_late_filter_after_requeue_completes_batch_without_orphaning_pending() {
+        // Regression: a late `cfilter` from the disconnected peer can complete
+        // a batch after `requeue_in_flight` moved it back to pending. Without
+        // the cancel-pending hook, the key would linger in `pending` while the
+        // tracker was gone, and the next `send_pending` would error with
+        // `SyncError::InvalidState`.
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.target_height = 2;
+
+        pipeline.batch_trackers.insert(0, BatchTracker::new(2));
+        pipeline.coordinator.mark_sent(&[0]);
+
+        // Two filters arrive before disconnect.
+        for h in 0..=1 {
+            let hash = Header::dummy(h).block_hash();
+            pipeline.receive_with_data(h, hash, &dummy_filter_data(h));
+        }
+
+        pipeline.requeue_in_flight();
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+
+        // Late buffered filter from old peer completes the batch.
+        let hash = Header::dummy(2).block_hash();
+        pipeline.receive_with_data(2, hash, &dummy_filter_data(2));
+
+        assert_eq!(pipeline.completed_batches.len(), 1);
+        assert!(pipeline.batch_trackers.is_empty());
+        // The orphaned pending key must be gone so `send_pending` does not
+        // resurrect a finished batch.
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
+        assert_eq!(pipeline.coordinator.active_count(), 0);
+    }
 
     #[test]
     fn test_receive_single_filter() {
@@ -748,7 +848,7 @@ mod tests {
 
         let (sender, mut rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(pipeline.coordinator.active_count(), 1);
@@ -782,7 +882,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         // 25 batches needed, but only 20 can be in-flight at once
         assert_eq!(count, MAX_CONCURRENT_FILTER_BATCHES);
@@ -804,7 +904,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(count, 2);
 
@@ -829,7 +929,7 @@ mod tests {
 
         let (sender, _rx) = create_test_request_sender();
 
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         // Should send all 3 batches: 0-999, 1000-1999, 2000-2500
         assert_eq!(count, 3);
@@ -850,11 +950,11 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // First send exhausts the queue
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(count, 1);
 
         // Second send has nothing to do
-        let count = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let count = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -875,7 +975,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Send request
-        let sent = pipeline.send_pending(&sender, &storage).await.unwrap();
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(sent, 1);
         assert_eq!(pipeline.coordinator.active_count(), 1);
 
@@ -910,7 +1010,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Send initial request
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 1);
         assert_eq!(pipeline.coordinator.pending_count(), 0);
 
@@ -926,7 +1026,7 @@ mod tests {
         assert!(pipeline.batch_trackers.contains_key(&0));
 
         // Can retry by sending again
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 1);
 
         // Existing tracker is reused (not replaced)
@@ -974,7 +1074,7 @@ mod tests {
         let (sender, _rx) = create_test_request_sender();
 
         // Only 2 batches sent, batch 2000 stays queued
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
         assert_eq!(pipeline.coordinator.active_count(), 2);
         assert_eq!(pipeline.coordinator.pending_count(), 1);
 
@@ -986,12 +1086,80 @@ mod tests {
             let hash = headers[h as usize].block_hash();
             pipeline.receive_with_data(h, hash, &dummy_filter_data(h));
         }
-        pipeline.send_pending(&sender, &storage).await.unwrap();
+        pipeline.send_pending(&sender, &storage, 0).await.unwrap();
 
         assert_eq!(
             pipeline.batch_trackers.get(&2000).unwrap().end_height(),
             2500,
             "deferred batch should use its original end height"
         );
+    }
+
+    /// `send_pending` with a generation tag records the snapshot on the
+    /// coordinator and `generation_for_height` returns it back exactly,
+    /// while a later generation bump means the same height now reports a
+    /// "different" generation so the manager-side check drops the response.
+    #[tokio::test]
+    async fn test_generation_tagging_round_trips_through_pipeline() {
+        let headers = Header::dummy_batch(0..1000);
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        storage.store_headers(&headers).await.unwrap();
+
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.init(0, 999);
+
+        let (sender, _rx) = create_test_request_sender();
+        let sent = pipeline.send_pending(&sender, &storage, 7).await.unwrap();
+        assert_eq!(sent, 1);
+
+        // The pipeline now stamps the in-flight batch with generation 7;
+        // every height covered by the batch returns the same snapshot.
+        assert_eq!(pipeline.generation_for_height(0), Some(7));
+        assert_eq!(pipeline.generation_for_height(500), Some(7));
+        assert_eq!(pipeline.generation_for_height(999), Some(7));
+
+        // A height outside any in-flight batch returns None so unsolicited
+        // responses are never accidentally dropped as "stale".
+        assert_eq!(pipeline.generation_for_height(2000), None);
+    }
+
+    #[tokio::test]
+    async fn test_send_pending_requeues_on_missing_header() {
+        // Headers 0..999 exist, but NOT 1999 (stop hash for batch 1000-1999).
+        let headers = Header::dummy_batch(0..1000);
+        let tmp_dir = TempDir::new().unwrap();
+        let mut storage = PersistentBlockHeaderStorage::open(tmp_dir.path()).await.unwrap();
+        storage.store_headers(&headers).await.unwrap();
+
+        let mut pipeline = FiltersPipeline::new();
+        pipeline.init(0, 1999);
+        assert_eq!(pipeline.coordinator.pending_count(), 2);
+
+        let (sender, mut rx) = create_test_request_sender();
+
+        // Batch 0 succeeds (header 999 exists), batch 1000 re-queued (header 1999 missing)
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(pipeline.coordinator.active_count(), 1);
+        assert_eq!(pipeline.coordinator.pending_count(), 1);
+
+        let request = rx.try_recv().unwrap();
+        match request {
+            NetworkRequest::SendMessage(NetworkMessage::GetCFilters(gcf)) => {
+                assert_eq!(gcf.start_height, 0);
+            }
+            other => panic!("Expected GetCFilters, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "should not have sent second request");
+
+        // Store the missing headers and retry
+        let more_headers = Header::dummy_batch(1000..2000);
+        storage.store_headers(&more_headers).await.unwrap();
+
+        let sent = pipeline.send_pending(&sender, &storage, 0).await.unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(pipeline.coordinator.active_count(), 2);
+        assert_eq!(pipeline.coordinator.pending_count(), 0);
     }
 }

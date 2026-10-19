@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     error::StorageResult,
@@ -11,15 +11,35 @@ use dashcore::prelude::CoreBlockHeight;
 /// Metadata key for persisting the best known peer height.
 const LAST_TARGET_HEIGHT_KEY: &str = "last_target_height";
 
+/// Filename of the reorg-in-progress sentinel inside the metadata folder.
+pub(crate) const REORG_SENTINEL_FILE: &str = "reorg_in_progress.dat";
+
 #[async_trait]
 pub trait MetadataStorage: Send + Sync + 'static {
     async fn store_metadata(&mut self, key: &str, value: &[u8]) -> StorageResult<()>;
 
     async fn load_metadata(&self, key: &str) -> StorageResult<Option<Vec<u8>>>;
+
+    /// Remove a stored metadata entry. A no-op when the key has not been
+    /// persisted.
+    async fn delete_metadata(&mut self, key: &str) -> StorageResult<()>;
+
     /// Persist the last target height to metadata storage.
     async fn store_last_target_height(&mut self, height: CoreBlockHeight) -> StorageResult<()>;
     /// Load the last target height from metadata storage.
     async fn load_last_target_height(&self) -> StorageResult<CoreBlockHeight>;
+
+    /// Create the reorg-in-progress sentinel marker on disk. Written
+    /// immediately before the truncation cascade so a crash mid-cascade is
+    /// detectable on the next startup.
+    async fn write_reorg_sentinel(&mut self) -> StorageResult<()>;
+
+    /// Remove the reorg-in-progress sentinel marker. Called after the
+    /// cascade's last truncation completes successfully.
+    async fn clear_reorg_sentinel(&mut self) -> StorageResult<()>;
+
+    /// `true` when the reorg-in-progress sentinel marker is present on disk.
+    async fn is_reorg_sentinel_set(&self) -> bool;
 }
 
 pub struct PersistentMetadataStorage {
@@ -27,7 +47,19 @@ pub struct PersistentMetadataStorage {
 }
 
 impl PersistentMetadataStorage {
-    const FOLDER_NAME: &str = "metadata";
+    pub(crate) const FOLDER_NAME: &str = "metadata";
+
+    pub(crate) fn sentinel_path_for(storage_path: &Path) -> PathBuf {
+        storage_path.join(Self::FOLDER_NAME).join(REORG_SENTINEL_FILE)
+    }
+
+    fn metadata_folder(&self) -> PathBuf {
+        self.storage_path.join(Self::FOLDER_NAME)
+    }
+
+    fn reorg_sentinel_path(&self) -> PathBuf {
+        Self::sentinel_path_for(&self.storage_path)
+    }
 }
 
 #[async_trait]
@@ -47,7 +79,7 @@ impl PersistentStorage for PersistentMetadataStorage {
 #[async_trait]
 impl MetadataStorage for PersistentMetadataStorage {
     async fn store_metadata(&mut self, key: &str, value: &[u8]) -> StorageResult<()> {
-        let metadata_folder = self.storage_path.join(Self::FOLDER_NAME);
+        let metadata_folder = self.metadata_folder();
         let path = metadata_folder.join(format!("{key}.dat"));
 
         tokio::fs::create_dir_all(metadata_folder).await?;
@@ -58,7 +90,7 @@ impl MetadataStorage for PersistentMetadataStorage {
     }
 
     async fn load_metadata(&self, key: &str) -> StorageResult<Option<Vec<u8>>> {
-        let path = self.storage_path.join(Self::FOLDER_NAME).join(format!("{key}.dat"));
+        let path = self.metadata_folder().join(format!("{key}.dat"));
 
         if !path.exists() {
             return Ok(None);
@@ -66,6 +98,15 @@ impl MetadataStorage for PersistentMetadataStorage {
 
         let data = tokio::fs::read(path).await?;
         Ok(Some(data))
+    }
+
+    async fn delete_metadata(&mut self, key: &str) -> StorageResult<()> {
+        let path = self.metadata_folder().join(format!("{key}.dat"));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::Io(e)),
+        }
     }
 
     /// Persist the last target height to metadata storage.
@@ -106,5 +147,23 @@ impl MetadataStorage for PersistentMetadataStorage {
                 Err(StorageError::Corruption(error))
             }
         }
+    }
+
+    async fn write_reorg_sentinel(&mut self) -> StorageResult<()> {
+        tokio::fs::create_dir_all(self.metadata_folder()).await?;
+        atomic_write(&self.reorg_sentinel_path(), &[]).await
+    }
+
+    async fn clear_reorg_sentinel(&mut self) -> StorageResult<()> {
+        let path = self.reorg_sentinel_path();
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
+    async fn is_reorg_sentinel_set(&self) -> bool {
+        tokio::fs::try_exists(self.reorg_sentinel_path()).await.unwrap_or(false)
     }
 }

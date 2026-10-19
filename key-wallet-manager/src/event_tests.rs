@@ -1,22 +1,25 @@
 use super::test_helpers::*;
 use super::*;
-use crate::wallet_interface::WalletInterface;
+use crate::wallet_interface::{RewindError, WalletInterface};
 use dashcore::block::{Block, Header, Version};
 use dashcore::blockdata::script::Builder;
 use dashcore::blockdata::transaction::special_transaction::asset_lock::AssetLockPayload;
 use dashcore::blockdata::transaction::special_transaction::TransactionPayload;
 use dashcore::bls_sig_utils::BLSSignature;
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::hash_types::CycleHash;
 use dashcore::hashes::Hash;
 use dashcore::opcodes;
 use dashcore::{
-    BlockHash, CompactTarget, OutPoint, ScriptBuf, TxIn, TxMerkleNode, TxOut, Txid, Witness,
+    BlockHash, CompactTarget, OutPoint, PublicKey, ScriptBuf, TxIn, TxMerkleNode, TxOut, Txid,
+    Witness,
 };
 use key_wallet::account::StandardAccountType;
-use key_wallet::managed_account::address_pool::AddressPoolType;
+use key_wallet::managed_account::address_pool::{AddressPoolType, PublicKeyType};
 use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
 use key_wallet::managed_account::managed_account_type::ManagedAccountType;
+use key_wallet::wallet::managed_wallet_info::transaction_building::AccountTypePreference;
 use key_wallet::AccountType;
 use std::collections::BTreeSet;
 
@@ -344,6 +347,7 @@ async fn test_block_with_new_tx_emits_inserted_record() {
             balance,
             account_balances,
             addresses_derived: _,
+            chain_lock: _,
         } => {
             assert_eq!(*wid, wallet_id);
             assert_eq!(*height, 100);
@@ -409,6 +413,7 @@ async fn test_block_confirming_known_mempool_tx_emits_updated_record() {
             balance,
             account_balances,
             addresses_derived: _,
+            chain_lock: _,
         } => {
             assert_eq!(*wid, wallet_id);
             assert_eq!(*height, 200);
@@ -816,17 +821,13 @@ async fn test_mempool_tx_to_highest_external_carries_addresses_derived() {
             derived.derivation_index
         );
         let stored_pubkey = match stored.public_key.as_ref().expect("ECDSA pool stores pubkey") {
-            key_wallet::managed_account::address_pool::PublicKeyType::ECDSA(b) => b,
+            PublicKeyType::ECDSA(b) => b,
             other => panic!("BIP44 external pool produced non-ECDSA key: {:?}", other),
         };
+        let expected = PublicKey::from_slice(stored_pubkey)
+            .expect("BIP44 external pool must store a valid compressed ECDSA key");
         assert_eq!(
-            stored_pubkey.len(),
-            33,
-            "BIP44 external pool must store 33-byte compressed keys"
-        );
-        assert_eq!(
-            &derived.public_key[..],
-            stored_pubkey.as_slice(),
+            derived.public_key, expected,
             "public key mismatch at index {}",
             derived.derivation_index
         );
@@ -1041,4 +1042,514 @@ async fn test_instant_send_lock_event_does_not_carry_addresses_derived_field() {
         }
         _ => unreachable!(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// ChainLock path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_apply_chain_lock_promotes_in_block_record_and_emits_event() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xa1);
+    let block = make_block(vec![tx.clone()], 0xa1, 1000);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 100, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    manager.apply_chain_lock(ChainLock::dummy(100));
+
+    let events = drain_events(&mut rx);
+    // First chainlock advances the wallet's metadata AND promotes a
+    // record, so a single atomic `ChainLockProcessed` fires carrying
+    // both the chainlock proof and the per-account promotions.
+    assert_eq!(events.len(), 1, "ChainLockProcessed expected, got {events:?}");
+    match &events[0] {
+        WalletEvent::ChainLockProcessed {
+            wallet_id: wid,
+            chain_lock,
+            locked_transactions,
+        } => {
+            assert_eq!(*wid, wallet_id);
+            assert_eq!(chain_lock.block_height, 100);
+            let receiving = AccountType::Standard {
+                index: 0,
+                standard_account_type: StandardAccountType::BIP44Account,
+            };
+            let txids = locked_transactions
+                .get(&receiving)
+                .expect("the receiving account should have a promotion entry");
+            assert_eq!(txids, &vec![tx.txid()]);
+        }
+        other => panic!("expected ChainLockProcessed, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_apply_chain_lock_with_no_records_emits_chain_lock_processed_and_advances_boundary() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let mut rx = manager.subscribe_events();
+    manager.apply_chain_lock(ChainLock::dummy(500));
+
+    // Even though no record was promoted, the wallet's
+    // `last_applied_chain_lock` advanced from `None` to `Some(500)` —
+    // durable consumers (e.g. asset-lock persisters) must observe a
+    // single `ChainLockProcessed` (with empty `locked_transactions`)
+    // to know the metadata moved.
+    let advance_events = drain_events(&mut rx);
+    assert_eq!(
+        advance_events.len(),
+        1,
+        "exactly one ChainLockProcessed expected, got {advance_events:?}"
+    );
+    match &advance_events[0] {
+        WalletEvent::ChainLockProcessed {
+            wallet_id: wid,
+            chain_lock,
+            locked_transactions,
+        } => {
+            assert_eq!(*wid, wallet_id);
+            assert_eq!(chain_lock.block_height, 500);
+            assert!(
+                locked_transactions.is_empty(),
+                "metadata advance without records must carry empty locked_transactions, got {locked_transactions:?}"
+            );
+        }
+        other => panic!("expected ChainLockProcessed, got {:?}", other),
+    }
+
+    // Subsequent block below the new finality boundary must be born chainlocked.
+    let addr = manager
+        .next_receive_address(&wallet_id, 0, AccountTypePreference::BIP44, true)
+        .expect("address generation");
+    let tx = create_tx_paying_to(&addr, 0xa2);
+    let block = make_block(vec![tx.clone()], 0xa2, 1100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 100, &wallets).await;
+
+    let events = drain_events(&mut rx);
+    let bp = events
+        .iter()
+        .find(|e| matches!(e, WalletEvent::BlockProcessed { .. }))
+        .expect("BlockProcessed expected after late block below finality boundary");
+    match bp {
+        WalletEvent::BlockProcessed {
+            chain_lock,
+            inserted,
+            ..
+        } => {
+            assert!(chain_lock.is_some(), "block below finality boundary must carry the chainlock");
+            assert!(
+                matches!(inserted[0].context, TransactionContext::InChainLockedBlock(_)),
+                "late-block path must record the tx as InChainLockedBlock, got {:?}",
+                inserted[0].context
+            );
+        }
+        _ => unreachable!(),
+    }
+    let chainlock_event_count =
+        events.iter().filter(|e| matches!(e, WalletEvent::ChainLockProcessed { .. })).count();
+    assert_eq!(
+        chainlock_event_count, 0,
+        "late-block path must not double-emit ChainLockProcessed for newly-born chainlocked txs"
+    );
+}
+
+#[tokio::test]
+async fn test_apply_chain_lock_is_idempotent_on_already_finalized() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xa3);
+    let block = make_block(vec![tx.clone()], 0xa3, 1200);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 50, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    manager.apply_chain_lock(ChainLock::dummy(50));
+    let first = drain_events(&mut rx);
+    let chainlock_events: Vec<_> = first
+        .iter()
+        .filter_map(|e| match e {
+            WalletEvent::ChainLockProcessed {
+                locked_transactions,
+                ..
+            } => Some(locked_transactions),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        chainlock_events.len(),
+        1,
+        "first chainlock must emit exactly one ChainLockProcessed, got {first:?}"
+    );
+    assert!(
+        !chainlock_events[0].is_empty(),
+        "first chainlock at height 50 must promote the InBlock record"
+    );
+
+    // Replaying the same chainlock must not re-emit anything: no
+    // promotions and no metadata advance.
+    manager.apply_chain_lock(ChainLock::dummy(50));
+    assert_no_events(&mut rx);
+
+    // A higher chainlock with no outstanding InBlock records below it
+    // still advances the metadata boundary, so emits exactly one
+    // `ChainLockProcessed` with empty `locked_transactions`.
+    manager.apply_chain_lock(ChainLock::dummy(80));
+    let advance = drain_events(&mut rx);
+    let advance_events: Vec<_> = advance
+        .iter()
+        .filter_map(|e| match e {
+            WalletEvent::ChainLockProcessed {
+                locked_transactions,
+                ..
+            } => Some(locked_transactions),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        advance_events.len(),
+        1,
+        "metadata advance from 50 -> 80 must emit exactly one ChainLockProcessed, got {advance:?}"
+    );
+    assert!(
+        advance_events[0].is_empty(),
+        "no records to promote => empty locked_transactions, got {:?}",
+        advance_events[0]
+    );
+}
+
+#[tokio::test]
+async fn test_block_processed_chainlocked_flag_matches_record_context() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+
+    // Below the finality boundary: chain_lock=Some, records InChainLockedBlock.
+    manager.apply_chain_lock(ChainLock::dummy(1000));
+    let tx_below = create_tx_paying_to(&addr, 0xa4);
+    let block_below = make_block(vec![tx_below.clone()], 0xa4, 1300);
+    let wallets = BTreeSet::from([wallet_id]);
+    let mut rx = manager.subscribe_events();
+    manager.process_block_for_wallets(&block_below, 500, &wallets).await;
+
+    let events_below = drain_events(&mut rx);
+    let bp_below = events_below
+        .iter()
+        .find(|e| matches!(e, WalletEvent::BlockProcessed { .. }))
+        .expect("BlockProcessed expected");
+    if let WalletEvent::BlockProcessed {
+        chain_lock,
+        inserted,
+        ..
+    } = bp_below
+    {
+        let cl = chain_lock.as_ref().expect("block below finality boundary must carry chainlock");
+        assert_eq!(cl.block_height, 1000);
+        assert!(matches!(inserted[0].context, TransactionContext::InChainLockedBlock(_)));
+    }
+
+    // Above the finality boundary: chain_lock=None, records InBlock.
+    let addr2 = manager
+        .next_receive_address(&wallet_id, 0, AccountTypePreference::BIP44, true)
+        .expect("address generation");
+    let tx_above = create_tx_paying_to(&addr2, 0xa5);
+    let block_above = make_block(vec![tx_above.clone()], 0xa5, 1400);
+    manager.process_block_for_wallets(&block_above, 2000, &wallets).await;
+
+    let events_above = drain_events(&mut rx);
+    let bp_above = events_above
+        .iter()
+        .find(|e| matches!(e, WalletEvent::BlockProcessed { .. }))
+        .expect("BlockProcessed expected");
+    if let WalletEvent::BlockProcessed {
+        chain_lock,
+        inserted,
+        ..
+    } = bp_above
+    {
+        assert!(chain_lock.is_none());
+        assert!(matches!(inserted[0].context, TransactionContext::InBlock(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reorg path
+// ---------------------------------------------------------------------------
+
+/// Build a transaction that spends a specific outpoint of a previous
+/// transaction (mimicking a child) paying back to one of the wallet's
+/// addresses.
+fn spend_from(parent_txid: Txid, parent_vout: u32, addr: &Address, value: u64) -> Transaction {
+    Transaction {
+        version: 2,
+        lock_time: 0,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent_txid,
+                vout: parent_vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value,
+            script_pubkey: addr.script_pubkey(),
+        }],
+        special_transaction_payload: None,
+    }
+}
+
+#[tokio::test]
+async fn test_rewind_demotes_single_above_cut_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xb0);
+    let block = make_block(vec![tx.clone()], 0xb0, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 11, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    let result = manager.rewind_to_height(10).await.expect("rewind below cut succeeds");
+    assert_eq!(result.demoted_txids, vec![tx.txid()]);
+    assert!(result.conflicted_txids.is_empty());
+
+    let events = drain_events(&mut rx);
+    let reorg = events
+        .iter()
+        .find_map(|e| match e {
+            WalletEvent::Reorg {
+                fork_height,
+                demoted_txids,
+                conflicted_txids,
+                balance,
+                ..
+            } => Some((*fork_height, demoted_txids.clone(), conflicted_txids.clone(), *balance)),
+            _ => None,
+        })
+        .expect("Reorg event must be emitted for a wallet whose state changed");
+    assert_eq!(reorg.0, 10);
+    assert_eq!(reorg.1, vec![tx.txid()]);
+    assert!(reorg.2.is_empty());
+    assert_eq!(reorg.3.confirmed(), 0, "demoted record must drop out of confirmed balance");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+}
+
+#[tokio::test]
+async fn test_rewind_cascades_to_descendant_in_same_account() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx_a = create_tx_paying_to(&addr, 0xc1);
+    let block_a = make_block(vec![tx_a.clone()], 0xc1, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block_a, 11, &wallets).await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    let block_b = make_block(vec![tx_b.clone()], 0xc2, 200);
+    manager.process_block_for_wallets(&block_b, 12, &wallets).await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    assert!(demoted.contains(&tx_a.txid()), "parent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "child spending parent must cascade");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 10);
+
+    // Rewind to Mempool leaves the child still spending the parent's
+    // output, so only the child's own output reaches the spendable
+    // set. Without `rebuild_utxos`'s order-independent spent-outpoint
+    // guard the child's output could be wrongly resurrected as still
+    // spent, or the parent's output wrongly resurrected as spendable,
+    // depending on txid sort order.
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 2,
+        "after rewind the child still spends the parent in mempool, only the child's output is a UTXO (got balance {balance:?})",
+    );
+}
+
+#[tokio::test]
+async fn test_rewind_cascades_three_levels() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+
+    let tx_a = create_tx_paying_to(&addr, 0xd0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xd0, 100), 11, &wallets)
+        .await;
+
+    let tx_b = spend_from(tx_a.txid(), 0, &addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xd1, 200), 12, &wallets)
+        .await;
+
+    let tx_c = spend_from(tx_b.txid(), 0, &addr, TX_AMOUNT / 4);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_c.clone()], 0xd2, 300), 13, &wallets)
+        .await;
+
+    let result = manager.rewind_to_height(10).await.expect("rewind succeeds");
+    let demoted: BTreeSet<Txid> = result.demoted_txids.iter().copied().collect();
+    // Wave 2 of the frontier cascade only fires if wave 1 propagated the
+    // newly-demoted parent into the next frontier. A regression that drops
+    // descendants beyond the first hop would still pass the two-level test
+    // above but fail here.
+    assert!(demoted.contains(&tx_a.txid()), "grandparent must be demoted");
+    assert!(demoted.contains(&tx_b.txid()), "parent must cascade (wave 1)");
+    assert!(demoted.contains(&tx_c.txid()), "child must cascade (wave 2)");
+
+    // Beyond the first cascade hop, `rebuild_utxos` must still produce a
+    // correct UTXO set: a regression that double-removes the intermediate
+    // tx_b's output, or that resurrects a spent ancestor, would inflate or
+    // deflate the balance without affecting the demotion list above.
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    let total = balance.confirmed() + balance.unconfirmed();
+    assert_eq!(
+        total,
+        TX_AMOUNT / 4,
+        "after 3-level cascade only tx_c's output remains spendable (got balance {balance:?})",
+    );
+}
+
+#[tokio::test]
+async fn test_rewind_restores_is_trusted_on_mempool_change() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let (_, _, change_addr) = pool_state(&manager, &wallet_id, AddressPoolType::Internal);
+
+    let tx_a = create_tx_paying_to(&addr, 0xe0);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_a.clone()], 0xe0, 100), 11, &wallets)
+        .await;
+
+    // tx_b spends the wallet's UTXO from tx_a and pays change back to our
+    // own internal pool: after rewind tx_b ends up in mempool, so the
+    // change output is a trusted-change UTXO that must be credited to
+    // `confirmed()`, not `unconfirmed()`.
+    let tx_b = spend_from(tx_a.txid(), 0, &change_addr, TX_AMOUNT / 2);
+    manager
+        .process_block_for_wallets(&make_block(vec![tx_b.clone()], 0xe1, 200), 12, &wallets)
+        .await;
+
+    manager.rewind_to_height(10).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let balance = info.balance();
+    assert_eq!(
+        balance.confirmed(),
+        TX_AMOUNT / 2,
+        "trusted mempool change must be credited to confirmed() after rebuild (got {balance:?})",
+    );
+    assert_eq!(balance.unconfirmed(), 0, "no untrusted mempool outputs remain");
+}
+
+#[tokio::test]
+async fn test_rewind_retains_instant_send_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xd3);
+
+    // First sighting is an IS-locked mempool tx.
+    let islock = dummy_instant_lock(tx.txid());
+    manager.process_mempool_transaction(&tx, Some(islock.clone())).await;
+
+    let _ = manager.rewind_to_height(0).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    let mut found = false;
+    for account in info.accounts().all_accounts() {
+        if let Some(record) = account.transactions().get(&tx.txid()) {
+            assert!(
+                matches!(record.context, TransactionContext::InstantSend(_)),
+                "IS-locked record must be retained as InstantSend after rewind, got {:?}",
+                record.context,
+            );
+            found = true;
+        }
+    }
+    assert!(found, "the IS-locked transaction record must still be present after rewind");
+}
+
+#[tokio::test]
+async fn test_rewind_refuses_below_chainlock_floor() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    manager.apply_chain_lock(ChainLock::dummy(50));
+
+    let err = manager
+        .rewind_to_height(49)
+        .await
+        .expect_err("rewind below chainlock floor must be rejected");
+    match err {
+        RewindError::BelowChainLockFloor {
+            requested,
+            floor,
+            wallet_id: rejecting,
+        } => {
+            assert_eq!(requested, 49);
+            assert_eq!(floor, 50);
+            assert_eq!(rejecting, wallet_id);
+        }
+    }
+
+    // Rewinding to the floor itself is allowed.
+    manager.rewind_to_height(50).await.expect("rewind at the floor is allowed");
+}
+
+#[tokio::test]
+async fn test_rewind_rolls_back_last_processed_and_synced_height() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xee, 100);
+    manager.process_block_for_wallets(&block, 500, &wallets).await;
+    manager.update_wallet_synced_height(&wallet_id, 500);
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 500);
+    assert_eq!(info.synced_height(), 500);
+
+    manager.rewind_to_height(250).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(info.last_processed_height(), 250);
+    assert_eq!(info.synced_height(), 250);
+}
+
+#[tokio::test]
+async fn test_rewind_below_current_does_not_advance_heights_upward() {
+    let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
+    let wallets = BTreeSet::from([wallet_id]);
+    let block = make_block(vec![], 0xef, 100);
+    manager.process_block_for_wallets(&block, 100, &wallets).await;
+
+    let mut rx = manager.subscribe_events();
+    manager.rewind_to_height(1000).await.expect("rewind succeeds");
+
+    let info = manager.get_wallet_info(&wallet_id).expect("wallet present");
+    assert_eq!(
+        info.last_processed_height(),
+        100,
+        "rewinding to a height above current must not advance the wallet forward",
+    );
+
+    let reorg_events: Vec<_> = drain_events(&mut rx)
+        .into_iter()
+        .filter(|e| matches!(e, WalletEvent::Reorg { .. }))
+        .collect();
+    assert!(reorg_events.is_empty(), "no-op rewind must not emit Reorg, got {reorg_events:?}",);
+}
+
+#[tokio::test]
+async fn test_get_transaction_returns_stored_record() {
+    let (mut manager, wallet_id, addr) = setup_manager_with_wallet();
+    let tx = create_tx_paying_to(&addr, 0xa9);
+    let block = make_block(vec![tx.clone()], 0xa9, 100);
+    let wallets = BTreeSet::from([wallet_id]);
+    manager.process_block_for_wallets(&block, 50, &wallets).await;
+
+    let fetched = manager.get_transaction(&tx.txid()).await.expect("tx must be retrievable");
+    assert_eq!(fetched.txid(), tx.txid());
+
+    let missing = manager.get_transaction(&Txid::from_byte_array([0xff; 32])).await;
+    assert!(missing.is_none(), "unknown txid must return None");
 }

@@ -8,5 +8,6 @@ mod tests_basic;
 mod tests_disconnect;
 mod tests_mempool;
 mod tests_multi_wallet;
+mod tests_reorg;
 mod tests_restart;
 mod tests_transaction;

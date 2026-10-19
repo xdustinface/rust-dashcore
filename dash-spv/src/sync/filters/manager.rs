@@ -5,6 +5,7 @@
 //! Emits FiltersStored, FiltersSyncComplete and BlocksNeeded events.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashcore::bip158::BlockFilter;
@@ -71,6 +72,9 @@ pub struct FiltersManager<
     /// `BlockProcessed` and the per-wallet record of which wallets already
     /// have a given processed block applied.
     pub(super) tracker: BlockMatchTracker,
+    /// Shared generation counter used to invalidate stale `CFilter`
+    /// responses delivered after a reorg cascade.
+    pub(super) reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: WalletInterface>
@@ -82,6 +86,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         header_storage: Arc<RwLock<H>>,
         filter_header_storage: Arc<RwLock<FH>>,
         filter_storage: Arc<RwLock<F>>,
+        reorg_generation: Arc<AtomicU64>,
     ) -> Self {
         let committed_height = wallet.read().await.synced_height();
         let stored_height = filter_storage.read().await.filter_tip_height().await.unwrap_or(0);
@@ -115,7 +120,13 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             active_batches: BTreeMap::new(),
             processing_height: 0,
             tracker: BlockMatchTracker::new(),
+            reorg_generation,
         }
+    }
+
+    /// Current reorg generation counter snapshot.
+    pub(super) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
     }
 
     /// Returns true if there is no in-flight processing state.
@@ -124,6 +135,60 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             && self.tracker.is_empty()
             && self.pending_batches.is_empty()
             && self.filter_pipeline.is_idle()
+    }
+
+    /// Drop all in-flight processing state so a fresh scan can begin from a
+    /// rolled-back `committed_height`. Used by the wallet-rescan trigger in
+    /// `tick` when a wallet's `synced_height` falls below the manager's
+    /// current scan progress. Distinct from `on_disconnect`, which keeps
+    /// in-progress work intact.
+    pub(super) fn reset_for_rescan(&mut self) {
+        self.active_batches.clear();
+        self.tracker.clear();
+        self.pending_batches.clear();
+        self.filter_pipeline = FiltersPipeline::new();
+    }
+
+    /// Drive the per-wallet rewind and compute the effective floor for
+    /// the filter re-match. Returns the lowest per-wallet `synced_height`
+    /// after the rewind clamps each wallet to `min(fork_height, current)`.
+    ///
+    /// The chainlock-floor invariant is enforced upstream by the reorg
+    /// cascade, so a `BelowChainLockFloor` error here is defense in
+    /// depth: log and fall back to `fork_height` for the floor without
+    /// touching wallet state.
+    pub(super) async fn rewind_wallet_for_reorg(&self, fork_height: u32) -> u32 {
+        let mut wallet = self.wallet.write().await;
+        match wallet.rewind_to_height(fork_height).await {
+            Ok(_) => wallet.synced_height().min(fork_height),
+            Err(e) => {
+                tracing::warn!(
+                    "FiltersManager: wallet rewind to {} rejected: {}; using fork_height as floor",
+                    fork_height,
+                    e
+                );
+                fork_height
+            }
+        }
+    }
+
+    /// Reset all sync state to begin again at `effective_floor` after a
+    /// reorg cascade. Clears in-flight batches and rewinds the per-batch
+    /// processing cursors so the next `FilterHeadersStored` event drives a
+    /// fresh download starting at the effective floor.
+    ///
+    /// `effective_floor` is the minimum of `fork_height` and the lowest
+    /// per-wallet `synced_height` across the wallet set, computed after
+    /// the wallet rewind. A wallet whose ingest tip is behind the fork
+    /// point never saw the orphaned chain, so the filter pipeline does
+    /// not need to re-match the segment between that wallet's tip and
+    /// the fork.
+    pub(super) fn reset_for_reorg(&mut self, effective_floor: u32) {
+        self.reset_for_rescan();
+        self.next_batch_to_store = effective_floor;
+        self.processing_height = effective_floor;
+        self.progress.update_committed_height(effective_floor);
+        self.progress.update_stored_height(effective_floor);
     }
 
     async fn load_filters(
@@ -222,7 +287,9 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         if download_start <= self.progress.filter_header_tip_height() {
             self.filter_pipeline.init(download_start, self.progress.filter_header_tip_height());
             let header_storage = self.header_storage.read().await;
-            self.filter_pipeline.send_pending(requests, &*header_storage).await?;
+            self.filter_pipeline
+                .send_pending(requests, &*header_storage, self.current_generation())
+                .await?;
             drop(header_storage);
         } else {
             // No new filters to download, scanning stored filters only
@@ -411,7 +478,11 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
         // Phase 2: Scan any ready batches where filters are available
         events.extend(self.scan_ready_batches().await?);
 
-        // Phase 3: Create lookahead batches up to MAX_LOOKAHEAD_BATCHES
+        // Phase 3: Commit newly scanned batches that are ready
+        // (avoids a one-tick delay between scan and commit for small batches)
+        events.extend(self.try_commit_batches().await?);
+
+        // Phase 4: Create lookahead batches up to MAX_LOOKAHEAD_BATCHES
         events.extend(self.try_create_lookahead_batches().await?);
 
         // If no active batches and all filters downloaded, emit FiltersSyncComplete.
@@ -506,7 +577,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
             // Drop processed-wallet records for the committed range. Below the
             // new committed_height a new wallet can only get here via the
             // `tick` rescan trigger, which already wipes the map via
-            // `clear_in_flight_state`, so older entries can never be consulted.
+            // `reset_for_rescan`, so older entries can never be consulted.
             self.tracker.prune_at_or_below(end);
             self.processing_height = end + 1;
 
@@ -863,7 +934,7 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
 
         match self.state() {
             SyncState::Syncing | SyncState::Synced
-                if self.progress.stored_height() < self.progress.filter_header_tip_height() =>
+                if self.progress.committed_height() < self.progress.filter_header_tip_height() =>
             {
                 // Transition back to Syncing so is_synced() returns false
                 // until all new filters and matched blocks are fully processed.
@@ -872,9 +943,11 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 }
 
                 self.filter_pipeline.extend_target(tip_height);
-                {
+                if self.progress.stored_height() < self.progress.filter_header_tip_height() {
                     let header_storage = self.header_storage.read().await;
-                    self.filter_pipeline.send_pending(requests, &*header_storage).await?;
+                    self.filter_pipeline
+                        .send_pending(requests, &*header_storage, self.current_generation())
+                        .await?;
                 }
 
                 if self.active_batches.is_empty() {
@@ -883,6 +956,14 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
                 }
             }
             SyncState::WaitingForConnections | SyncState::WaitForEvents => {
+                // In-progress work preserved across a disconnect cycle. Don't
+                // re-init via `start_download` — that would clobber existing
+                // batches. Instead extend the target and let the eventual
+                // `start_sync` (driven by `PeersUpdated`) resume from here.
+                if !self.active_batches.is_empty() {
+                    self.filter_pipeline.extend_target(tip_height);
+                    return Ok(vec![]);
+                }
                 return self.start_download(requests).await;
             }
             _ => {}
@@ -938,6 +1019,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
     }
@@ -951,6 +1033,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
     }
@@ -1017,6 +1100,7 @@ mod tests {
             storage.block_headers(),
             storage.filter_headers(),
             storage.filters(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await;
 
@@ -1049,6 +1133,25 @@ mod tests {
         } else {
             panic!("Expected SyncManagerProgress::Filters");
         }
+    }
+
+    #[tokio::test]
+    async fn test_filter_header_tip_height_is_monotonic() {
+        let mut manager = create_test_manager().await;
+        manager.progress.update_filter_header_tip_height(500);
+        assert_eq!(manager.progress.filter_header_tip_height(), 500);
+
+        // Lower value is rejected
+        manager.progress.update_filter_header_tip_height(200);
+        assert_eq!(manager.progress.filter_header_tip_height(), 500);
+
+        // Equal value is rejected (no spurious activity bump)
+        manager.progress.update_filter_header_tip_height(500);
+        assert_eq!(manager.progress.filter_header_tip_height(), 500);
+
+        // Higher value is accepted
+        manager.progress.update_filter_header_tip_height(600);
+        assert_eq!(manager.progress.filter_header_tip_height(), 600);
     }
 
     #[tokio::test]
@@ -1584,7 +1687,7 @@ mod tests {
 
     /// `try_commit_batches` prunes `processed_blocks_per_wallet` entries at
     /// or below the new committed_height, since they cannot be reached again
-    /// without `clear_in_flight_state` wiping the map outright.
+    /// without `reset_for_rescan` wiping the map outright.
     #[tokio::test]
     async fn test_commit_prunes_processed_blocks_per_wallet() {
         let mut manager = create_test_manager().await;
@@ -1838,7 +1941,7 @@ mod tests {
         assert!(!manager.is_idle());
         manager.filter_pipeline = FiltersPipeline::new();
 
-        // Populate all fields, then clear_in_flight_state restores idleness
+        // Populate all fields, then reset_for_rescan restores idleness
         manager.active_batches.insert(0, FiltersBatch::new(0, 999, HashMap::new()));
         manager.tracker.track(&key, 0, BTreeSet::from([wallet_id]));
         manager.tracker.record_processed(100, hash, &BTreeSet::from([wallet_id]));
@@ -1846,7 +1949,7 @@ mod tests {
         manager.filter_pipeline.init(2000, 2999);
         assert!(!manager.is_idle());
 
-        manager.clear_in_flight_state();
+        manager.reset_for_rescan();
         assert!(manager.is_idle());
     }
 
@@ -1941,7 +2044,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let requests = RequestSender::new(tx);
 
-        // New filter headers arrive at 150: stored(100) < tip(150)
+        // New filter headers arrive at 150: committed(100) < tip(150)
         let events = manager.handle_new_filter_headers(150, &requests).await.unwrap();
 
         assert!(events.is_empty());
@@ -2054,7 +2157,7 @@ mod tests {
         manager.progress.update_filter_header_tip_height(100);
         manager.progress.update_target_height(100);
 
-        // Pre-populate in-flight state so we can verify clear_in_flight_state runs.
+        // Pre-populate in-flight state so we can verify reset_for_rescan runs.
         manager.active_batches.insert(101, FiltersBatch::new(101, 200, HashMap::new()));
         let stale_hash = dashcore::block::Header::dummy(0).block_hash();
         let stale_key = FilterMatchKey::new(150, stale_hash);
@@ -2083,7 +2186,7 @@ mod tests {
         // Old in-flight state was cleared and a fresh batch was created at scan_start=0.
         assert!(!manager.active_batches.contains_key(&101));
         assert!(manager.active_batches.contains_key(&0));
-        // The stale pre-populated record was wiped by `clear_in_flight_state`:
+        // The stale pre-populated record was wiped by `reset_for_rescan`:
         // a fresh `track` for the same wallet now returns `NewlyTracked`.
         assert!(matches!(
             manager.tracker.track(&stale_key, 0, BTreeSet::from([MOCK_WALLET_ID])),
@@ -2178,5 +2281,189 @@ mod tests {
         assert_eq!(manager.progress.committed_height(), 100);
         assert_eq!(manager.state(), SyncState::WaitingForConnections);
         assert!(manager.active_batches.is_empty());
+    }
+
+    /// `on_disconnect` for `FiltersManager` keeps the block-match tracker,
+    /// active batches (with their `pending_blocks` counters), pending verified
+    /// batches, and per-batch filter receipts, and moves any in-flight
+    /// `getcfilters` slots back to pending so the next `send_pending` reissues
+    /// them. This keeps `FiltersManager.tracker` in lockstep with
+    /// `BlocksManager`'s preserved pipeline so already-counted matches do not
+    /// leak into a permanent non-zero `pending_blocks`.
+    #[tokio::test]
+    async fn test_on_disconnect_preserves_in_progress_work() {
+        let mut manager = create_test_manager().await;
+
+        let key = FilterMatchKey::new(100, dashcore::block::Header::dummy(0).block_hash());
+        let wallet_id = MOCK_WALLET_ID;
+
+        let mut batch = FiltersBatch::new(0, 999, HashMap::new());
+        batch.set_pending_blocks(1);
+        manager.active_batches.insert(0, batch);
+        manager.tracker.track(&key, 0, BTreeSet::from([wallet_id]));
+        manager.pending_batches.insert(FiltersBatch::new(1000, 1999, HashMap::new()));
+        manager.filter_pipeline.init(0, 1999);
+
+        manager.on_disconnect();
+
+        assert!(manager.active_batches.contains_key(&0));
+        assert_eq!(
+            manager.active_batches.get(&0).unwrap().pending_blocks(),
+            1,
+            "active batch's pending_blocks counter must not be reset"
+        );
+        assert_eq!(
+            manager.tracker.track(&key, 0, BTreeSet::from([wallet_id])),
+            BlockTrackResult::InFlight {
+                wallets: BTreeSet::from([wallet_id])
+            },
+            "tracker must still see the hash as in-flight"
+        );
+        assert_eq!(manager.pending_batches.len(), 1);
+
+        // Sanity check: the full-reset path (`reset_for_rescan`) does wipe
+        // everything — the two paths must remain distinct.
+        manager.reset_for_rescan();
+        assert!(manager.active_batches.is_empty());
+        assert!(manager.pending_batches.is_empty());
+        assert!(manager.tracker.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_filter_headers_starts_scan_when_stored_equals_tip() {
+        let mut manager = create_test_manager().await;
+
+        let headers = dashcore::block::Header::dummy_batch(0..101);
+        manager.header_storage.write().await.store_headers(&headers).await.unwrap();
+
+        // Populate filter storage so load_filters succeeds during lookahead
+        {
+            let dummy_filter = BlockFilter::new(&[0u8; 32]);
+            let mut fs = manager.filter_storage.write().await;
+            for h in 0..=100 {
+                fs.store_filter(h, &dummy_filter.content).await.unwrap();
+            }
+        }
+
+        // Filters stored but not yet committed (restart scenario).
+        manager.set_state(SyncState::Synced);
+        manager.progress.update_filter_header_tip_height(100);
+        manager.progress.update_stored_height(100);
+        manager.progress.update_committed_height(0);
+        manager.progress.update_target_height(1000);
+        manager.filter_pipeline.init(101, 100);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        // committed(0) < tip(100) fires the guard even though stored == tip.
+        // Because stored >= tip, send_pending is skipped (no downloads needed).
+        let _events = manager.handle_new_filter_headers(100, &requests).await.unwrap();
+
+        assert_eq!(manager.state(), SyncState::Syncing);
+        assert!(
+            manager.active_batches.contains_key(&0),
+            "expected lookahead batch at processing_height=0, got keys: {:?}",
+            manager.active_batches.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_new_filter_headers_skips_when_fully_committed() {
+        let mut manager = create_test_manager().await;
+
+        // Everything committed, stored, and at tip. No work to do.
+        manager.set_state(SyncState::Synced);
+        manager.progress.update_committed_height(100);
+        manager.progress.update_stored_height(100);
+        manager.progress.update_filter_header_tip_height(100);
+        manager.progress.update_target_height(1000);
+        manager.filter_pipeline.init(101, 100);
+
+        let (tx, _rx) = unbounded_channel();
+        let requests = RequestSender::new(tx);
+
+        let events = manager.handle_new_filter_headers(100, &requests).await.unwrap();
+
+        assert_eq!(manager.state(), SyncState::Synced);
+        assert!(events.is_empty());
+        assert!(manager.active_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_try_process_batch_commits_after_scan_in_same_call() {
+        let mut manager = create_test_manager().await;
+
+        let headers = dashcore::block::Header::dummy_batch(0..101);
+        manager.header_storage.write().await.store_headers(&headers).await.unwrap();
+        {
+            let dummy_filter = BlockFilter::new(&[0u8; 32]);
+            let mut fs = manager.filter_storage.write().await;
+            for h in 0..=100 {
+                fs.store_filter(h, &dummy_filter.content).await.unwrap();
+            }
+        }
+
+        manager.set_state(SyncState::Syncing);
+        manager.progress.update_stored_height(100);
+        manager.progress.update_filter_header_tip_height(100);
+        manager.progress.update_committed_height(0);
+        manager.progress.update_target_height(100);
+        manager.processing_height = 0;
+
+        // Create a batch that has all filters stored but is not yet scanned.
+        // Phase 1 (commit) skips it because it's not scanned.
+        // Phase 2 (scan) marks it scanned.
+        // Phase 3 (second commit) commits it immediately.
+        let mut batch = FiltersBatch::new(0, 100, manager.load_filters(0, 100).await.unwrap());
+        batch.mark_verified();
+        manager.active_batches.insert(0, batch);
+
+        let events = manager.try_process_batch().await.unwrap();
+
+        // Batch was scanned and committed in a single try_process_batch call.
+        assert!(manager.active_batches.is_empty());
+        assert_eq!(manager.progress.committed_height(), 100);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SyncEvent::FiltersSyncComplete {
+                    tip_height: 100
+                }
+            )),
+            "expected FiltersSyncComplete, got {:?}",
+            events
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewind_wallet_for_reorg_uses_min_of_wallet_and_fork() {
+        let manager = create_test_manager().await;
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 40);
+
+        let effective_floor = manager.rewind_wallet_for_reorg(100).await;
+
+        assert_eq!(
+            effective_floor, 40,
+            "wallet behind fork_height should drag floor down to its synced_height"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewind_wallet_for_reorg_clamps_to_fork_height() {
+        let manager = create_test_manager().await;
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 200);
+
+        let effective_floor = manager.rewind_wallet_for_reorg(100).await;
+
+        assert_eq!(
+            effective_floor, 100,
+            "wallet ahead of fork_height should be clamped and floor equals fork_height"
+        );
+        assert_eq!(
+            manager.wallet.read().await.wallet_synced_height(&MOCK_WALLET_ID),
+            100,
+            "rewind must clamp wallet's synced_height to fork_height"
+        );
     }
 }

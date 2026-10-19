@@ -1,11 +1,13 @@
+use crate::wallet_interface::{RewindError, RewindResult};
 use crate::{
     BlockProcessingResult, MempoolTransactionResult, WalletEvent, WalletId, WalletInterface,
 };
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, OutPoint, Transaction, Txid};
 use key_wallet::transaction_checking::TransactionContext;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
@@ -42,6 +44,7 @@ pub struct MockWallet {
     pub processed_instant_locks: InstantLockCaptures,
     /// Monitor revision counter for staleness detection.
     monitor_revision: u64,
+    stored_transactions: HashMap<Txid, Transaction>,
 }
 
 impl Default for MockWallet {
@@ -69,7 +72,17 @@ impl MockWallet {
             status_changes: Arc::new(Mutex::new(Vec::new())),
             processed_instant_locks: Arc::new(Mutex::new(Vec::new())),
             monitor_revision: 0,
+            stored_transactions: HashMap::new(),
         }
+    }
+
+    pub fn insert_stored_transaction(&mut self, tx: Transaction) {
+        self.stored_transactions.insert(tx.txid(), tx);
+    }
+
+    /// Sender used to fire synthetic `WalletEvent`s from tests.
+    pub fn event_sender(&self) -> &broadcast::Sender<WalletEvent> {
+        &self.event_sender
     }
 
     /// Override the wallet id used for per-wallet API surfaces.
@@ -252,6 +265,27 @@ impl WalletInterface for MockWallet {
             self.status_changes.try_lock().expect("status_changes lock contention in test helper");
         changes.push((txid, TransactionContext::InstantSend(instant_lock)));
     }
+
+    fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
+        panic!("apply_chain_lock not supported for MockWallet");
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        if height < self.last_processed_height {
+            self.last_processed_height = height;
+        }
+        if height < self.synced_height {
+            self.synced_height = height;
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, txid: &Txid) -> Option<Transaction> {
+        self.stored_transactions.get(txid).cloned()
+    }
 }
 
 /// Mock wallet that returns false for filter checks
@@ -356,6 +390,27 @@ impl WalletInterface for NonMatchingMockWallet {
 
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
+    }
+
+    fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
+        panic!("apply_chain_lock not supported for NonMatchingMockWallet");
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        if height < self.last_processed_height {
+            self.last_processed_height = height;
+        }
+        if height < self.synced_height {
+            self.synced_height = height;
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
+        None
     }
 
     async fn describe(&self) -> String {
@@ -499,6 +554,29 @@ impl WalletInterface for MultiMockWallet {
 
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
+    }
+
+    fn apply_chain_lock(&mut self, _chain_lock: ChainLock) {
+        panic!("apply_chain_lock not supported for MultiMockWallet");
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        for state in self.wallets.values_mut() {
+            if height < state.last_processed_height {
+                state.last_processed_height = height;
+            }
+            if height < state.synced_height {
+                state.synced_height = height;
+            }
+        }
+        Ok(RewindResult::default())
+    }
+
+    async fn get_transaction(&self, _txid: &Txid) -> Option<Transaction> {
+        None
     }
 
     async fn describe(&self) -> String {

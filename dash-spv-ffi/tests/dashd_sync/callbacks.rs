@@ -30,6 +30,8 @@ pub(super) struct CallbackTracker {
     pub(super) instantlock_received_count: AtomicU32,
     pub(super) manager_error_count: AtomicU32,
     pub(super) sync_complete_count: AtomicU32,
+    pub(super) chain_reorg_count: AtomicU32,
+    pub(super) deep_reorg_count: AtomicU32,
 
     // Network event tracking
     pub(super) peer_connected_count: AtomicU32,
@@ -497,6 +499,9 @@ extern "C" fn on_wallet_block_processed(
     account_balances_count: u32,
     _addresses_derived: *const dash_spv_ffi::FFIDerivedAddress,
     _addresses_derived_count: u32,
+    _cl_height: u32,
+    _cl_hash: *const [u8; 32],
+    _cl_signature: *const [u8; 96],
     user_data: *mut c_void,
 ) {
     let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
@@ -570,6 +575,28 @@ extern "C" fn on_sync_height_advanced(
     tracing::info!("on_sync_height_advanced: wallet={}, height={}", wallet_str, height);
 }
 
+extern "C" fn on_chain_reorg(
+    fork_height: u32,
+    _old_tip: *const [u8; 32],
+    _new_tip: *const [u8; 32],
+    generation: u64,
+    user_data: *mut c_void,
+) {
+    let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
+        return;
+    };
+    tracker.chain_reorg_count.fetch_add(1, Ordering::SeqCst);
+    tracing::info!("on_chain_reorg: fork_height={}, generation={}", fork_height, generation);
+}
+
+extern "C" fn on_deep_reorg_detected(fork_height: u32, depth: u32, user_data: *mut c_void) {
+    let Some(tracker) = (unsafe { tracker_from(user_data) }) else {
+        return;
+    };
+    tracker.deep_reorg_count.fetch_add(1, Ordering::SeqCst);
+    tracing::info!("on_deep_reorg_detected: fork_height={}, depth={}", fork_height, depth);
+}
+
 /// Create sync callbacks with all event handlers wired to the tracker.
 ///
 /// The `user_data` pointer borrows the tracker Arc. The caller must ensure the
@@ -590,6 +617,8 @@ pub(super) fn create_sync_callbacks(tracker: &Arc<CallbackTracker>) -> FFISyncEv
         on_instantlock_received: Some(on_instantlock_received),
         on_manager_error: Some(on_manager_error),
         on_sync_complete: Some(on_sync_complete),
+        on_chain_reorg: Some(on_chain_reorg),
+        on_deep_reorg_detected: Some(on_deep_reorg_detected),
         user_data: Arc::as_ptr(tracker) as *mut c_void,
     }
 }
@@ -617,6 +646,7 @@ pub(super) fn create_wallet_callbacks(tracker: &Arc<CallbackTracker>) -> FFIWall
         on_transaction_instant_locked: Some(on_transaction_instant_locked),
         on_block_processed: Some(on_wallet_block_processed),
         on_sync_height_advanced: Some(on_sync_height_advanced),
+        on_chain_lock_processed: None,
         user_data: Arc::as_ptr(tracker) as *mut c_void,
     }
 }

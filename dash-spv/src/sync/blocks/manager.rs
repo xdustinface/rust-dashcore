@@ -3,6 +3,7 @@
 //! Downloads blocks that matched wallet filters and processes them in height order.
 //! Subscribes to BlockNeeded events and emits BlockProcessed events.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -39,6 +40,9 @@ pub struct BlocksManager<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterf
     pub(super) pipeline: BlocksPipeline,
     /// Whether FiltersSyncComplete has been received.
     pub(super) filters_sync_complete: bool,
+    /// Shared generation counter used to invalidate stale `Block` responses
+    /// delivered after a reorg cascade.
+    pub(super) reorg_generation: Arc<AtomicU64>,
 }
 
 impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H, B, W> {
@@ -47,6 +51,7 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
         wallet: Arc<RwLock<W>>,
         header_storage: Arc<RwLock<H>>,
         block_storage: Arc<RwLock<B>>,
+        reorg_generation: Arc<AtomicU64>,
     ) -> Self {
         let last_processed_height = wallet.read().await.last_processed_height();
 
@@ -60,11 +65,18 @@ impl<H: BlockHeaderStorage, B: BlockStorage, W: WalletInterface> BlocksManager<H
             wallet,
             pipeline: BlocksPipeline::new(),
             filters_sync_complete: false,
+            reorg_generation,
         }
     }
 
+    /// Current reorg generation counter snapshot.
+    pub(super) fn current_generation(&self) -> u64 {
+        self.reorg_generation.load(Ordering::Acquire)
+    }
+
     pub(super) async fn send_pending(&mut self, requests: &RequestSender) -> SyncResult<()> {
-        let sent = self.pipeline.send_pending(requests).await?;
+        let sent =
+            self.pipeline.send_pending_with_generation(requests, self.current_generation()).await?;
         if sent > 0 {
             self.progress.add_requested(sent as u32);
         }
@@ -183,7 +195,13 @@ mod tests {
     async fn create_test_manager() -> TestBlocksManager {
         let storage = DiskStorageManager::with_temp_dir().await.unwrap();
         let wallet = Arc::new(RwLock::new(MockWallet::new()));
-        BlocksManager::new(wallet, storage.block_headers(), storage.blocks()).await
+        BlocksManager::new(
+            wallet,
+            storage.block_headers(),
+            storage.blocks(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -296,7 +314,13 @@ mod tests {
             PersistentBlockHeaderStorage,
             PersistentBlockStorage,
             MultiMockWallet,
-        > = BlocksManager::new(multi.clone(), storage.block_headers(), storage.blocks()).await;
+        > = BlocksManager::new(
+            multi.clone(),
+            storage.block_headers(),
+            storage.blocks(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
         manager.progress.set_state(SyncState::Syncing);
 
         let header = Header {
@@ -326,5 +350,85 @@ mod tests {
             !processed.iter().any(|(id, _, _)| *id == wallet_out),
             "wallet_out was not in the routed set, must not be processed"
         );
+    }
+
+    /// `on_disconnect` for `BlocksManager` keeps the downloaded buffer, the
+    /// per-block wallet routing, and the `filters_sync_complete` flag, and
+    /// moves any in-flight `getdata`s back to pending so the next
+    /// `send_pending` reissues them. Without this preservation, blocks waiting
+    /// in `downloaded` for height ordering would be dropped, leaving
+    /// `FiltersManager.tracker` entries that never get decremented.
+    #[tokio::test]
+    async fn test_on_disconnect_preserves_pipeline_work() {
+        use dashcore::block::Header;
+        use dashcore::{Block, TxMerkleNode};
+        use dashcore_hashes::Hash;
+
+        let mut manager = create_test_manager().await;
+        manager.filters_sync_complete = true;
+
+        let header = Header {
+            version: dashcore::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: dashcore::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![],
+        };
+
+        // Already-downloaded block sitting in the pipeline.
+        manager.pipeline.add_from_storage(block.clone(), 200, BTreeSet::from([MOCK_WALLET_ID]));
+
+        manager.on_disconnect();
+
+        assert!(!manager.pipeline.is_complete(), "downloaded buffer must survive on_disconnect");
+        assert!(manager.filters_sync_complete);
+    }
+
+    /// `SyncEvent::ChainReorg` must reset the pipeline, clear
+    /// `filters_sync_complete`, and move the manager back to `WaitForEvents`.
+    #[tokio::test]
+    async fn chain_reorg_event_resets_pipeline_and_state() {
+        use dashcore::block::Header;
+        use dashcore::{Block, TxMerkleNode};
+        use dashcore_hashes::Hash;
+
+        let mut manager = create_test_manager().await;
+        manager.filters_sync_complete = true;
+        manager.progress.set_state(SyncState::Syncing);
+
+        let header = Header {
+            version: dashcore::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: dashcore::BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 0,
+            bits: dashcore::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![],
+        };
+        manager.pipeline.add_from_storage(block, 100, BTreeSet::from([MOCK_WALLET_ID]));
+        assert!(!manager.pipeline.is_complete(), "pipeline must have pending work before reorg");
+
+        let network = MockNetworkManager::new();
+        let requests = network.request_sender();
+        let event = SyncEvent::ChainReorg {
+            fork_height: 50,
+            old_tip: dashcore::BlockHash::all_zeros(),
+            new_tip: dashcore::BlockHash::all_zeros(),
+            generation: 1,
+        };
+
+        let events = manager.handle_sync_event(&event, &requests).await.unwrap();
+        assert!(events.is_empty());
+        assert!(manager.pipeline.is_complete(), "pipeline must be empty after ChainReorg");
+        assert!(!manager.filters_sync_complete, "filters_sync_complete must be cleared");
+        assert_eq!(manager.state(), SyncState::WaitForEvents);
     }
 }

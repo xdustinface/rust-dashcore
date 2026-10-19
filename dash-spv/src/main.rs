@@ -5,12 +5,9 @@ use std::process;
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use dash_spv::network::NetworkEvent;
-use dash_spv::sync::{SyncEvent, SyncProgress};
-use dash_spv::{ClientConfig, DashSpvClient, EventHandler, LevelFilter, MempoolStrategy, Network};
+use dash_spv::{ClientConfig, DashSpvClient, LevelFilter, MempoolStrategy, Network};
 use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
-use key_wallet_manager::{WalletEvent, WalletManager};
-use tokio_util::sync::CancellationToken;
+use key_wallet_manager::WalletManager;
 
 /// Network selection for CLI
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -68,31 +65,6 @@ impl From<LogLevelArg> for LevelFilter {
             LogLevelArg::Debug => LevelFilter::DEBUG,
             LogLevelArg::Trace => LevelFilter::TRACE,
         }
-    }
-}
-
-/// Logs all SPV client events via tracing.
-struct LoggingEventHandler;
-
-impl EventHandler for LoggingEventHandler {
-    fn on_sync_event(&self, event: &SyncEvent) {
-        tracing::info!("{}", event.description());
-    }
-
-    fn on_network_event(&self, event: &NetworkEvent) {
-        tracing::info!("{}", event.description());
-    }
-
-    fn on_progress(&self, progress: &SyncProgress) {
-        tracing::info!("Sync progress: {}", progress);
-    }
-
-    fn on_wallet_event(&self, event: &WalletEvent) {
-        tracing::info!("Wallet: {}", event.description());
-    }
-
-    fn on_error(&self, error: &str) {
-        tracing::error!("{}", error);
     }
 }
 
@@ -292,7 +264,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut wallet_manager = WalletManager::<ManagedWalletInfo>::new(config.network);
     wallet_manager.create_wallet_from_mnemonic(
         mnemonic_phrase.as_str(),
-        "",
         0,
         key_wallet::wallet::initialization::WalletAccountCreationOptions::default(),
     )?;
@@ -326,42 +297,34 @@ async fn run_client<S: dash_spv::storage::StorageManager>(
     wallet: Arc<tokio::sync::RwLock<WalletManager<ManagedWalletInfo>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Create and start the client
-    let client = match DashSpvClient::<
-        WalletManager<ManagedWalletInfo>,
-        dash_spv::network::manager::PeerNetworkManager,
-        S,
-    >::new(
-        config.clone(),
-        network_manager,
-        storage_manager,
-        wallet.clone(),
-        vec![Arc::new(LoggingEventHandler)],
-    )
-    .await
-    {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("Failed to create SPV client: {}", e);
-            process::exit(1);
-        }
-    };
+    let client =
+        match DashSpvClient::<
+            WalletManager<ManagedWalletInfo>,
+            dash_spv::network::manager::PeerNetworkManager,
+            S,
+        >::new(
+            config.clone(), network_manager, storage_manager, wallet.clone(), Vec::new()
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("Failed to create SPV client: {}", e);
+                process::exit(1);
+            }
+        };
 
-    let shutdown_token = CancellationToken::new();
-    let ctrl_c_token = shutdown_token.clone();
+    let stop_client = client.clone();
     tokio::spawn(async move {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.ok();
-                tracing::debug!("Shutdown signal received");
-            }
-            _ = ctrl_c_token.cancelled() => {
-                tracing::debug!("Shutdown token cancelled");
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::debug!("Shutdown signal received");
+            if let Err(e) = stop_client.stop().await {
+                tracing::warn!("Error during ctrl-c stop: {}", e);
             }
         }
-        ctrl_c_token.cancel();
     });
 
-    client.run(shutdown_token).await?;
+    client.run().await?;
 
     Ok(())
 }

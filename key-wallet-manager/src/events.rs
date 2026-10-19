@@ -5,10 +5,12 @@
 //! persist the transaction(s) and balance atomically off a single event.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::Txid;
+use dashcore::{PublicKey, Txid};
 use key_wallet::account::AccountType;
 use key_wallet::managed_account::address_pool::{AddressPoolType, PublicKeyType};
 use key_wallet::managed_account::transaction_record::TransactionRecord;
@@ -27,6 +29,7 @@ use crate::WalletId;
 /// stand-alone event) is what lets consumers store
 /// `Wallet → Account → CoreAddress → Txo` without breaking the
 /// `CoreAddress` link for UTXOs landing on freshly derived addresses.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedAddress {
     /// The account that derived this address.
@@ -43,20 +46,20 @@ pub struct DerivedAddress {
     pub derivation_index: u32,
     /// The derived address.
     pub address: dashcore::Address,
-    /// Compressed ECDSA public key (33 bytes). Non-ECDSA pools
+    /// ECDSA public key for the derived address. Non-ECDSA pools
     /// (BLS / EdDSA) are skipped during projection.
-    pub public_key: [u8; 33],
+    pub public_key: PublicKey,
 }
 
 impl DerivedAddress {
     /// Project a [`DerivedAddressInfo`] from key-wallet into a
     /// `DerivedAddress` event payload. Returns `None` for non-ECDSA pools
-    /// (BLS / EdDSA) since the event field carries a 33-byte compressed
-    /// key — those pools don't trigger gap-limit extension on Core
-    /// transactions in practice, but skip rather than panic if they do.
-    /// Drops are logged so a future change that wires gap-limit extension
-    /// into a BLS / EdDSA pool surfaces in traces rather than silently
-    /// orphaning UTXOs at the persister.
+    /// (BLS / EdDSA) since the event field carries an ECDSA key. Those
+    /// pools don't trigger gap-limit extension on Core transactions in
+    /// practice, but skip rather than panic if they do. Drops are logged
+    /// so a future change that wires gap-limit extension into a BLS /
+    /// EdDSA pool surfaces in traces rather than silently orphaning UTXOs
+    /// at the persister.
     pub(crate) fn from_info(derived: DerivedAddressInfo) -> Option<Self> {
         let account_type = derived.account_type;
         let pool_type = derived.pool_type;
@@ -71,31 +74,29 @@ impl DerivedAddress {
                 );
                 return None;
             }
-            Some(PublicKeyType::ECDSA(bytes)) => {
-                if bytes.len() != 33 {
+            Some(PublicKeyType::ECDSA(bytes)) => match PublicKey::from_slice(bytes) {
+                Ok(pk) => pk,
+                Err(err) => {
                     // Producer (`generate_address_at_index`) always stores
-                    // 33-byte compressed keys, so a length mismatch is a
-                    // bug, not an expected drop.
+                    // valid compressed keys, so a parse failure is a bug,
+                    // not an expected drop.
                     tracing::warn!(
                         ?account_type,
                         ?pool_type,
                         index,
-                        len = bytes.len(),
-                        "dropping derived address: ECDSA public key is not 33 bytes"
+                        %err,
+                        "dropping derived address: ECDSA public key failed to parse"
                     );
                     return None;
                 }
-                let mut arr = [0u8; 33];
-                arr.copy_from_slice(bytes);
-                arr
-            }
+            },
             Some(PublicKeyType::BLS(_)) | Some(PublicKeyType::EdDSA(_)) => {
                 tracing::debug!(
                     ?account_type,
                     ?pool_type,
                     index,
                     "dropping non-ECDSA derived address from event projection \
-                     (event field is 33-byte compressed ECDSA only)"
+                     (event field is ECDSA only)"
                 );
                 return None;
             }
@@ -232,6 +233,16 @@ pub enum WalletEvent {
         wallet_id: WalletId,
         /// Height of the block that was processed.
         height: CoreBlockHeight,
+        /// `Some(chain_lock)` iff the wallet's finality boundary at
+        /// processing time covers `height`, meaning every record in
+        /// this event has a [`key_wallet::transaction_checking::TransactionContext::InChainLockedBlock`]
+        /// context and the transactions are already finalized. The
+        /// chainlock carried here is the proof that established the
+        /// boundary, retained so consumers can persist the signing
+        /// proof alongside the block. By construction
+        /// `chain_lock.block_height >= height` whenever `Some`. The
+        /// per-record `context` is the source of truth and will agree.
+        chain_lock: Option<ChainLock>,
         /// Records first stored for this wallet in this block.
         inserted: Vec<TransactionRecord>,
         /// Previously-known records confirmed by this block.
@@ -264,11 +275,99 @@ pub enum WalletEvent {
         /// New scanned height for the wallet.
         height: CoreBlockHeight,
     },
+    /// A chainlock was applied to the wallet: its
+    /// `last_applied_chain_lock` metadata advanced (strictly forward by
+    /// height, or `None` → `Some`), and any previously-`InBlock`
+    /// records at heights `<= chain_lock.block_height` were promoted
+    /// to [`key_wallet::transaction_checking::TransactionContext::InChainLockedBlock`].
+    ///
+    /// Fires once per wallet whenever the wallet's
+    /// `last_applied_chain_lock` advances. `locked_transactions` carries
+    /// the promotions when there were any, and is empty when the
+    /// chainlock advanced the metadata without promoting any record —
+    /// a chainlock at a height ahead of the wallet's recorded history
+    /// still establishes the finality boundary for future late-arriving
+    /// blocks. Subscribers that persist `last_applied_chain_lock` (so
+    /// they can reconstruct chainlock-derived state across restarts —
+    /// e.g. a platform-wallet bridge that builds a
+    /// `ChainAssetLockProof` for an `InBlock` asset-lock TX from the
+    /// persisted chainlock) must therefore listen to this event even
+    /// when `locked_transactions` is empty.
+    ///
+    /// Transactions born directly in a chainlocked block (block at
+    /// height `<= last_applied_chain_lock.block_height` at processing
+    /// time) are surfaced via [`WalletEvent::BlockProcessed`] with
+    /// `chain_lock = Some(..)` and their records already in
+    /// `InChainLockedBlock` context. They do not appear here, since no
+    /// promotion took place.
+    ///
+    /// Carries the full `ChainLock` (signing proof: `block_height`,
+    /// `block_hash`, `signature`) so consumers can persist the proof
+    /// alongside the height.
+    ChainLockProcessed {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// The chainlock that drove this advance. Carries the signing
+        /// proof (`block_height`, `block_hash`, `signature`) so
+        /// consumers can persist it alongside any promotions. The
+        /// wallet's `last_applied_chain_lock` has been advanced to this
+        /// chainlock (clamped forward by height).
+        chain_lock: ChainLock,
+        /// Per-account net-new finalized txids: records that flipped
+        /// from `InBlock` to `InChainLockedBlock` in this promotion.
+        /// Accounts with no net-new promotions are omitted; the map is
+        /// empty when the chainlock advanced the metadata without
+        /// promoting any record. No balance is carried because a
+        /// chainlock does not change UTXO state (only the certainty of
+        /// the parent transaction).
+        locked_transactions: BTreeMap<AccountType, Vec<Txid>>,
+    },
+    /// The wallet was rolled back to `fork_height` after a chain reorg.
+    /// Fires once per wallet whose state actually changed (records
+    /// demoted, or `last_processed_height` rolled back). Carries the
+    /// partitioned demoted-vs-conflicted txid lists plus the wallet's
+    /// post-rewind balance so consumers can persist the new state
+    /// atomically.
+    Reorg {
+        /// ID of the affected wallet.
+        wallet_id: WalletId,
+        /// Common-ancestor height in the active chain that the wallet
+        /// was rolled back to.
+        fork_height: CoreBlockHeight,
+        /// Records demoted to an active-but-unconfirmed context
+        /// (`Mempool` or retained `InstantSend`). Empty when the
+        /// reorg rolled `last_processed_height` back over a height
+        /// range that contained no wallet records.
+        demoted_txids: Vec<Txid>,
+        /// Records demoted to a terminal inactive context
+        /// (`Conflicted` / `Abandoned`). Currently always empty;
+        /// self-conflict detection is deferred to a follow-up.
+        conflicted_txids: Vec<Txid>,
+        /// Wallet balance after the rewind. UTXO state was rebuilt
+        /// from the surviving records before this value was computed.
+        balance: WalletCoreBalance,
+    },
+    /// An outgoing transaction has been demoted by reorg and the SPV
+    /// rebroadcast loop has given up after the per-tx retry cap. The
+    /// transaction is not in any mempool and will not be rebroadcast
+    /// further until the user intervenes. Surface this in the UI so
+    /// the user can decide whether to abandon, re-sign, or wait.
+    TxRepeatedlyOrphaned {
+        /// ID of the affected wallet (looked up at emit time, may be
+        /// `None` when the rebroadcaster could not attribute the
+        /// txid to any managed wallet).
+        wallet_id: Option<WalletId>,
+        /// The transaction that exhausted its retry budget.
+        txid: Txid,
+    },
 }
 
 impl WalletEvent {
-    /// ID of the wallet this event pertains to.
-    pub fn wallet_id(&self) -> WalletId {
+    /// ID of the wallet this event pertains to. Returns `None` for events
+    /// that may not be tied to a specific wallet (e.g.
+    /// [`WalletEvent::TxRepeatedlyOrphaned`] emitted by the SPV
+    /// rebroadcast loop when the txid was not attributable).
+    pub fn wallet_id(&self) -> Option<WalletId> {
         match self {
             WalletEvent::TransactionDetected {
                 wallet_id,
@@ -285,12 +384,25 @@ impl WalletEvent {
             | WalletEvent::SyncHeightAdvanced {
                 wallet_id,
                 ..
+            }
+            | WalletEvent::ChainLockProcessed {
+                wallet_id,
+                ..
+            }
+            | WalletEvent::Reorg {
+                wallet_id,
+                ..
+            } => Some(*wallet_id),
+            WalletEvent::TxRepeatedlyOrphaned {
+                wallet_id,
+                ..
             } => *wallet_id,
         }
     }
+}
 
-    /// Short description for logging.
-    pub fn description(&self) -> String {
+impl fmt::Display for WalletEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WalletEvent::TransactionDetected {
                 record,
@@ -298,31 +410,30 @@ impl WalletEvent {
                 account_balances,
                 addresses_derived,
                 ..
-            } => {
-                format!(
-                    "TransactionDetected(txid={}, context={}, balance={}, account_balances={}, derived={})",
-                    record.txid,
-                    record.context,
-                    balance,
-                    format_account_balances(account_balances),
-                    addresses_derived.len(),
-                )
-            }
+            } => write!(
+                f,
+                "TransactionDetected(txid={}, context={}, balance={}, account_balances={}, derived={})",
+                record.txid,
+                record.context,
+                balance,
+                format_account_balances(account_balances),
+                addresses_derived.len(),
+            ),
             WalletEvent::TransactionInstantLocked {
                 txid,
                 balance,
                 account_balances,
                 ..
-            } => {
-                format!(
-                    "TransactionInstantLocked(txid={}, balance={}, account_balances={})",
-                    txid,
-                    balance,
-                    format_account_balances(account_balances),
-                )
-            }
+            } => write!(
+                f,
+                "TransactionInstantLocked(txid={}, balance={}, account_balances={})",
+                txid,
+                balance,
+                format_account_balances(account_balances),
+            ),
             WalletEvent::BlockProcessed {
                 height,
+                chain_lock,
                 inserted,
                 updated,
                 matured,
@@ -330,24 +441,57 @@ impl WalletEvent {
                 account_balances,
                 addresses_derived,
                 ..
-            } => {
-                format!(
-                    "BlockProcessed(height={}, inserted={}, updated={}, matured={}, balance={}, account_balances={}, derived={})",
-                    height,
-                    inserted.len(),
-                    updated.len(),
-                    matured.len(),
-                    balance,
-                    format_account_balances(account_balances),
-                    addresses_derived.len(),
-                )
-            }
+            } => write!(
+                f,
+                "BlockProcessed(height={}, chainlocked={}, inserted={}, updated={}, matured={}, balance={}, account_balances={}, derived={})",
+                height,
+                    chain_lock.is_some(),
+                inserted.len(),
+                updated.len(),
+                matured.len(),
+                balance,
+                format_account_balances(account_balances),
+                addresses_derived.len(),
+            ),
             WalletEvent::SyncHeightAdvanced {
                 height,
                 ..
             } => {
-                format!("SyncHeightAdvanced(height={})", height)
+                write!(f, "SyncHeightAdvanced(height={})", height)
             }
+            WalletEvent::ChainLockProcessed {
+                chain_lock,
+                locked_transactions,
+                ..
+            } => {
+                let total_txids: usize =
+                    locked_transactions.values().map(|v| v.len()).sum();
+                write!(
+                    f,
+                    "ChainLockProcessed(chainlock_height={}, accounts={}, finalized_txids={})",
+                    chain_lock.block_height,
+                    locked_transactions.len(),
+                    total_txids,
+                )
+            }
+            WalletEvent::Reorg {
+                fork_height,
+                demoted_txids,
+                conflicted_txids,
+                balance,
+                ..
+            } => write!(
+                f,
+                "Reorg(fork_height={}, demoted={}, conflicted={}, balance={})",
+                fork_height,
+                demoted_txids.len(),
+                conflicted_txids.len(),
+                balance,
+            ),
+            WalletEvent::TxRepeatedlyOrphaned {
+                txid,
+                ..
+            } => write!(f, "TxRepeatedlyOrphaned(txid={})", txid),
         }
     }
 }
@@ -360,30 +504,34 @@ mod project_derived_addresses_tests {
     use key_wallet::managed_account::address_pool::AddressInfo;
     use std::collections::BTreeMap;
 
-    /// Compressed encoding of the secp256k1 generator point — a known
-    /// on-curve 33-byte value `dashcore::PublicKey::from_slice` accepts.
-    /// Tests don't care which key it is; they care that projection
-    /// preserves the bytes round-trip.
+    /// Compressed encoding of the secp256k1 generator point (G).
     const TEST_PUBKEY_G: [u8; 33] = [
         0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
         0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
         0xf8, 0x17, 0x98,
     ];
 
+    /// Compressed encoding of 2G. A second well-known on-curve point,
+    /// used to distinguish two `DerivedAddressInfo` entries when testing
+    /// dedup behavior. The point must be on-curve so the projection's
+    /// `PublicKey::from_slice` parse succeeds.
+    const TEST_PUBKEY_2G: [u8; 33] = [
+        0x02, 0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45, 0x40, 0x6e, 0x95, 0xc0,
+        0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b, 0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c,
+        0x70, 0x9e, 0xe5,
+    ];
+
     /// Build a stub `DerivedAddressInfo` for unit-testing the projection
-    /// without spinning up a wallet. `tag` differentiates the
-    /// `public_key` so "first-seen wins" can be observed across
-    /// duplicates; pass `None` to use the default valid key.
+    /// without spinning up a wallet. `alt_key` toggles between G and 2G
+    /// so "first-seen wins" can be observed across duplicates.
     fn make_derived(
         account_type: AccountType,
         pool_type: AddressPoolType,
         index: u32,
-        tag: Option<u8>,
+        alt_key: bool,
     ) -> DerivedAddressInfo {
-        // Take a real compressed pubkey and tweak only the `public_key`
-        // bytes via `tag` (which the projection passes through verbatim).
-        // We don't actually re-derive the address from the tagged bytes —
-        // tests don't depend on address↔pubkey consistency, only on
+        // Always derive the address from `G` regardless of `alt_key`.
+        // Tests don't depend on address↔pubkey consistency, only on
         // dedup keys and pubkey round-trip.
         let pubkey =
             dashcore::PublicKey::from_slice(&TEST_PUBKEY_G).expect("generator point is valid");
@@ -393,12 +541,11 @@ mod project_derived_addresses_tests {
             ChildNumber::from_normal_idx(0).unwrap(),
             ChildNumber::from_normal_idx(index).unwrap(),
         ]);
-        let mut pubkey_bytes = TEST_PUBKEY_G.to_vec();
-        if let Some(t) = tag {
-            // Tag a non-prefix byte so `[u8; 33]` round-trip is observable
-            // without affecting the leading `0x02` compressed marker.
-            pubkey_bytes[32] = t;
-        }
+        let pubkey_bytes = if alt_key {
+            TEST_PUBKEY_2G.to_vec()
+        } else {
+            TEST_PUBKEY_G.to_vec()
+        };
         DerivedAddressInfo {
             account_type,
             pool_type,
@@ -436,21 +583,16 @@ mod project_derived_addresses_tests {
     #[test]
     fn project_dedups_overlapping_keys() {
         let acct = standard_account_0();
-        let first = make_derived(acct, AddressPoolType::External, 5, Some(0xaa));
-        let first_bytes = match first.info.public_key.as_ref().expect("ECDSA pubkey") {
-            PublicKeyType::ECDSA(b) => b.clone(),
-            _ => unreachable!(),
-        };
-        let second = make_derived(acct, AddressPoolType::External, 5, Some(0xbb));
+        let first = make_derived(acct, AddressPoolType::External, 5, false);
+        let second = make_derived(acct, AddressPoolType::External, 5, true);
 
         let projected = project_derived_addresses(vec![first, second]);
         assert_eq!(projected.len(), 1, "duplicate (account, pool, index) must dedup to one entry");
         assert_eq!(projected[0].account_type, acct);
         assert_eq!(projected[0].pool_type, AddressPoolType::External);
         assert_eq!(projected[0].derivation_index, 5);
-        // First-seen wins: surviving pubkey matches `first`, not `second`.
-        assert_eq!(&projected[0].public_key[..], first_bytes.as_slice());
-        assert_eq!(projected[0].public_key[32], 0xaa);
+        let expected = PublicKey::from_slice(&TEST_PUBKEY_G).expect("G is valid");
+        assert_eq!(projected[0].public_key, expected);
     }
 
     /// Different indices on the same pool must NOT dedup.
@@ -458,9 +600,9 @@ mod project_derived_addresses_tests {
     fn project_keeps_distinct_indices_on_same_pool() {
         let acct = standard_account_0();
         let infos = vec![
-            make_derived(acct, AddressPoolType::External, 5, None),
-            make_derived(acct, AddressPoolType::External, 6, None),
-            make_derived(acct, AddressPoolType::External, 7, None),
+            make_derived(acct, AddressPoolType::External, 5, false),
+            make_derived(acct, AddressPoolType::External, 6, false),
+            make_derived(acct, AddressPoolType::External, 7, false),
         ];
         let projected = project_derived_addresses(infos);
         assert_eq!(projected.len(), 3);
@@ -475,8 +617,8 @@ mod project_derived_addresses_tests {
     fn project_keeps_same_index_across_different_pools() {
         let acct = standard_account_0();
         let projected = project_derived_addresses(vec![
-            make_derived(acct, AddressPoolType::External, 5, None),
-            make_derived(acct, AddressPoolType::Internal, 5, None),
+            make_derived(acct, AddressPoolType::External, 5, false),
+            make_derived(acct, AddressPoolType::Internal, 5, false),
         ]);
         assert_eq!(projected.len(), 2);
         let pools: std::collections::BTreeSet<AddressPoolType> =
@@ -490,8 +632,18 @@ mod project_derived_addresses_tests {
     /// length 0 is the contract — no panic.
     #[test]
     fn project_drops_entry_with_missing_pubkey() {
-        let mut info = make_derived(standard_account_0(), AddressPoolType::External, 5, None);
+        let mut info = make_derived(standard_account_0(), AddressPoolType::External, 5, false);
         info.info.public_key = None;
+        let projected = project_derived_addresses(vec![info]);
+        assert!(projected.is_empty());
+    }
+
+    /// 33 bytes that don't parse as a valid compressed secp256k1 point
+    /// must drop rather than panic.
+    #[test]
+    fn project_drops_entry_with_invalid_curve_point() {
+        let mut info = make_derived(standard_account_0(), AddressPoolType::External, 5, false);
+        info.info.public_key = Some(PublicKeyType::ECDSA(vec![0xff; 33]));
         let projected = project_derived_addresses(vec![info]);
         assert!(projected.is_empty());
     }

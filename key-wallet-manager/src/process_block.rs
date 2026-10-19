@@ -1,14 +1,18 @@
 use crate::events::{diff_account_balances, project_derived_addresses, DerivedAddress};
-use crate::wallet_interface::{BlockProcessingResult, MempoolTransactionResult, WalletInterface};
+use crate::wallet_interface::{
+    BlockProcessingResult, MempoolTransactionResult, RewindError, RewindResult, WalletInterface,
+};
 use crate::{WalletEvent, WalletId, WalletManager};
 use async_trait::async_trait;
 use core::fmt::Write as _;
+use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
 use dashcore::{Address, Block, Transaction};
 use key_wallet::account::AccountType;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::{BlockInfo, DerivedAddressInfo, TransactionContext};
+use key_wallet::wallet::managed_wallet_info::wallet_info_interface::RewindRejection;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
 use key_wallet::WalletCoreBalance;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,14 +32,37 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         }
         let info = BlockInfo::new(height, block.block_hash(), block.header.time);
 
+        // Late-block: when every wallet in scope already has its
+        // finality boundary at or above this height, the block is
+        // born chainlocked from each wallet's perspective. Record the
+        // tx directly with `InChainLockedBlock` so the inserted
+        // `TransactionRecord` carries the right context, the
+        // `BlockProcessed` event then surfaces this with
+        // `chain_lock: Some(..)`, and no follow-up
+        // `TransactionsChainlocked` event is needed for these txs.
+        //
+        // Heterogeneous boundaries (e.g. a wallet added mid-flight at
+        // a stale boundary) fall back to `InBlock` for the whole
+        // call; the lagging wallet is brought current by the next
+        // chainlock that arrives.
+        let all_chainlocked = !wallets.is_empty()
+            && wallets.iter().filter_map(|wid| self.wallet_infos.get(wid)).all(|info| {
+                info.last_applied_chain_lock().is_some_and(|cl| height <= cl.block_height)
+            });
+        let block_context = if all_chainlocked {
+            TransactionContext::InChainLockedBlock(info)
+        } else {
+            TransactionContext::InBlock(info)
+        };
+
         let mut per_wallet_inserted: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
         let mut per_wallet_updated: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
         let mut per_wallet_derived: BTreeMap<WalletId, Vec<DerivedAddressInfo>> = BTreeMap::new();
 
         for tx in &block.txdata {
-            let context = TransactionContext::InBlock(info);
-            let check_result =
-                self.check_transaction_in_wallets(tx, context, wallets, true, false).await;
+            let check_result = self
+                .check_transaction_in_wallets(tx, block_context.clone(), wallets, true, false)
+                .await;
 
             if !check_result.affected_wallets.is_empty() {
                 if check_result.is_new_transaction {
@@ -263,8 +290,113 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         );
     }
 
+    async fn clamp_heights_to(&mut self, tip: CoreBlockHeight) {
+        for info in self.wallet_infos.values_mut() {
+            let current_last = info.last_processed_height();
+            if current_last > tip {
+                info.update_last_processed_height(tip);
+            }
+            let current_synced = info.synced_height();
+            if current_synced > tip {
+                info.update_synced_height(tip);
+            }
+        }
+    }
+
+    async fn rewind_to_height(
+        &mut self,
+        height: CoreBlockHeight,
+    ) -> Result<RewindResult, RewindError> {
+        for (wallet_id, info) in self.wallet_infos.iter() {
+            if let Some(cl) = info.last_applied_chain_lock() {
+                if height < cl.block_height {
+                    tracing::warn!(
+                        wallet_id = ?wallet_id,
+                        requested = height,
+                        floor = cl.block_height,
+                        "refusing rewind: requested height crosses chainlock floor",
+                    );
+                    return Err(RewindError::BelowChainLockFloor {
+                        requested: height,
+                        floor: cl.block_height,
+                        wallet_id: *wallet_id,
+                    });
+                }
+            }
+        }
+
+        let mut aggregated = RewindResult::default();
+        let wallet_ids: Vec<WalletId> = self.wallet_infos.keys().copied().collect();
+        for wallet_id in wallet_ids {
+            let Some(info) = self.wallet_infos.get_mut(&wallet_id) else {
+                continue;
+            };
+            let outcome = match info.rewind_to_height(height) {
+                Ok(o) => o,
+                Err(RewindRejection::BelowChainLockFloor {
+                    requested,
+                    floor,
+                }) => {
+                    return Err(RewindError::BelowChainLockFloor {
+                        requested,
+                        floor,
+                        wallet_id,
+                    });
+                }
+            };
+
+            if !outcome.state_changed {
+                continue;
+            }
+
+            aggregated.demoted_txids.extend(outcome.demoted_txids.iter().copied());
+            aggregated.conflicted_txids.extend(outcome.conflicted_txids.iter().copied());
+
+            let balance = info.balance();
+            let event = WalletEvent::Reorg {
+                wallet_id,
+                fork_height: height,
+                demoted_txids: outcome.demoted_txids,
+                conflicted_txids: outcome.conflicted_txids,
+                balance,
+            };
+            let _ = self.event_sender.send(event);
+        }
+        Ok(aggregated)
+    }
+
+    async fn get_transaction(&self, txid: &dashcore::Txid) -> Option<Transaction> {
+        for info in self.wallet_infos.values() {
+            for account in info.accounts().all_accounts() {
+                if let Some(record) = account.transactions().get(txid) {
+                    return Some(record.transaction.clone());
+                }
+            }
+        }
+        None
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<WalletEvent> {
         self.event_sender.subscribe()
+    }
+
+    fn apply_chain_lock(&mut self, chain_lock: ChainLock) {
+        for (wallet_id, info) in self.wallet_infos.iter_mut() {
+            let outcome = info.apply_chain_lock(chain_lock.clone());
+
+            // Emit a single atomic `ChainLockProcessed` whenever the
+            // wallet's `last_applied_chain_lock` advanced — carrying any
+            // net-new promotions (possibly empty when the advance
+            // promoted nothing). Replays of the same chainlock (no
+            // metadata advance) are silent.
+            if outcome.metadata_advanced {
+                let _ = self.event_sender.send(WalletEvent::ChainLockProcessed {
+                    wallet_id: *wallet_id,
+                    chain_lock: chain_lock.clone(),
+                    locked_transactions: outcome.locked_transactions,
+                });
+            }
+        }
     }
 
     fn process_instant_send_lock(&mut self, instant_lock: InstantLock) {
@@ -416,6 +548,8 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
             let derived_for_wallet = per_wallet_derived.remove(wallet_id).unwrap_or_default();
             let addresses_derived: Vec<DerivedAddress> =
                 project_derived_addresses(derived_for_wallet);
+            let chain_lock =
+                info.last_applied_chain_lock().filter(|cl| height <= cl.block_height).cloned();
 
             if !inserted.is_empty()
                 || !updated.is_empty()
@@ -426,6 +560,7 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletManager<T> {
                 let event = WalletEvent::BlockProcessed {
                     wallet_id: *wallet_id,
                     height,
+                    chain_lock,
                     inserted,
                     updated,
                     matured,
@@ -560,6 +695,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clamp_heights_to_lowers_above_tip_metadata() {
+        let (mut manager, wallet_id, _) = setup_manager_with_wallet();
+
+        manager.update_wallet_synced_height(&wallet_id, 500);
+        manager.update_wallet_last_processed_height(&wallet_id, 600);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 500);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 600);
+
+        manager.clamp_heights_to(450).await;
+
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().synced_height(),
+            450,
+            "synced_height above tip must be clamped down"
+        );
+        assert_eq!(
+            manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(),
+            450,
+            "last_processed_height above tip must be clamped down"
+        );
+
+        // Clamping to a tip above both is a no-op.
+        manager.clamp_heights_to(10_000).await;
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().synced_height(), 450);
+        assert_eq!(manager.get_wallet_info(&wallet_id).unwrap().last_processed_height(), 450);
+    }
+
+    #[tokio::test]
     async fn test_update_wallet_synced_height_emits_sync_height_advanced() {
         let (mut manager, wallet_id, _addr) = setup_manager_with_wallet();
         let mut rx = manager.subscribe_events();
@@ -588,7 +751,6 @@ mod tests {
         let wallet_id2 = manager
             .create_wallet_from_mnemonic(
                 &mnemonic2.to_string(),
-                "",
                 0,
                 WalletAccountCreationOptions::Default,
             )
@@ -656,12 +818,7 @@ mod tests {
 
         // create_wallet_from_mnemonic bumps
         let wallet_id = manager
-            .create_wallet_from_mnemonic(
-                TEST_MNEMONIC,
-                "",
-                0,
-                WalletAccountCreationOptions::Default,
-            )
+            .create_wallet_from_mnemonic(TEST_MNEMONIC, 0, WalletAccountCreationOptions::Default)
             .unwrap();
         expected_rev += 1;
         assert_eq!(manager.monitor_revision(), expected_rev, "after create_wallet_from_mnemonic");

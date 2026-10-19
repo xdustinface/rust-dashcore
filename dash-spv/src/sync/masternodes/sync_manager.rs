@@ -225,7 +225,7 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
         &[MessageType::MnListDiff, MessageType::QRInfo]
     }
 
-    fn clear_in_flight_state(&mut self) {
+    fn on_disconnect(&mut self) {
         self.sync_state.clear_pending();
         self.sync_state.qrinfo_retry_count = 0;
         self.sync_state.last_processed_qrinfo_tip = None;
@@ -321,7 +321,7 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
 
                 // If no pending requests, complete
                 if !self.sync_state.has_pending_requests() {
-                    return self.complete_pipeline().await;
+                    return self.complete_pipeline(requests).await;
                 }
             }
 
@@ -399,7 +399,7 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                         return Ok(vec![]);
                     }
                     tracing::info!("All MnListDiff responses received");
-                    return self.complete_pipeline().await;
+                    return self.complete_pipeline(requests).await;
                 }
             }
 
@@ -414,6 +414,20 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
         event: &SyncEvent,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        if let SyncEvent::ChainReorg {
+            fork_height,
+            new_tip,
+            ..
+        } = event
+        {
+            tracing::info!(
+                fork_height,
+                new_tip = %new_tip,
+                "MasternodesManager: cascading ChainReorg, rewinding engine"
+            );
+            return self.rewind_to_height(*fork_height, *new_tip, requests).await;
+        }
+
         // Track block header tip height as headers come in
         if let SyncEvent::BlockHeadersStored {
             tip_height,
@@ -615,7 +629,7 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
                         MAX_RETRY_ATTEMPTS
                     );
                     self.sync_state.clear_pending();
-                    return self.complete_pipeline().await;
+                    return self.complete_pipeline(requests).await;
                 }
             }
             return Ok(vec![]);
@@ -631,7 +645,7 @@ impl<H: BlockHeaderStorage> SyncManager for MasternodesManager<H> {
             // Check if complete after handling timeouts
             if self.sync_state.mnlistdiff_pipeline.is_complete() {
                 tracing::info!("MnListDiff pipeline complete");
-                return self.complete_pipeline().await;
+                return self.complete_pipeline(requests).await;
             }
         }
 
@@ -709,6 +723,10 @@ mod tests {
         }
         async fn get_header_height_by_hash(&self, hash: &BlockHash) -> StorageResult<Option<u32>> {
             Ok(self.0.get(hash).copied())
+        }
+        async fn truncate_above(&mut self, target_height: u32) -> StorageResult<()> {
+            self.0.retain(|_, h| *h <= target_height);
+            Ok(())
         }
     }
 

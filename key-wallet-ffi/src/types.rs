@@ -86,6 +86,7 @@ pub(crate) fn transaction_context_from_ffi(
             }
             Some(TransactionContext::InChainLockedBlock(block_info.to_block_info()))
         }
+        FFITransactionContextType::Conflicted | FFITransactionContextType::Abandoned => None,
     }
 }
 
@@ -684,6 +685,12 @@ pub enum FFITransactionContextType {
     InBlock = 2,
     /// Transaction is in a chain-locked block at the given height
     InChainLockedBlock = 3,
+    /// Transaction was reorganized out and is superseded by a conflicting
+    /// transaction. The previous context is not surfaced across the FFI
+    /// boundary.
+    Conflicted = 4,
+    /// Transaction was reorganized out and is not expected to confirm again.
+    Abandoned = 5,
 }
 
 impl From<TransactionContext> for FFITransactionContextType {
@@ -695,6 +702,10 @@ impl From<TransactionContext> for FFITransactionContextType {
             TransactionContext::InChainLockedBlock(_) => {
                 FFITransactionContextType::InChainLockedBlock
             }
+            TransactionContext::Conflicted {
+                ..
+            } => FFITransactionContextType::Conflicted,
+            TransactionContext::Abandoned => FFITransactionContextType::Abandoned,
         }
     }
 }
@@ -1153,6 +1164,48 @@ mod tests {
         assert!(matches!(
             FFITransactionType::from(TransactionType::Ignored),
             FFITransactionType::Ignored
+        ));
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_conflicted_returns_none() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::Conflicted,
+            &FFIBlockInfo::empty(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn transaction_context_from_ffi_abandoned_returns_none() {
+        let result = transaction_context_from_ffi(
+            FFITransactionContextType::Abandoned,
+            &FFIBlockInfo::empty(),
+            ptr::null(),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_ffi_transaction_context_type_from_conflicted() {
+        let ctx = TransactionContext::Conflicted {
+            previous: Box::new(TransactionContext::Mempool),
+        };
+        assert!(matches!(
+            FFITransactionContextType::from(ctx),
+            FFITransactionContextType::Conflicted
+        ));
+    }
+
+    #[test]
+    fn test_ffi_transaction_context_type_from_abandoned() {
+        let ctx = TransactionContext::Abandoned;
+        assert!(matches!(
+            FFITransactionContextType::from(ctx),
+            FFITransactionContextType::Abandoned
         ));
     }
 
