@@ -18,12 +18,12 @@ on:
 permissions:
   contents: read
 
-# Pinned nightly: nightly-2026-07-14 (rustc daf2e5e18) ICEs while expanding the
-# libtest harness for dash-spv-ffi ("attribute is missing tokens:
-# rustc_test_entrypoint_marker" in rustc_ast/src/attr/mod.rs). Bump or restore
-# the floating `nightly` once a fixed nightly ships.
+# Pinned so a nightly regression cannot break the job unannounced. Keep it
+# recent: a dependency that builds on stable can still fail on an old nightly,
+# e.g. nightly-2026-07-13 has a builtin `unroll` attribute that makes
+# `dash-pow`'s `unroll!` macro ambiguous.
 env:
-  SANITIZER_TOOLCHAIN: nightly-2026-07-13
+  SANITIZER_TOOLCHAIN: nightly-2026-10-26
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
