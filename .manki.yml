@@ -16,3 +16,22 @@ instructions: |
   - Proper error handling — prefer Result over unwrap/expect in library code
   - DIP (Dash Improvement Proposal) compliance for protocol changes
   - Memory safety in hash/crypto implementations
+
+# Read from the base branch only, so a PR cannot weaken its own review.
+review:
+  classes:
+    security:
+      match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**"] }
+    consensus:
+      rank: 85
+      match: { paths_any: ["dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"] }
+    ffi:
+      rank: 84
+      match: { paths_any: ["dash-spv-ffi/**", "key-wallet-ffi/**", "ffi-c-tests/**"] }
+  routing:
+    consensus: pair
+    ffi: pair
+
+static_analysis:
+  analyzers:
+    secrets: true
