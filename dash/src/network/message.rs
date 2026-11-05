@@ -40,9 +40,13 @@ use crate::{ChainLock, InstantLock};
 /// This limit is not currently enforced by this implementation.
 pub const MAX_INV_SIZE: usize = 50_000;
 
-/// Maximum size, in bytes, of an encoded message
-/// This by necessity should be larger than `MAX_VEC_SIZE`
-pub const MAX_MSG_SIZE: usize = 5_000_000;
+/// Maximum size, in bytes, of a message payload: Dash Core's `MAX_PROTOCOL_MESSAGE_LENGTH`
+/// (`src/net.h:80`, 7c7e91a4e40), 3 MiB, checked against the header's length field
+/// (`src/net.cpp:754`).
+pub const MAX_MSG_SIZE: usize = 3 * 1024 * 1024;
+
+/// Size of a message header: magic, command, payload length and checksum.
+const MESSAGE_HEADER_SIZE: usize = 24;
 
 /// Serializer for command string
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -805,7 +809,7 @@ impl Decodable for HeaderDeserializationWrapper {
     fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
         r: &mut R,
     ) -> Result<Self, encode::Error> {
-        let len = VarInt::consensus_decode(r)?.0;
+        let len = encode::read_compact_size_len(r)?;
         // Core never sends more and treats more as misbehaviour
         if len > MAX_HEADERS_RESULTS as u64 {
             return Err(encode::Error::ParseFailed("headers message has too many headers"));
@@ -834,7 +838,7 @@ impl Decodable for RawNetworkMessage {
     ) -> Result<Self, encode::Error> {
         let magic = Decodable::consensus_decode_from_finite_reader(r)?;
         let cmd = CommandString::consensus_decode_from_finite_reader(r)?;
-        let raw_payload = match CheckedData::consensus_decode_from_finite_reader(r) {
+        let raw_payload = match CheckedData::decode_limited(r, MAX_MSG_SIZE) {
             Ok(cd) => cd.0,
             Err(encode::Error::InvalidChecksum {
                 expected,
@@ -865,7 +869,9 @@ impl Decodable for RawNetworkMessage {
 
     #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-        Self::consensus_decode_from_finite_reader(r.take(MAX_MSG_SIZE as u64).by_ref())
+        Self::consensus_decode_from_finite_reader(
+            r.take((MESSAGE_HEADER_SIZE + MAX_MSG_SIZE) as u64).by_ref(),
+        )
     }
 }
 
@@ -883,11 +889,9 @@ impl tokio_util::codec::Decoder for RawNetworkMessageCodec {
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use bytes::Buf as _;
 
-        /// `magic(4) + command(12) + payload_length(4) + checksum(4)`.
-        const HEADER_LEN: usize = 24;
         const LENGTH_OFFSET: usize = 16;
 
-        if src.len() < HEADER_LEN {
+        if src.len() < MESSAGE_HEADER_SIZE {
             return Ok(None);
         }
 
@@ -907,7 +911,7 @@ impl tokio_util::codec::Decoder for RawNetworkMessageCodec {
             .into());
         }
 
-        let frame_len = HEADER_LEN + payload_len;
+        let frame_len = MESSAGE_HEADER_SIZE + payload_len;
         if src.len() < frame_len {
             src.reserve(frame_len - src.len());
             return Ok(None);
@@ -991,6 +995,30 @@ mod codec_tests {
                 assert!(partial.is_empty());
             }
         }
+    }
+
+    /// A header announcing more than Core's `MAX_PROTOCOL_MESSAGE_LENGTH` (3 MiB) is refused
+    /// before anything is reserved for its payload; a header at the limit waits for its payload.
+    #[test]
+    fn a_payload_over_the_protocol_limit_is_refused_at_the_header() {
+        const MAX_PROTOCOL_MESSAGE_LENGTH: usize = 3 * 1024 * 1024;
+
+        let header = |len: usize| {
+            let mut b = BytesMut::new();
+            b.extend_from_slice(&0xBD6B_0CBFu32.to_le_bytes());
+            b.extend_from_slice(b"inv\0\0\0\0\0\0\0\0\0");
+            b.extend_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+            b.extend_from_slice(&[0; 4]);
+            b
+        };
+        let mut codec = RawNetworkMessageCodec;
+
+        let mut at_limit = header(MAX_PROTOCOL_MESSAGE_LENGTH);
+        assert!(codec.decode(&mut at_limit).unwrap().is_none());
+
+        let mut over = header(MAX_PROTOCOL_MESSAGE_LENGTH + 1);
+        assert!(codec.decode(&mut over).is_err());
+        assert!(over.capacity() < MAX_PROTOCOL_MESSAGE_LENGTH, "nothing reserved");
     }
 }
 
@@ -1432,6 +1460,97 @@ mod test {
         };
         let decoded = deserialize::<RawNetworkMessage>(&serialize(&msg));
         assert_eq!(decoded.ok(), decodes.then_some(msg));
+    }
+
+    #[test]
+    fn headers_count_is_read_with_the_core_range() {
+        // Core reads the count with `ReadCompactSize`, whose range check comes before the batch
+        // limit.
+        let payload = serialize(&VarInt(crate::consensus::encode::MAX_COMPACT_SIZE + 1));
+        let err =
+            HeaderDeserializationWrapper::consensus_decode_from_finite_reader(&mut &payload[..])
+                .err()
+                .unwrap();
+        assert!(matches!(err, encode::Error::OversizedVectorAllocation { .. }), "{err:?}");
+
+        // `MAX_SIZE` itself passes the range check and is refused by the batch limit.
+        let payload = serialize(&VarInt(crate::consensus::encode::MAX_COMPACT_SIZE));
+        let err =
+            HeaderDeserializationWrapper::consensus_decode_from_finite_reader(&mut &payload[..])
+                .err()
+                .unwrap();
+        assert!(matches!(err, encode::Error::ParseFailed(_)), "{err:?}");
+    }
+
+    /// A message with `len` announced payload bytes, `payload` of which follow.
+    fn message_bytes(command: &str, len: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = 0xBD6B0CBFu32.to_le_bytes().to_vec();
+        let mut cmd = [0u8; 12];
+        cmd[..command.len()].copy_from_slice(command.as_bytes());
+        bytes.extend_from_slice(&cmd);
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&Hash::hash(payload).to_byte_array()[..4]);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn unknown_payload_len(msg: RawNetworkMessage) -> usize {
+        match msg.payload {
+            NetworkMessage::Unknown {
+                payload,
+                ..
+            } => payload.len(),
+            other => panic!("expected an unknown message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_payload_above_the_limit_is_refused_at_the_header() {
+        // The header announces one byte too many and nothing follows: the error is the size,
+        // not a short read.
+        let header_only = message_bytes("foo", MAX_MSG_SIZE as u32 + 1, &[]);
+        assert_eq!(header_only.len(), MESSAGE_HEADER_SIZE);
+        match deserialize::<RawNetworkMessage>(&header_only) {
+            Err(encode::Error::OversizedVectorAllocation {
+                requested,
+                max,
+            }) => assert_eq!((requested, max), (MAX_MSG_SIZE + 1, MAX_MSG_SIZE)),
+            other => panic!("expected the size error, got {other:?}"),
+        }
+
+        // A payload of exactly the limit is read.
+        let payload = vec![0xa5u8; MAX_MSG_SIZE];
+        let bytes = message_bytes("foo", payload.len() as u32, &payload);
+        let msg: RawNetworkMessage = deserialize(&bytes).unwrap();
+        assert_eq!(unknown_payload_len(msg), MAX_MSG_SIZE);
+
+        // One byte more, even with the whole payload present, is refused.
+        let payload = vec![0xa5u8; MAX_MSG_SIZE + 1];
+        let bytes = message_bytes("foo", payload.len() as u32, &payload);
+        assert!(matches!(
+            deserialize::<RawNetworkMessage>(&bytes),
+            Err(encode::Error::OversizedVectorAllocation { .. })
+        ));
+    }
+
+    #[test]
+    fn a_streamed_message_of_exactly_the_limit_is_read() {
+        // The streaming read is bounded at the header plus the payload limit.
+        let payload = vec![0x5au8; MAX_MSG_SIZE];
+        let mut bytes = message_bytes("foo", payload.len() as u32, &payload);
+        bytes.extend_from_slice(b"next");
+        let mut cursor = io::Cursor::new(bytes);
+        let msg = RawNetworkMessage::consensus_decode(&mut cursor).unwrap();
+        assert_eq!(unknown_payload_len(msg), MAX_MSG_SIZE);
+        // What follows the message is left in the stream.
+        assert_eq!(cursor.position() as usize, MESSAGE_HEADER_SIZE + MAX_MSG_SIZE);
+
+        let payload = vec![0x5au8; MAX_MSG_SIZE + 1];
+        let bytes = message_bytes("foo", payload.len() as u32, &payload);
+        assert!(matches!(
+            RawNetworkMessage::consensus_decode(&mut io::Cursor::new(bytes)),
+            Err(encode::Error::OversizedVectorAllocation { .. })
+        ));
     }
 
     #[test]
