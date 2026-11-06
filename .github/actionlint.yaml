@@ -1,5 +1,0 @@
-paths:
-  .github/workflows/manki.yml:
-    ignore:
-      # `concurrency.queue` (GitHub, 2026-05-07) is newer than every actionlint release.
-      - 'unexpected key "queue" for "concurrency" section'
