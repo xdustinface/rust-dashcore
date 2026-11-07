@@ -8,6 +8,9 @@ exclude_paths:
   - "*.lock"
   - "fuzz/**"
 
+# Bot PRs get no automatic review. Read from the base branch only.
+skip_authors: ["dependabot[bot]", "github-actions[bot]"]
+
 instructions: |
   This is a Rust implementation of the Dash cryptocurrency protocol.
   Pay special attention to:
@@ -68,4 +71,4 @@ static_analysis:
 
 memory:
   enabled: true
-  repo: "manki-review/review-memory"
+  repo: "xdustinface/review-memory"
