@@ -7,6 +7,7 @@ use crate::sync::{
 use async_trait::async_trait;
 use dashcore::network::message::NetworkMessage;
 use key_wallet_manager::WalletInterface;
+use std::time::Instant;
 
 #[async_trait]
 impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
@@ -117,11 +118,13 @@ impl<W: WalletInterface + 'static> SyncManager for MempoolManager<W> {
             return Ok(vec![]);
         }
 
+        let now = Instant::now();
+
         // Prune expired transactions periodically
-        self.prune_expired(MEMPOOL_TX_EXPIRY);
+        self.prune_expired(MEMPOOL_TX_EXPIRY, now);
 
         // Prune pending requests that never received a response
-        self.prune_pending_requests();
+        self.prune_pending_requests(now);
 
         // Send queued getdata requests now that slots may have freed up
         self.send_queued(requests).await?;

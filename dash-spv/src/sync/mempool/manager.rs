@@ -327,6 +327,18 @@ impl<W: WalletInterface> MempoolManager<W> {
         peer: SocketAddr,
         requests: &RequestSender,
     ) -> SyncResult<Vec<SyncEvent>> {
+        self.handle_inv_at(inv, peer, requests, Instant::now()).await
+    }
+
+    /// `now`-injected variant of [`Self::handle_inv`], so tests can expire a
+    /// `seen_txids` entry without subtracting from `Instant::now()`.
+    async fn handle_inv_at(
+        &mut self,
+        inv: &[Inventory],
+        peer: SocketAddr,
+        requests: &RequestSender,
+        now: Instant,
+    ) -> SyncResult<Vec<SyncEvent>> {
         let mempool_full = self.transactions.len() >= self.max_transactions;
         if mempool_full {
             return Ok(vec![]);
@@ -340,7 +352,10 @@ impl<W: WalletInterface> MempoolManager<W> {
                 continue;
             };
 
-            if self.seen_txids.get(txid).is_some_and(|t| t.elapsed() < SEEN_TXID_EXPIRY)
+            if self
+                .seen_txids
+                .get(txid)
+                .is_some_and(|t| now.saturating_duration_since(*t) < SEEN_TXID_EXPIRY)
                 || self.pending_requests.contains_key(txid)
                 || self.is_queued(txid)
                 || self.transactions.contains_key(txid)
@@ -530,11 +545,11 @@ impl<W: WalletInterface> MempoolManager<W> {
         }
     }
 
-    /// Prune transactions and pending IS locks older than `timeout`.
-    pub(super) fn prune_expired(&mut self, timeout: Duration) {
+    /// Prune transactions and pending IS locks older than `timeout` at `now`.
+    pub(super) fn prune_expired(&mut self, timeout: Duration, now: Instant) {
         let mut expired_txids = Vec::new();
         self.transactions.retain(|txid, tx| {
-            if tx.is_expired(timeout) {
+            if tx.is_expired(timeout, now) {
                 expired_txids.push(*txid);
                 false
             } else {
@@ -543,7 +558,7 @@ impl<W: WalletInterface> MempoolManager<W> {
         });
 
         // Prune old recent sends
-        if let Some(cutoff) = Instant::now().checked_sub(timeout) {
+        if let Some(cutoff) = now.checked_sub(timeout) {
             self.recent_sends.retain(|_, &mut timestamp| timestamp > cutoff);
         }
 
@@ -558,7 +573,8 @@ impl<W: WalletInterface> MempoolManager<W> {
 
         // Prune pending IS locks whose transaction never arrived
         let before = self.pending_is_locks.len();
-        self.pending_is_locks.retain(|_, (_, inserted_at)| inserted_at.elapsed() < timeout);
+        self.pending_is_locks
+            .retain(|_, (_, inserted_at)| now.saturating_duration_since(*inserted_at) < timeout);
         let expired = before - self.pending_is_locks.len();
         if expired > 0 {
             tracing::debug!("Pruned {} expired pending IS locks", expired);
@@ -812,10 +828,10 @@ impl<W: WalletInterface> MempoolManager<W> {
 
     /// Remove pending requests that have timed out without receiving a response.
     /// Timed-out txids are re-queued to any connected peer for retry.
-    pub(super) fn prune_pending_requests(&mut self) {
+    pub(super) fn prune_pending_requests(&mut self, now: Instant) {
         let mut timed_out = Vec::new();
         self.pending_requests.retain(|txid, requested_at| {
-            if requested_at.elapsed() >= PENDING_REQUEST_TIMEOUT {
+            if now.saturating_duration_since(*requested_at) >= PENDING_REQUEST_TIMEOUT {
                 timed_out.push(*txid);
                 false
             } else {
@@ -1061,12 +1077,12 @@ mod tests {
         let fresh_txid = Txid::from_byte_array([1; 32]);
         let stale_txid = Txid::from_byte_array([2; 32]);
 
-        manager.pending_requests.insert(fresh_txid, Instant::now());
-        manager
-            .pending_requests
-            .insert(stale_txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
+        let stale_at = Instant::now();
+        let now = stale_at + PENDING_REQUEST_TIMEOUT + Duration::from_secs(1);
+        manager.pending_requests.insert(fresh_txid, now);
+        manager.pending_requests.insert(stale_txid, stale_at);
 
-        manager.prune_pending_requests();
+        manager.prune_pending_requests(now);
 
         assert!(manager.pending_requests.contains_key(&fresh_txid));
         assert!(!manager.pending_requests.contains_key(&stale_txid));
@@ -1135,11 +1151,7 @@ mod tests {
         let expired_txid = expired_tx.txid();
         let test_timeout = Duration::from_secs(2);
 
-        manager.transactions.insert(
-            fresh_txid,
-            UnconfirmedTransaction::new(fresh_tx, Amount::from_sat(0), false, false, Vec::new(), 0),
-        );
-        let mut expired_utx = UnconfirmedTransaction::new(
+        let expired_utx = UnconfirmedTransaction::new(
             expired_tx,
             Amount::from_sat(0),
             false,
@@ -1147,10 +1159,14 @@ mod tests {
             Vec::new(),
             0,
         );
-        expired_utx.first_seen = Instant::now() - test_timeout - Duration::from_secs(1);
+        let now = expired_utx.first_seen + test_timeout + Duration::from_secs(1);
         manager.transactions.insert(expired_txid, expired_utx);
+        let mut fresh_utx =
+            UnconfirmedTransaction::new(fresh_tx, Amount::from_sat(0), false, false, Vec::new(), 0);
+        fresh_utx.first_seen = now;
+        manager.transactions.insert(fresh_txid, fresh_utx);
 
-        manager.prune_expired(test_timeout);
+        manager.prune_expired(test_timeout, now);
 
         assert_eq!(manager.transactions.len(), 1);
         assert!(manager.transactions.contains_key(&fresh_txid));
@@ -1624,20 +1640,17 @@ mod tests {
 
         let test_timeout = Duration::from_secs(2);
 
-        // Add the tx with a timestamp in the past so it expires
-        let mut utx =
-            UnconfirmedTransaction::new(tx, Amount::from_sat(0), false, false, Vec::new(), 0);
-        utx.first_seen = Instant::now() - test_timeout - Duration::from_secs(1);
+        // Prune at a `now` past the timeout, so the tx expires
+        let utx = UnconfirmedTransaction::new(tx, Amount::from_sat(0), false, false, Vec::new(), 0);
+        let now = utx.first_seen + test_timeout + Duration::from_secs(1);
         manager.transactions.insert(txid, utx);
 
         // Also store a pending IS lock for this txid and an unrelated one
         let unrelated_txid = Txid::from_byte_array([0xdd; 32]);
-        manager.pending_is_locks.insert(txid, (dummy_instant_lock(txid), Instant::now()));
-        manager
-            .pending_is_locks
-            .insert(unrelated_txid, (dummy_instant_lock(unrelated_txid), Instant::now()));
+        manager.pending_is_locks.insert(txid, (dummy_instant_lock(txid), now));
+        manager.pending_is_locks.insert(unrelated_txid, (dummy_instant_lock(unrelated_txid), now));
 
-        manager.prune_expired(test_timeout);
+        manager.prune_expired(test_timeout, now);
 
         // The expired tx's IS lock should be removed
         assert!(
@@ -1657,23 +1670,18 @@ mod tests {
 
         let test_timeout = Duration::from_secs(2);
 
+        let stale_at = Instant::now();
+        let now = stale_at + test_timeout + Duration::from_secs(1);
+
         // Insert a pending IS lock that is older than the test timeout
         let stale_txid = Txid::from_byte_array([0xaa; 32]);
-        manager.pending_is_locks.insert(
-            stale_txid,
-            (
-                dummy_instant_lock(stale_txid),
-                Instant::now() - test_timeout - Duration::from_secs(1),
-            ),
-        );
+        manager.pending_is_locks.insert(stale_txid, (dummy_instant_lock(stale_txid), stale_at));
 
         // Insert a fresh pending IS lock
         let fresh_txid = Txid::from_byte_array([0xbb; 32]);
-        manager
-            .pending_is_locks
-            .insert(fresh_txid, (dummy_instant_lock(fresh_txid), Instant::now()));
+        manager.pending_is_locks.insert(fresh_txid, (dummy_instant_lock(fresh_txid), now));
 
-        manager.prune_expired(test_timeout);
+        manager.prune_expired(test_timeout, now);
 
         assert!(
             !manager.pending_is_locks.contains_key(&stale_txid),
@@ -1850,11 +1858,10 @@ mod tests {
         manager.peers.insert(peer, Some(VecDeque::new()));
 
         let txid = Txid::from_byte_array([1; 32]);
-        manager
-            .pending_requests
-            .insert(txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
+        let requested_at = Instant::now();
+        manager.pending_requests.insert(txid, requested_at);
 
-        manager.prune_pending_requests();
+        manager.prune_pending_requests(requested_at + PENDING_REQUEST_TIMEOUT);
 
         assert!(!manager.pending_requests.contains_key(&txid));
         assert!(manager.peers[&peer].as_ref().unwrap().contains(&txid));
@@ -1865,11 +1872,10 @@ mod tests {
         let (mut manager, _requests, _rx) = create_test_manager();
 
         let txid = Txid::from_byte_array([1; 32]);
-        manager
-            .pending_requests
-            .insert(txid, Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1));
+        let requested_at = Instant::now();
+        manager.pending_requests.insert(txid, requested_at);
 
-        manager.prune_pending_requests();
+        manager.prune_pending_requests(requested_at + PENDING_REQUEST_TIMEOUT);
 
         assert!(!manager.pending_requests.contains_key(&txid));
         assert!(manager.peers.is_empty());
@@ -1969,13 +1975,14 @@ mod tests {
         let inv = vec![Inventory::Transaction(txid)];
 
         // A fresh seen_txids entry should cause handle_inv to skip the txid
-        manager.seen_txids.insert(txid, Instant::now());
+        let seen_at = Instant::now();
+        manager.seen_txids.insert(txid, seen_at);
         manager.handle_inv(&inv, peer, &requests).await.unwrap();
         assert!(manager.pending_requests.is_empty(), "seen txid should be skipped");
 
         // An expired entry should allow the txid to be accepted again
-        manager.seen_txids.insert(txid, Instant::now() - SEEN_TXID_EXPIRY - Duration::from_secs(1));
-        manager.handle_inv(&inv, peer, &requests).await.unwrap();
+        let now = seen_at + SEEN_TXID_EXPIRY + Duration::from_secs(1);
+        manager.handle_inv_at(&inv, peer, &requests, now).await.unwrap();
         assert!(
             manager.pending_requests.contains_key(&txid),
             "expired seen txid should be accepted"

@@ -234,9 +234,9 @@ impl UnconfirmedTransaction {
         self.transaction.txid()
     }
 
-    /// Check if transaction has expired.
-    pub fn is_expired(&self, timeout: Duration) -> bool {
-        self.first_seen.elapsed() > timeout
+    /// Whether the transaction was first seen more than `timeout` before `now`.
+    pub fn is_expired(&self, timeout: Duration, now: Instant) -> bool {
+        now.saturating_duration_since(self.first_seen) > timeout
     }
 
     /// Get fee rate in satoshis per byte.
