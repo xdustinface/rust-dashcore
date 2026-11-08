@@ -1,6 +1,6 @@
 use dash_spv::network::NetworkEvent;
 use dash_spv::sync::{ProgressPercentage, SyncEvent, SyncProgress, SyncState};
-use dash_spv::test_utils::DashCoreNode;
+use dash_spv::test_utils::{wait_for_sync, DashCoreNode};
 use dashcore::Txid;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
@@ -29,45 +29,6 @@ pub(super) const SECONDARY_MNEMONIC: &str =
 /// Read the headers manager's effective height (storage tip plus buffered).
 fn current_header_height(handle: &ClientHandle) -> u32 {
     handle.progress_receiver.borrow().headers().ok().map(|h| h.current_height()).unwrap_or(0)
-}
-
-/// Wait for sync to reach target height.
-pub(super) async fn wait_for_sync(
-    progress_receiver: &mut watch::Receiver<SyncProgress>,
-    target_height: u32,
-) {
-    let timeout = tokio::time::sleep(SYNC_TIMEOUT);
-    tokio::pin!(timeout);
-
-    loop {
-        // Check current state before waiting for changes — the receiver may
-        // already hold a value that satisfies the condition.
-        {
-            let update = progress_receiver.borrow_and_update();
-            let header_height = update.headers().ok().map(|h| h.current_height()).unwrap_or(0);
-            let filters_height = update.filters().ok().map(|f| f.committed_height()).unwrap_or(0);
-            if update.is_synced()
-                && header_height >= target_height
-                && filters_height >= target_height
-            {
-                return;
-            }
-        }
-
-        tokio::select! {
-            _ = &mut timeout => {
-                let update = progress_receiver.borrow();
-                panic!("Timeout waiting for sync to height {}. Current progress: {:?}",
-                    target_height, update
-                );
-            }
-            result = progress_receiver.changed() => {
-                if result.is_err() {
-                    panic!("Progress channel closed");
-                }
-            }
-        }
-    }
 }
 
 /// Count all unique transactions across wallet accounts.

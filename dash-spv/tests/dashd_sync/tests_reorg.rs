@@ -15,13 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dash_spv::sync::SyncEvent;
-use dash_spv::test_utils::{create_test_wallet, TestChain};
+use dash_spv::test_utils::{create_test_wallet, wait_for_sync, TestChain};
 use dash_spv::Network;
 use dashcore::{Amount, BlockHash};
 use key_wallet_manager::WalletEvent;
 use tokio::sync::broadcast;
 
-use super::helpers::wait_for_sync;
 use super::setup::{create_and_start_client, TestContext};
 
 /// How long to wait for a reorg-related event after triggering the reorg

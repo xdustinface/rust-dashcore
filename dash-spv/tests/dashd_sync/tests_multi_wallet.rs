@@ -11,11 +11,13 @@ use dash_spv::Network;
 use dashcore::{Address, Amount};
 
 use super::helpers::{
-    count_wallet_transactions, get_spendable_balance, wait_for_sync, wait_for_wallet_synced,
-    EMPTY_MNEMONIC, SECONDARY_MNEMONIC,
+    count_wallet_transactions, get_spendable_balance, wait_for_wallet_synced, EMPTY_MNEMONIC,
+    SECONDARY_MNEMONIC,
 };
 use super::setup::{create_and_start_client, TestContext};
-use dash_spv::test_utils::{create_test_wallet, default_test_account_options, TestChain};
+use dash_spv::test_utils::{
+    create_test_wallet, default_test_account_options, wait_for_sync, TestChain,
+};
 use key_wallet::account::ManagedAccountTrait;
 
 /// Derive a fresh BIP44 external receive address for `mnemonic` without

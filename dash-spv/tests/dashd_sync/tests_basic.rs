@@ -8,11 +8,9 @@ use key_wallet_manager::WalletManager;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::RwLock;
 
-use super::helpers::{
-    count_wallet_transactions, get_spendable_balance, wait_for_sync, EMPTY_MNEMONIC,
-};
+use super::helpers::{count_wallet_transactions, get_spendable_balance, EMPTY_MNEMONIC};
 use super::setup::{create_and_start_client, TestContext};
-use dash_spv::test_utils::{create_test_wallet, TestChain};
+use dash_spv::test_utils::{create_test_wallet, wait_for_sync, TestChain};
 
 #[tokio::test]
 async fn test_wallet_sync() {

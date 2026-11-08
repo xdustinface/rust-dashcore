@@ -8,6 +8,7 @@ mod fs_helpers;
 pub(crate) mod masternode_network;
 mod network;
 mod node;
+mod sync;
 mod types;
 mod wallet;
 
@@ -22,6 +23,7 @@ pub use fs_helpers::retain_test_dir;
 pub use masternode_network::MasternodeTestContext;
 pub use network::{test_socket_address, MockNetworkManager};
 pub use node::{DashCoreNode, TestChain, WalletFile};
+pub use sync::wait_for_sync;
 pub use wallet::{
     create_test_wallet, default_test_account_options, init_test_logging,
     next_unused_receive_address,
