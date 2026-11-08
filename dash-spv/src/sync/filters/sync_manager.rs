@@ -198,7 +198,7 @@ impl<
                     "FiltersManager: re-matching filters from effective floor {}",
                     effective_floor
                 );
-                self.reset_for_reorg(effective_floor);
+                self.reset_for_reorg(*fork_height, effective_floor);
                 self.set_state(SyncState::WaitForEvents);
                 return Ok(vec![]);
             }

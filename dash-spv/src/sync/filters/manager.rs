@@ -177,14 +177,21 @@ impl<H: BlockHeaderStorage, FH: FilterHeaderStorage, F: FilterStorage, W: Wallet
     /// processing cursors so the next `FilterHeadersStored` event drives a
     /// fresh download starting at the effective floor.
     ///
+    /// The reorg truncated filter header storage to `fork_height`, so the
+    /// filter header tip moves down to it too. Otherwise the first
+    /// `FilterHeadersStored` of the new branch, whose tip is below the old
+    /// one, would start a download up to the old tip and verify filters
+    /// against filter headers that are no longer stored.
+    ///
     /// `effective_floor` is the minimum of `fork_height` and the lowest
     /// per-wallet `synced_height` across the wallet set, computed after
     /// the wallet rewind. A wallet whose ingest tip is behind the fork
     /// point never saw the orphaned chain, so the filter pipeline does
     /// not need to re-match the segment between that wallet's tip and
     /// the fork.
-    pub(super) fn reset_for_reorg(&mut self, effective_floor: u32) {
+    pub(super) fn reset_for_reorg(&mut self, fork_height: u32, effective_floor: u32) {
         self.reset_for_rescan();
+        self.progress.rewind_filter_header_tip_height(fork_height);
         self.next_batch_to_store = effective_floor;
         self.processing_height = effective_floor;
         self.progress.update_committed_height(effective_floor);
@@ -2434,6 +2441,37 @@ mod tests {
             "expected FiltersSyncComplete, got {:?}",
             events
         );
+    }
+
+    /// After a reorg truncated filter headers to the fork, the first
+    /// `FilterHeadersStored` of the new branch carries a tip below the old one.
+    /// The download it starts must stop at that tip, not at the old filter
+    /// header tip whose filter headers are gone.
+    #[tokio::test]
+    async fn test_reorg_rewinds_filter_header_tip_to_fork() {
+        let mut manager = create_test_manager().await;
+        let headers = dashcore::block::Header::dummy_batch(0..412);
+        manager.header_storage.write().await.store_headers(&headers).await.unwrap();
+
+        manager.wallet.write().await.update_wallet_synced_height(&MOCK_WALLET_ID, 411);
+        manager.progress.update_filter_header_tip_height(411);
+        manager.progress.update_committed_height(411);
+        manager.progress.update_stored_height(411);
+        manager.progress.update_target_height(411);
+        manager.set_state(SyncState::Synced);
+
+        let effective_floor = manager.rewind_wallet_for_reorg(408).await;
+        manager.reset_for_reorg(408, effective_floor);
+        manager.set_state(SyncState::WaitForEvents);
+        assert_eq!(manager.progress.filter_header_tip_height(), 408);
+
+        let (tx, _rx) = unbounded_channel();
+        manager.handle_new_filter_headers(409, &RequestSender::new(tx)).await.unwrap();
+
+        assert_eq!(manager.state(), SyncState::Syncing);
+        let batch =
+            manager.active_batches.get(&409).expect("batch at the first height past the fork");
+        assert_eq!(batch.end_height(), 409, "the download must stop at the new filter header tip");
     }
 
     #[tokio::test]

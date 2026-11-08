@@ -120,6 +120,15 @@ impl FiltersProgress {
         }
     }
 
+    /// Lower the filter header tip after a reorg truncated filter header storage.
+    /// Unlike `update_filter_header_tip_height`, it only moves the tip down.
+    pub fn rewind_filter_header_tip_height(&mut self, height: u32) {
+        if height < self.filter_header_tip_height {
+            self.filter_header_tip_height = height;
+            self.bump_last_activity();
+        }
+    }
+
     /// Add a number to the downloaded counter.
     pub fn add_downloaded(&mut self, count: u32) {
         self.downloaded += count;
