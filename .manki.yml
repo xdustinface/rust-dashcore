@@ -1,0 +1,74 @@
+# Manki — AI Code Review Configuration
+# https://github.com/manki-review/manki
+
+auto_review: true
+auto_approve: true
+
+exclude_paths:
+  - "*.lock"
+  - "fuzz/**"
+
+# Bot PRs get no automatic review. Read from the base branch only.
+skip_authors: ["dependabot[bot]", "github-actions[bot]"]
+
+instructions: |
+  This is a Rust implementation of the Dash cryptocurrency protocol.
+  Pay special attention to:
+  - Consensus-critical code paths — changes here can cause chain splits
+  - FFI safety for C/Swift bindings in dash-spv-* crates
+  - Proper error handling — prefer Result over unwrap/expect in library code
+  - DIP (Dash Improvement Proposal) compliance for protocol changes
+  - Memory safety in hash/crypto implementations
+
+# Read from the base branch only, so a PR cannot weaken its own review.
+review:
+  classes:
+    security:
+      match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**"] }
+    # The built-in security class takes no `critical`, so the wallet and crypto paths are marked critical here.
+    wallet:
+      rank: 86
+      critical: true
+      match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "key-wallet-ffi/**", "dash/src/crypto/**"] }
+    consensus:
+      rank: 85
+      critical: true
+      match: { paths_any: ["dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"] }
+    ffi:
+      rank: 84
+      match: { paths_any: ["dash-spv-ffi/**", "key-wallet-ffi/**", "ffi-c-tests/**"] }
+  routing:
+    wallet: pair
+    consensus: pair
+    ffi: pair
+  outside_input: >-
+    Anything a network peer sends: P2P messages, blocks, transactions, headers,
+    masternode list diffs and the length prefixes inside them. Arguments from FFI
+    callers in C and Swift. Responses from a Dash Core RPC server. Files read from
+    disk, such as stored headers, filters and wallet data.
+  examples:
+    blocker:
+      - "Indexing `buf[len]` with a length read from a peer message panics on a short message."
+      - "`Vec::with_capacity` sized by a count a peer sends lets one message allocate gigabytes."
+      - "Changing the field order in a `consensus_encode` implementation changes the bytes on the wire, even when every test passes."
+      - "A signature check whose failure is ignored accepts a forged message."
+      - "An inverted peer selection weight, such as `score + offset` where a lower score is better, picks misbehaving peers more often than well-behaved ones."
+    not_blocker:
+      - "A `todo!()` the PR states is intentional: `suggestion` at most."
+      - "An `expect` right after a bounds check that proves it cannot fail."
+      - "A missing test for new code: `suggestion`."
+      - "A missing `#[must_use]` or missing docs: `nitpick`."
+
+related_repos:
+  - { repo: dashpay/dash, kind: reference, paths: [src/] }
+  - { repo: dashpay/dips, kind: reference }
+  - { repo: dashpay/platform, kind: consumer, paths: ["packages/rs-*"] }
+  - { repo: dashpay/dash-evo-tool, kind: consumer }
+
+static_analysis:
+  analyzers:
+    secrets: true
+
+memory:
+  enabled: true
+  repo: "xdustinface/review-memory"
