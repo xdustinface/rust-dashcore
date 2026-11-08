@@ -482,9 +482,8 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
 
     /// Drop entries from `pending_unknown_hash` whose age exceeds
     /// [`PENDING_UNKNOWN_HASH_TTL`]. Returns the number of evicted entries.
-    pub(super) fn drain_expired_pending(&mut self) -> usize {
+    pub(super) fn drain_expired_pending(&mut self, now: Instant) -> usize {
         let before = self.pending_unknown_hash.len();
-        let now = Instant::now();
         self.pending_unknown_hash.retain(|_, (_, _, queued_at)| {
             now.duration_since(*queued_at) < PENDING_UNKNOWN_HASH_TTL
         });
@@ -1211,6 +1210,7 @@ mod tests {
 
         let fresh_hash = BlockHash::from_byte_array([0x01; 32]);
         let stale_hash = BlockHash::from_byte_array([0x02; 32]);
+        let queued_at = Instant::now();
         manager.pending_unknown_hash.insert(
             fresh_hash,
             (
@@ -1220,7 +1220,7 @@ mod tests {
                     signature: BLSSignature::from([0u8; 96]),
                 },
                 None,
-                Instant::now(),
+                queued_at + PENDING_UNKNOWN_HASH_TTL,
             ),
         );
         manager.pending_unknown_hash.insert(
@@ -1232,11 +1232,14 @@ mod tests {
                     signature: BLSSignature::from([0u8; 96]),
                 },
                 None,
-                Instant::now() - PENDING_UNKNOWN_HASH_TTL - Duration::from_secs(1),
+                queued_at,
             ),
         );
 
-        let evicted = manager.drain_expired_pending();
+        // Moving `now` forward never underflows, while backdating an `Instant` does on a host
+        // whose clock started less than the TTL ago, as Windows CI runners often do.
+        let evicted = manager
+            .drain_expired_pending(queued_at + PENDING_UNKNOWN_HASH_TTL + Duration::from_secs(1));
         assert_eq!(evicted, 1);
         assert!(manager.pending_unknown_hash.contains_key(&fresh_hash));
         assert!(!manager.pending_unknown_hash.contains_key(&stale_hash));
