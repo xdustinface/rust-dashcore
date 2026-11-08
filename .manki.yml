@@ -71,4 +71,3 @@ static_analysis:
 
 memory:
   enabled: true
-  repo: "xdustinface/review-memory"
