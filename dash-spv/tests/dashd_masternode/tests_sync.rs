@@ -7,15 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dash_spv::sync::{ProgressPercentage, SyncEvent, SyncState};
+use dash_spv::test_utils::wait_for_sync;
 use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::sml::llmq_type::LLMQType;
 use tokio::time;
 
 use super::helpers::{
     assert_all_rotated_quorums_verified, wait_for_chain_reorg_event,
-    wait_for_chainlock_height_at_least, wait_for_full_sync, wait_for_masternode_sync,
-    wait_for_mn_state_event, wait_for_mn_state_event_above,
-    wait_for_mn_state_with_stored_cycle_above,
+    wait_for_chainlock_height_at_least, wait_for_masternode_sync, wait_for_mn_state_event,
+    wait_for_mn_state_event_above, wait_for_mn_state_with_stored_cycle_above,
 };
 use super::setup::{
     create_and_start_client, create_dummy_wallet, create_mn_test_config, TestContext, SYNC_TIMEOUT,
@@ -597,10 +597,13 @@ async fn test_masternode_list_rewind_across_dip3_reorg() {
     .await;
     tracing::info!("Pre-reorg masternode tip at height {}", mid);
 
-    wait_for_full_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    // The SPV must hold the blocks the reorg orphans, or it never sees a reorg and just
+    // follows the replacement branch. Its filters must be done too, so it never requests
+    // filters for orphaned blocks, which makes dashd drop the peer.
+    let pre_reorg_tip = ctx.mn_ctx.controller.get_block_count();
+    wait_for_sync(&mut client_handle.progress_receiver, pre_reorg_tip).await;
 
     let reorg_depth = 3;
-    let pre_reorg_tip = ctx.mn_ctx.controller.get_block_count();
     let fork_height = pre_reorg_tip - reorg_depth;
     let (orphaned, replacement) = ctx.mn_ctx.mine_reorg(reorg_depth);
     assert_eq!(orphaned.len(), reorg_depth as usize);
@@ -779,7 +782,8 @@ async fn test_chainlock_forced_reorg_end_to_end() {
     let mn = wait_for_masternode_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
     assert_eq!(mn.state(), SyncState::Synced);
 
-    wait_for_full_sync(&mut client_handle.progress_receiver, SYNC_TIMEOUT).await;
+    wait_for_sync(&mut client_handle.progress_receiver, ctx.mn_ctx.controller.get_block_count())
+        .await;
 
     // Initial chainlock.
     let initial_cl_height = ctx
