@@ -7,6 +7,7 @@ use crate::sync::{
 use async_trait::async_trait;
 use dashcore::network::message::NetworkMessage;
 use dashcore::network::message_blockdata::Inventory;
+use std::time::Instant;
 
 #[async_trait]
 impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager<H, M> {
@@ -120,7 +121,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> SyncManager for ChainLockManager
     }
 
     async fn tick(&mut self, _requests: &RequestSender) -> SyncResult<Vec<SyncEvent>> {
-        let evicted = self.drain_expired_pending();
+        let evicted = self.drain_expired_pending(Instant::now());
         if evicted > 0 {
             tracing::debug!("Evicted {} expired pending-unknown-hash chainlocks", evicted);
         }

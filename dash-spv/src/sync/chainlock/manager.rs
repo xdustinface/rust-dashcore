@@ -480,11 +480,10 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
         Ok(events)
     }
 
-    /// Drop entries from `pending_unknown_hash` whose age exceeds
+    /// Drop entries from `pending_unknown_hash` whose age at `now` exceeds
     /// [`PENDING_UNKNOWN_HASH_TTL`]. Returns the number of evicted entries.
-    pub(super) fn drain_expired_pending(&mut self) -> usize {
+    pub(super) fn drain_expired_pending(&mut self, now: Instant) -> usize {
         let before = self.pending_unknown_hash.len();
-        let now = Instant::now();
         self.pending_unknown_hash.retain(|_, (_, _, queued_at)| {
             now.duration_since(*queued_at) < PENDING_UNKNOWN_HASH_TTL
         });
@@ -1208,6 +1207,10 @@ mod tests {
     #[tokio::test]
     async fn test_drain_expired_pending_evicts_only_stale_entries() {
         let mut manager = create_test_manager().await;
+        // Move `now` forward instead of backdating the stale entry. On Windows an `Instant`
+        // cannot go back further than system boot, which a fresh CI runner is close to.
+        let queued_at = Instant::now();
+        let now = queued_at + PENDING_UNKNOWN_HASH_TTL + Duration::from_secs(1);
 
         let fresh_hash = BlockHash::from_byte_array([0x01; 32]);
         let stale_hash = BlockHash::from_byte_array([0x02; 32]);
@@ -1220,7 +1223,7 @@ mod tests {
                     signature: BLSSignature::from([0u8; 96]),
                 },
                 None,
-                Instant::now(),
+                queued_at + Duration::from_secs(2),
             ),
         );
         manager.pending_unknown_hash.insert(
@@ -1232,11 +1235,11 @@ mod tests {
                     signature: BLSSignature::from([0u8; 96]),
                 },
                 None,
-                Instant::now() - PENDING_UNKNOWN_HASH_TTL - Duration::from_secs(1),
+                queued_at,
             ),
         );
 
-        let evicted = manager.drain_expired_pending();
+        let evicted = manager.drain_expired_pending(now);
         assert_eq!(evicted, 1);
         assert!(manager.pending_unknown_hash.contains_key(&fresh_hash));
         assert!(!manager.pending_unknown_hash.contains_key(&stale_hash));
