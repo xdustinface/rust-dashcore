@@ -4,8 +4,11 @@
 auto_review: true
 auto_approve: true
 
+# The list replaces the defaults, so it repeats them to keep the same files out of review.
 exclude_paths:
   - "*.lock"
+  - "dist/**"
+  - "*.generated.*"
   - "fuzz/**"
 
 # Bot PRs get no automatic review. Read from the base branch only.
@@ -24,18 +27,16 @@ review:
   classes:
     security:
       match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
-    # The built-in security class takes no `critical`, so the wallet and crypto paths are marked critical here.
     wallet:
       rank: 86
-      critical: true
       match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
     consensus:
       rank: 85
-      critical: true
       match: { paths_any: ["dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"] }
   routing:
     wallet: pair
     consensus: pair
+  critical_paths: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**", "dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"]
   outside_input: >-
     Anything a network peer sends: P2P messages, blocks, transactions, headers,
     masternode list diffs and the length prefixes inside them. Responses from a
