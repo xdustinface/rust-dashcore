@@ -20,6 +20,27 @@ use crate::sync::{ChainLockProgress, SyncEvent};
 /// Metadata key for persisting the best validated ChainLock.
 const BEST_CHAINLOCK_KEY: &str = "best_chainlock";
 
+/// Load the best validated ChainLock persisted in `storage`, if there is one.
+pub(crate) async fn load_persisted_chainlock<M: MetadataStorage>(storage: &M) -> Option<ChainLock> {
+    match storage.load_metadata(BEST_CHAINLOCK_KEY).await {
+        Ok(Some(bytes)) => match serde_json::from_slice::<ChainLock>(&bytes) {
+            Ok(chainlock) => Some(chainlock),
+            Err(e) => {
+                tracing::warn!("Failed to deserialize persisted chainlock: {}", e);
+                None
+            }
+        },
+        Ok(None) => {
+            tracing::debug!("No persisted chainlock found (fresh start)");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load persisted chainlock: {}", e);
+            None
+        }
+    }
+}
+
 /// ChainLock manager for the parallel sync coordinator.
 ///
 /// This manager:
@@ -238,26 +259,14 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> ChainLockManager<H, M> {
 
     /// Load the best chainlock from metadata storage and restore progress.
     pub(super) async fn load_best_chainlock(&mut self) {
-        let storage = self.metadata_storage.read().await;
-        match storage.load_metadata(BEST_CHAINLOCK_KEY).await {
-            Ok(Some(bytes)) => match serde_json::from_slice::<ChainLock>(&bytes) {
-                Ok(chainlock) => {
-                    let height = chainlock.block_height;
-                    tracing::info!("Restored persisted ChainLock at height {}", height);
-                    self.progress.update_best_validated_height(height);
-                    self.best_chainlock = Some(chainlock);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize persisted chainlock: {}", e);
-                }
-            },
-            Ok(None) => {
-                tracing::debug!("No persisted chainlock found (fresh start)");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load persisted chainlock: {}", e);
-            }
-        }
+        let Some(chainlock) = load_persisted_chainlock(&*self.metadata_storage.read().await).await
+        else {
+            return;
+        };
+        let height = chainlock.block_height;
+        tracing::info!("Restored persisted ChainLock at height {}", height);
+        self.progress.update_best_validated_height(height);
+        self.best_chainlock = Some(chainlock);
     }
 
     /// Verify that the ChainLock block hash matches our stored header.
