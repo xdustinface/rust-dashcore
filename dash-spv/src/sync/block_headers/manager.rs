@@ -11,11 +11,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::chain::CheckpointManager;
+use crate::chain::{ChainWork, CheckpointManager};
 use crate::error::{SyncError, SyncResult};
 use crate::network::RequestSender;
 use crate::storage::{BlockHeaderStorage, BlockHeaderTip, MetadataStorage};
 use crate::sync::block_headers::HeadersPipeline;
+use crate::sync::chainlock::load_persisted_chainlock;
 use crate::sync::{BlockHeadersProgress, ProgressPercentage, SyncEvent, SyncManager, SyncState};
 use crate::types::HashedBlockHeader;
 use crate::validation::{BlockHeaderValidator, Validator};
@@ -46,6 +47,23 @@ pub struct BlockHeadersManager<H: BlockHeaderStorage, M: MetadataStorage> {
     /// Peers we've sent a GetHeaders to after sync, so Dash Core knows our tip
     /// and can send us header announcements instead of inv.
     pub(super) announced_peers: HashSet<SocketAddr>,
+    /// Checkpoints a fork must not replace.
+    checkpoint_manager: Arc<CheckpointManager>,
+    /// Branch off the stored chain that does not have more work than it yet.
+    fork_branch: Option<ForkBranch>,
+}
+
+/// Most blocks a fork may replace, and most headers of a branch kept while it
+/// has less work than the stored chain. A `headers` message carries at most
+/// this many headers.
+const MAX_FORK_DEPTH: u32 = 2000;
+
+/// Valid headers that branch off the stored chain below its tip.
+#[derive(Debug)]
+struct ForkBranch {
+    /// Height of the last stored block the branch shares.
+    fork_height: u32,
+    headers: Vec<HashedBlockHeader>,
 }
 
 impl<H: BlockHeaderStorage, M: MetadataStorage> std::fmt::Debug for BlockHeadersManager<H, M> {
@@ -86,9 +104,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
             progress: initial_progress,
             header_storage,
             metadata_storage,
-            pipeline: HeadersPipeline::new(checkpoint_manager),
+            pipeline: HeadersPipeline::new(checkpoint_manager.clone()),
             pending_announcements: HashMap::new(),
             announced_peers: HashSet::new(),
+            checkpoint_manager,
+            fork_branch: None,
         })
     }
 
@@ -139,7 +159,7 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         let matched = self.pipeline.receive_headers(headers)?;
 
         if matched.is_none() && !headers.is_empty() {
-            if let Some(fork_height) = self.fork_height(headers).await? {
+            if let Some(fork_height) = self.follow_fork(headers).await? {
                 return Ok(vec![SyncEvent::ForkDetected {
                     fork_height,
                 }]);
@@ -181,23 +201,99 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
         Ok(events)
     }
 
-    /// Height where `headers` branch off the stored chain below its tip, if they do.
-    async fn fork_height(&self, headers: &[HashedBlockHeader]) -> SyncResult<Option<u32>> {
+    /// Follow `headers` that branch off the stored chain below its tip.
+    ///
+    /// Returns the height of the fork once the branch is valid and has more work
+    /// than the stored chain above the fork. Until then the branch is kept, so the
+    /// headers a peer announces one at a time can extend it. A branch that replaces
+    /// a checkpoint, a ChainLocked block or more than [`MAX_FORK_DEPTH`] blocks is
+    /// dropped.
+    async fn follow_fork(&mut self, headers: &[HashedBlockHeader]) -> SyncResult<Option<u32>> {
         let storage = self.header_storage.read().await;
+        let Some(tip_height) = storage.get_tip_height().await else {
+            return Ok(None);
+        };
 
         // Skip the headers we already store: a peer may resend part of our chain.
-        for header in headers {
-            if storage.get_header_height_by_hash(header.hash()).await?.is_some() {
-                continue;
+        let mut known = 0;
+        while known < headers.len()
+            && storage.get_header_height_by_hash(headers[known].hash()).await?.is_some()
+        {
+            known += 1;
+        }
+        let new_headers = &headers[known..];
+        let Some(first) = new_headers.first() else {
+            return Ok(None);
+        };
+        let parent_hash = first.header().prev_blockhash;
+
+        let held = self
+            .fork_branch
+            .as_ref()
+            .filter(|branch| branch.headers.last().is_some_and(|last| *last.hash() == parent_hash));
+        let extends_held = held.is_some();
+        let (fork_height, held_len) = match held {
+            Some(held) => (held.fork_height, held.headers.len()),
+            None => match storage.get_header_height_by_hash(&parent_hash).await? {
+                Some(parent) if parent < tip_height => (parent, 0),
+                _ => return Ok(None),
+            },
+        };
+
+        if tip_height.saturating_sub(fork_height) > MAX_FORK_DEPTH
+            || held_len + new_headers.len() > MAX_FORK_DEPTH as usize
+        {
+            tracing::warn!("Ignoring a fork at height {} that replaces too much", fork_height);
+            return Ok(None);
+        }
+        // `should_reject_fork` takes the height of the first block the fork replaces.
+        if self.checkpoint_manager.should_reject_fork(fork_height + 1) {
+            tracing::warn!("Ignoring a fork at height {} below a checkpoint", fork_height);
+            return Ok(None);
+        }
+        let metadata = self.metadata_storage.read().await;
+        if let Some(chainlock) = load_persisted_chainlock(&*metadata).await {
+            let locked = storage.get_header_height_by_hash(&chainlock.block_hash).await?;
+            if locked.is_some_and(|locked| locked > fork_height) {
+                tracing::warn!(
+                    "Ignoring a fork at height {} below the ChainLock at height {}",
+                    fork_height,
+                    chainlock.block_height
+                );
+                return Ok(None);
             }
-
-            let parent = storage.get_header_height_by_hash(&header.header().prev_blockhash).await?;
-            let tip = storage.get_tip_height().await;
-
-            return Ok(parent.filter(|&parent| tip.is_some_and(|tip| parent < tip)));
         }
 
-        Ok(None)
+        BlockHeaderValidator::new().validate(new_headers)?;
+        let mut branch = if extends_held {
+            self.fork_branch.take().map(|held| held.headers).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        branch.extend_from_slice(new_headers);
+
+        let stored = storage.load_headers(fork_height + 1..tip_height + 1).await?;
+        if chain_work(&branch) <= chain_work(&stored) {
+            tracing::debug!(
+                "Holding a fork at height {} with {} headers until it has more work",
+                fork_height,
+                branch.len()
+            );
+            self.fork_branch = Some(ForkBranch {
+                fork_height,
+                headers: branch,
+            });
+            return Ok(None);
+        }
+
+        tracing::info!(
+            "Fork at height {}: {} headers outweigh the {} stored above it",
+            fork_height,
+            branch.len(),
+            stored.len()
+        );
+        self.fork_branch = None;
+        Ok(Some(fork_height))
     }
 
     /// Write segments that finished downloading into storage.
@@ -323,6 +419,11 @@ impl<H: BlockHeaderStorage, M: MetadataStorage> BlockHeadersManager<H, M> {
     }
 }
 
+/// Total proof of work of `headers`.
+fn chain_work(headers: &[HashedBlockHeader]) -> ChainWork {
+    headers.iter().fold(ChainWork::zero(), |work, header| work.add_header(header.header()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +435,10 @@ mod tests {
     use crate::sync::block_headers::pipeline::ACTIVE_SEGMENT_WINDOW;
     use crate::sync::block_headers::segment_state::SegmentState;
     use crate::sync::{ManagerIdentifier, SyncManager, SyncManagerProgress};
+    use dashcore::bls_sig_utils::BLSSignature;
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
     use dashcore::network::message::NetworkMessage;
+    use dashcore::CompactTarget;
     use tokio::sync::mpsc::unbounded_channel;
 
     type TestBlockHeadersManager =
@@ -345,6 +449,12 @@ mod tests {
     }
 
     async fn create_test_manager() -> TestBlockHeadersManager {
+        create_test_manager_with(create_test_checkpoint_manager()).await
+    }
+
+    async fn create_test_manager_with(
+        checkpoint_manager: Arc<CheckpointManager>,
+    ) -> TestBlockHeadersManager {
         let mut storage = DiskStorageManager::with_temp_dir().await.unwrap();
         // Store a genesis header so the manager can initialize
         let genesis = Header::dummy_batch(0..1);
@@ -354,7 +464,6 @@ mod tests {
             )
             .await
             .unwrap();
-        let checkpoint_manager = create_test_checkpoint_manager();
         BlockHeadersManager::new(storage.block_headers(), storage.metadata(), checkpoint_manager)
             .await
             .expect("Failed to create BlockHeadersManager")
@@ -763,5 +872,124 @@ mod tests {
         assert!(events.is_empty());
         assert!(rx.try_recv().is_err());
         assert!(manager.pipeline.is_tip_complete());
+    }
+
+    /// A synced manager storing `len` headers above genesis, and those headers.
+    async fn create_manager_on_chain(
+        checkpoint_manager: Arc<CheckpointManager>,
+        len: usize,
+    ) -> (TestBlockHeadersManager, Vec<HashedBlockHeader>) {
+        let mut manager = create_test_manager_with(checkpoint_manager).await;
+        let genesis = manager.tip().await.unwrap();
+        let chain: Vec<HashedBlockHeader> =
+            Header::dummy_chain(len, *genesis.hash()).iter().map(HashedBlockHeader::from).collect();
+        let tip = manager.store_headers(&chain).await.unwrap();
+        manager.pipeline.init(tip.height(), *tip.hash(), tip.height());
+        manager.pipeline.mark_tip_complete();
+        manager.progress.set_state(SyncState::Synced);
+        (manager, chain)
+    }
+
+    /// `count` valid headers on `prev` that differ from those of `Header::dummy_chain`.
+    fn branch(count: usize, mut prev: BlockHash) -> Vec<HashedBlockHeader> {
+        (0..count)
+            .map(|i| {
+                let header = Header {
+                    nonce: u32::MAX - i as u32,
+                    ..Header::dummy_chain(1, prev)[0]
+                };
+                prev = header.block_hash();
+                HashedBlockHeader::from(header)
+            })
+            .collect()
+    }
+
+    fn fork_heights(events: &[SyncEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SyncEvent::ForkDetected {
+                    fork_height,
+                } => Some(*fork_height),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A branch is followed only once it has more work than the stored chain
+    /// above the fork, also when a peer announces its headers one at a time.
+    #[tokio::test]
+    async fn test_fork_needs_more_work_than_the_stored_chain() {
+        let no_checkpoints = Arc::new(CheckpointManager::new(Vec::new()));
+        let (mut manager, chain) = create_manager_on_chain(no_checkpoints, 3).await;
+        let (requests, _rx) = create_test_request_sender();
+
+        // A stale sibling of the tip has the same work as the tip.
+        let sibling = branch(2, *chain[1].hash());
+        let events = manager.handle_headers_pipeline(&sibling[..1], &requests).await.unwrap();
+        assert!(fork_heights(&events).is_empty());
+
+        // A header without proof of work does not extend it.
+        let mut unworked = Header::dummy_chain(1, *sibling[0].hash())[0];
+        unworked.bits = CompactTarget::from_consensus(0x1d00ffff);
+        let unworked = HashedBlockHeader::from(unworked);
+        assert!(manager.handle_headers_pipeline(&[unworked], &requests).await.is_err());
+
+        // The next header gives the branch more work, resent headers are skipped.
+        let resent = [chain[0].clone(), chain[1].clone(), sibling[1].clone()];
+        let events = manager.handle_headers_pipeline(&resent, &requests).await.unwrap();
+        assert_eq!(fork_heights(&events), vec![2]);
+        assert_eq!(manager.tip().await.unwrap().height(), 3, "storage stays until recovery");
+
+        // A deeper branch announced one header at a time needs a fourth header.
+        let deeper = branch(4, chain[0].header().prev_blockhash);
+        for header in &deeper[..3] {
+            let events = manager
+                .handle_headers_pipeline(std::slice::from_ref(header), &requests)
+                .await
+                .unwrap();
+            assert!(fork_heights(&events).is_empty());
+        }
+        let events = manager.handle_headers_pipeline(&deeper[3..], &requests).await.unwrap();
+        assert_eq!(fork_heights(&events), vec![0]);
+
+        // Headers whose parent is not stored are no fork.
+        let orphan = branch(5, BlockHash::dummy(99));
+        let events = manager.handle_headers_pipeline(&orphan, &requests).await.unwrap();
+        assert!(fork_heights(&events).is_empty());
+    }
+
+    /// A branch that replaces a checkpoint or a ChainLocked block is never followed.
+    #[tokio::test]
+    async fn test_fork_below_checkpoint_or_chainlock_is_ignored() {
+        let (mut manager, chain) =
+            create_manager_on_chain(create_test_checkpoint_manager(), 3).await;
+        let (requests, _rx) = create_test_request_sender();
+        let genesis = chain[0].header().prev_blockhash;
+        let events = manager.handle_headers_pipeline(&branch(5, genesis), &requests).await.unwrap();
+        assert!(fork_heights(&events).is_empty());
+
+        let no_checkpoints = Arc::new(CheckpointManager::new(Vec::new()));
+        let (mut manager, chain) = create_manager_on_chain(no_checkpoints, 3).await;
+        let chainlock = ChainLock {
+            block_height: 2,
+            block_hash: *chain[1].hash(),
+            signature: BLSSignature::from([0; 96]),
+        };
+        manager
+            .metadata_storage
+            .write()
+            .await
+            .store_metadata("best_chainlock", &serde_json::to_vec(&chainlock).unwrap())
+            .await
+            .unwrap();
+
+        let events =
+            manager.handle_headers_pipeline(&branch(5, *chain[0].hash()), &requests).await.unwrap();
+        assert!(fork_heights(&events).is_empty());
+
+        let events =
+            manager.handle_headers_pipeline(&branch(5, *chain[1].hash()), &requests).await.unwrap();
+        assert_eq!(fork_heights(&events), vec![2]);
     }
 }
