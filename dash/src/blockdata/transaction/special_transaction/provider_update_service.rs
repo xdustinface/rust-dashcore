@@ -42,6 +42,7 @@ use crate::bls_sig_utils::BLSSignature;
 use crate::consensus::{Decodable, Encodable, encode};
 use crate::hash_types::{InputsHash, SpecialTransactionPayloadHash, Txid};
 use crate::platform_node_id::PlatformNodeId;
+use crate::prelude::*;
 use crate::sml::masternode_list_entry::net_info::ExtNetInfo;
 use crate::{ScriptBuf, VarInt, io};
 
@@ -81,6 +82,7 @@ pub struct ProviderUpdateServicePayload {
     pub platform_http_port: Option<u16>,
     pub payload_sig: BLSSignature,
     /// Extended service addresses, present from version 3 in place of `ip_address`/`port`.
+    /// From version 3 a missing value encodes as an empty `ExtNetInfo`.
     pub net_info: Option<ExtNetInfo>,
 }
 
@@ -122,6 +124,11 @@ impl ProviderUpdateServicePayload {
         self.version >= ProTxVersion::ExtAddr as u16
     }
 
+    /// The `net_info` written from version 3, empty when unset so encoding never fails on it.
+    fn ext_net_info(&self) -> Cow<'_, ExtNetInfo> {
+        self.net_info.as_ref().map_or_else(|| Cow::Owned(ExtNetInfo::default()), Cow::Borrowed)
+    }
+
     fn is_evo(&self) -> bool {
         self.version >= ProTxVersion::BasicBLS as u16
             && self.mn_type == Some(ProviderMasternodeType::HighPerformance as u16)
@@ -133,9 +140,10 @@ impl ProviderUpdateServicePayload {
         size += VarInt(self.script_payout.len() as u64).len() + self.script_payout.len();
 
         if self.is_ext_addr() {
-            size += self.net_info.as_ref().map_or(0, |info| {
-                info.consensus_encode_ext(&mut io::sink()).expect("sinks don't error")
-            });
+            size += self
+                .ext_net_info()
+                .consensus_encode_ext(&mut io::sink())
+                .expect("sinks don't error");
         } else {
             size += 16 + 2; // ip_address + port
         }
@@ -169,10 +177,7 @@ impl SpecialTransactionBasePayloadEncodable for ProviderUpdateServicePayload {
 
         len += self.pro_tx_hash.consensus_encode(&mut s)?;
         if self.is_ext_addr() {
-            let Some(net_info) = &self.net_info else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "net_info is not set"));
-            };
-            len += net_info.consensus_encode_ext(&mut s)?;
+            len += self.ext_net_info().consensus_encode_ext(&mut s)?;
         } else {
             len += self.ip_address.consensus_encode(&mut s)?;
             len += u16::swap_bytes(self.port).consensus_encode(&mut s)?;
@@ -418,6 +423,27 @@ mod tests {
         let decoded = ProviderUpdateServicePayload::consensus_decode(&mut reader).unwrap();
         assert!(reader.is_empty());
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn v3_without_net_info_encodes_empty_net_info() {
+        let payload = ProviderUpdateServicePayload {
+            net_info: None,
+            ..v3_payload(0, None)
+        };
+        let empty = ProviderUpdateServicePayload {
+            net_info: Some(ExtNetInfo::default()),
+            ..v3_payload(0, None)
+        };
+        let mut encoded = Vec::new();
+        payload.consensus_encode(&mut encoded).unwrap();
+
+        // An empty `netInfo` is its version and a zero purpose count.
+        assert_eq!(&encoded[36..38], &[1, 0]);
+        assert_eq!(payload.size(), encoded.len());
+        assert_eq!(payload.base_payload_hash(), empty.base_payload_hash());
+        let decoded = ProviderUpdateServicePayload::consensus_decode(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded, empty);
     }
 
     #[test]

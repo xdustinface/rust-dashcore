@@ -200,6 +200,16 @@ pub struct ExtNetInfo {
     pub purposes: Vec<(NetInfoPurpose, Vec<NetInfoEntry>)>,
 }
 
+/// An empty `ExtNetInfo` at the current version, as Core default-constructs it.
+impl Default for ExtNetInfo {
+    fn default() -> Self {
+        ExtNetInfo {
+            version: EXTNETINFO_CURRENT_VERSION,
+            purposes: Vec::new(),
+        }
+    }
+}
+
 impl ExtNetInfo {
     pub(crate) fn consensus_encode_ext<W: Write + ?Sized>(
         &self,

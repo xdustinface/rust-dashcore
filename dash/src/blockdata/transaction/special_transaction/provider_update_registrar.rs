@@ -58,6 +58,7 @@ pub struct ProviderUpdateRegistrarPayload {
     pub inputs_hash: InputsHash,
     pub payload_sig: Vec<u8>, // TODO: Need to figure out, is this signature BLS Signature (length 96)
     /// DIP-0026 payouts, present from version 3 in place of `script_payout`.
+    /// From version 3 a missing value encodes as an empty list.
     pub payouts: Option<Vec<MasternodePayoutShare>>,
 }
 
@@ -115,10 +116,7 @@ impl SpecialTransactionBasePayloadEncodable for ProviderUpdateRegistrarPayload {
         len += self.operator_public_key.consensus_encode(&mut s)?;
         len += self.voting_key_hash.consensus_encode(&mut s)?;
         if self.is_ext_addr() {
-            let Some(payouts) = &self.payouts else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "payouts is not set"));
-            };
-            len += encode_payouts(payouts, &mut s)?;
+            len += encode_payouts(self.payouts.as_deref().unwrap_or_default(), &mut s)?;
         } else {
             len += self.script_payout.consensus_encode(&mut s)?;
         }
@@ -415,12 +413,23 @@ mod tests {
     }
 
     #[test]
-    fn v3_without_payouts_fails_to_encode() {
+    fn v3_without_payouts_encodes_empty_list() {
         let payload = ProviderUpdateRegistrarPayload {
             payouts: None,
             ..v3_payload()
         };
-        assert!(payload.consensus_encode(&mut Vec::new()).is_err());
+        let empty = ProviderUpdateRegistrarPayload {
+            payouts: Some(Vec::new()),
+            ..v3_payload()
+        };
+        let mut encoded = Vec::new();
+        payload.consensus_encode(&mut encoded).unwrap();
+
+        assert_eq!(encoded[104], 0);
+        assert_eq!(payload.size(), encoded.len());
+        assert_eq!(payload.base_payload_hash(), empty.base_payload_hash());
+        let decoded = ProviderUpdateRegistrarPayload::consensus_decode(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded, empty);
     }
 
     #[cfg(feature = "bincode")]
