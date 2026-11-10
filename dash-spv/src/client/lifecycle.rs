@@ -258,7 +258,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     /// Recover from a fork at `fork_height`: stop the client, drop the stored
     /// chain above the fork and run again, so the client syncs onto the branch
     /// the network follows. A loop that was stopped or replaced in the meantime
-    /// is left alone.
+    /// is left alone. A failure is reported through `on_error`.
     ///
     /// Boxed because the client it runs again can recover from a fork too.
     pub(super) fn handle_fork(
@@ -270,15 +270,29 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
             let Some(forked) = sync_loop.take_if(|running| running.shutdown.is_cancelled()) else {
                 return Ok(());
             };
-            self.stop_locked(forked).await?;
 
-            tracing::warn!("Fork at height {}, dropping the stored chain above it", fork_height);
-            {
+            let dropped: Result<()> = async {
+                self.stop_locked(forked).await?;
+
+                tracing::warn!(
+                    "Fork at height {}, dropping the stored chain above it",
+                    fork_height
+                );
+                // Each store goes before the stores it is built on, so a failure
+                // part way never leaves a store above one it depends on.
                 let mut storage = self.storage.lock().await;
-                BlockHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
-                FilterHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
-                FilterStorage::truncate_above(&mut *storage, fork_height).await?;
                 BlockStorage::truncate_above(&mut *storage, fork_height).await?;
+                FilterStorage::truncate_above(&mut *storage, fork_height).await?;
+                FilterHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
+                BlockHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = dropped {
+                for handler in self.event_handlers.iter() {
+                    handler.on_error(&e.to_string());
+                }
+                return Err(e);
             }
 
             self.run_locked(&mut sync_loop).await
