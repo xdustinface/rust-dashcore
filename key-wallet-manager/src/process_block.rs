@@ -381,6 +381,14 @@ impl<T: WalletInfoInterface + Send + Sync + 'static> WalletInterface for WalletM
         }
     }
 
+    fn rewind_synced_height(&mut self, height: CoreBlockHeight) {
+        for info in self.wallet_infos.values_mut() {
+            if info.synced_height() > height {
+                info.update_synced_height(height);
+            }
+        }
+    }
+
     fn update_wallet_last_processed_height(
         &mut self,
         wallet_id: &WalletId,

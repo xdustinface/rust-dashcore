@@ -166,6 +166,11 @@ pub trait WalletInterface: Send + Sync + 'static {
     /// only advance forward (a value below the current is silently ignored).
     fn update_wallet_synced_height(&mut self, wallet_id: &WalletId, height: CoreBlockHeight);
 
+    /// Lower every wallet's committed sync checkpoint that is above `height` to
+    /// `height`, so filter sync scans the blocks above it again. Called when
+    /// the chain above `height` was replaced by another branch.
+    fn rewind_synced_height(&mut self, height: CoreBlockHeight);
+
     /// Advance one wallet's last-processed height after a block has been applied
     /// to its state. Implementations must only advance forward.
     fn update_wallet_last_processed_height(

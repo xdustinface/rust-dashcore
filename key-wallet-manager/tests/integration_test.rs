@@ -10,6 +10,7 @@ use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 use key_wallet::{mnemonic::Language, Mnemonic, Network};
 use key_wallet_manager::WalletInterface;
 use key_wallet_manager::WalletManager;
+use std::collections::BTreeSet;
 
 #[test]
 fn test_wallet_manager_creation() {
@@ -248,4 +249,13 @@ fn test_block_height_tracking() {
     assert!(behind_at_12000.contains(&wallet_id2));
     let behind_at_500 = manager.wallets_behind(500);
     assert!(behind_at_500.is_empty());
+
+    // A rewind lowers only the wallets synced above it, and keeps last-processed heights.
+    manager.rewind_synced_height(11500);
+    let wallet_info1 = manager.get_wallet_info(&wallet_id1).unwrap();
+    let wallet_info2 = manager.get_wallet_info(&wallet_id2).unwrap();
+    assert_eq!(wallet_info1.synced_height(), 11500);
+    assert_eq!(wallet_info2.synced_height(), 11000);
+    assert_eq!(wallet_info1.last_processed_height(), 12345);
+    assert_eq!(manager.wallets_behind(11500), BTreeSet::from([wallet_id2]));
 }

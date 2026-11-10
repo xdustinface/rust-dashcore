@@ -260,9 +260,10 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     }
 
     /// Recover from a fork at `fork_height`: stop the client, drop the stored
-    /// chain above the fork and run again, so the client syncs onto the branch
-    /// the network follows. A loop that was stopped or replaced in the meantime
-    /// is left alone. A failure is reported through `on_error`.
+    /// chain and the masternode lists above the fork, rewind the wallet's synced
+    /// height to the fork and run again, so the client syncs onto the branch the
+    /// network follows. A loop that was stopped or replaced in the meantime is
+    /// left alone. A failure is reported through `on_error`.
     ///
     /// Boxed because the client it runs again can recover from a fork too.
     pub(super) fn handle_fork(
@@ -289,6 +290,13 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
                 FilterStorage::truncate_above(&mut *storage, fork_height).await?;
                 FilterHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
                 BlockHeaderStorage::truncate_above(&mut *storage, fork_height).await?;
+
+                // The replay skips the masternode messages of the dropped blocks.
+                if let Some(engine) = &self.masternode_engine {
+                    let config = self.config.read().await;
+                    *engine.write().await = Self::load_masternode_engine(&config, &storage).await;
+                }
+                self.wallet.write().await.rewind_synced_height(fork_height);
                 Ok(())
             }
             .await;
