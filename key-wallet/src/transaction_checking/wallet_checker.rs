@@ -449,7 +449,9 @@ impl WalletTransactionChecker for ManagedWalletInfo {
         }
 
         for account_match in &result.affected_accounts {
-            self.accounts.settle_outputs_held_elsewhere(&account_match.account_type_match, tx);
+            if self.accounts.settle_outputs_held_elsewhere(&account_match.account_type_match, tx) {
+                result.state_modified = true;
+            }
         }
         self.attribute_late_inputs(tx, &mut result);
 
@@ -4037,11 +4039,16 @@ mod tests {
     /// a transaction that also pays BIP44. Recording the transaction in a
     /// block (a rescan) leaves X in the CoinJoin account only, so the wallet
     /// balance counts it once (#1294). A lock already on the CoinJoin copy
-    /// stays.
-    #[test_case::test_case(false; "rescan")]
-    #[test_case::test_case(true; "after a locked mempool copy")]
+    /// stays. The move reports `state_modified` even when the record itself
+    /// is already confirmed in that block.
+    #[test_case::test_case(false, false; "rescan")]
+    #[test_case::test_case(true, false; "after a locked mempool copy")]
+    #[test_case::test_case(false, true; "rescan of a confirmed record")]
     #[tokio::test]
-    async fn an_output_held_by_another_funds_account_moves_to_its_owner(locked_in_mempool: bool) {
+    async fn an_output_held_by_another_funds_account_moves_to_its_owner(
+        locked_in_mempool: bool,
+        confirmed_before: bool,
+    ) {
         let mut ctx = TestWalletContext::new_random();
         let xpub = ctx.wallet.get_coinjoin_account(0).expect("CoinJoin account").account_xpub;
         let coinjoin = ctx.managed_wallet.accounts.coinjoin_accounts.get_mut(&0).expect("CoinJoin");
@@ -4060,7 +4067,15 @@ mod tests {
             script_pubkey: coinjoin_address.script_pubkey(),
         });
         let x = OutPoint::new(tx.txid(), 1);
+        let block = TransactionContext::InBlock(BlockInfo::new(
+            1_000,
+            BlockHash::from_byte_array([0x10; 32]),
+            1_700_000_000,
+        ));
 
+        if confirmed_before {
+            ctx.check_transaction(&tx, block.clone()).await;
+        }
         if locked_in_mempool {
             ctx.check_transaction(&tx, TransactionContext::Mempool).await;
             let coinjoin = ctx.managed_wallet.accounts.coinjoin_accounts.get_mut(&0).unwrap();
@@ -4070,12 +4085,8 @@ mod tests {
         let bip44 = ctx.managed_wallet.accounts.standard_bip44_accounts.get_mut(&0).expect("BIP44");
         bip44.utxos.insert(x, restored);
 
-        let block = TransactionContext::InBlock(BlockInfo::new(
-            1_000,
-            BlockHash::from_byte_array([0x10; 32]),
-            1_700_000_000,
-        ));
-        ctx.check_transaction(&tx, block).await;
+        let result = ctx.check_transaction(&tx, block).await;
+        assert!(result.state_modified);
 
         let accounts = &ctx.managed_wallet.accounts;
         assert!(!accounts.standard_bip44_accounts[&0].utxos.contains_key(&x));

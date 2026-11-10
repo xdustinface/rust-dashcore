@@ -1060,18 +1060,19 @@ impl ManagedAccountCollection {
     /// wallet counts it once. The removed copy's `is_instantlocked`,
     /// `is_trusted` and `is_locked` flags carry over to `owner`'s copy. An
     /// account holding a contact's coins takes nothing from the others.
+    /// Returns whether any copy was removed.
     pub(crate) fn settle_outputs_held_elsewhere(
         &mut self,
         owner: &CoreAccountTypeMatch,
         tx: &Transaction,
-    ) {
+    ) -> bool {
         let Some(ManagedAccountRef::Funds(owner_account)) = self.get_by_account_type_match(owner)
         else {
-            return;
+            return false;
         };
         let owner_type = owner_account.managed_account_type().to_account_type();
         if owner_type.is_contact_owned() {
-            return;
+            return false;
         }
         let txid = tx.txid();
         let held: Vec<OutPoint> = tx
@@ -1083,7 +1084,7 @@ impl ManagedAccountCollection {
             .filter(|outpoint| owner_account.utxos.contains_key(outpoint))
             .collect();
         if held.is_empty() {
-            return;
+            return false;
         }
         let mut removed = Vec::new();
         for account in self.all_funding_accounts_mut() {
@@ -1092,10 +1093,13 @@ impl ManagedAccountCollection {
             }
             removed.extend(held.iter().filter_map(|outpoint| account.utxos.remove(outpoint)));
         }
+        if removed.is_empty() {
+            return false;
+        }
         let Some(ManagedAccountRefMut::Funds(owner_account)) =
             self.get_by_account_type_match_mut(owner)
         else {
-            return;
+            return true;
         };
         for prior in removed {
             if let Some(utxo) = owner_account.utxos.get_mut(&prior.outpoint) {
@@ -1104,6 +1108,7 @@ impl ManagedAccountCollection {
                 utxo.is_locked |= prior.is_locked;
             }
         }
+        true
     }
 
     /// Get the count of accounts
