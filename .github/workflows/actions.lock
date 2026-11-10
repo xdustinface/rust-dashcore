@@ -110,7 +110,7 @@ dependencies:
         owner_id: 12292047
         repo_id: 248206495
     'manki-review/manki@3fbb78218029c032515d09779209cf6d92c3126b':
-        ref: '3fbb78218029c032515d09779209cf6d92c3126b'
+        ref: 'test/v74-dist'
         commit: 'sha1-3fbb78218029c032515d09779209cf6d92c3126b'
         owner_id: 270828077
         repo_id: 1190216666
