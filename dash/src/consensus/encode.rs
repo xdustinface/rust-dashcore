@@ -441,8 +441,8 @@ pub trait Decodable: Sized {
     ///   * Make `consensus_decode` forward to `consensus_decode_bytes_from_finite_reader` with the
     ///     reader wrapped by `Take`. Failure to do so, without other forms of memory exhaustion
     ///     protection might lead to resource exhaustion vulnerability.
-    ///     `Vec<T>`, `Vec<u8>`, `Box<[u8]>`, `String` and `Cow<str>` read without `Take`: their
-    ///     length is range-checked and they grow with the data read.
+    ///     `Vec<u8>`, `Box<[u8]>`, `String` and `Cow<str>` read without `Take`, because their
+    ///     range-checked length bounds the bytes read. `Vec<T>` takes [`MAX_COMPACT_SIZE`] bytes.
     ///   * Put a max cap on things like `Vec::with_capacity` to avoid oversized allocations, and
     ///     rely on the reader running out of data, and collections reallocating on a legitimately
     ///     oversized input data, instead of trying to enforce arbitrary length limits.
@@ -740,11 +740,11 @@ macro_rules! impl_vec {
 
         impl Decodable for Vec<$type> {
             // Like Core's `UnserializeVectorContents` (`src/serialize.h:883`, 7c7e91a4e40), any
-            // length up to `MAX_COMPACT_SIZE` is read; the capped reserve below bounds the initial
-            // allocation, and the vector grows as elements are decoded.
+            // length up to `MAX_COMPACT_SIZE` is read. Elements can hold their own vectors, so
+            // the stream is still cut at `MAX_COMPACT_SIZE` bytes to bound the total read.
             #[inline]
             fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
-                Self::consensus_decode_from_finite_reader(r)
+                Self::consensus_decode_from_finite_reader(r.take(MAX_COMPACT_SIZE).by_ref())
             }
 
             #[inline]
@@ -1542,13 +1542,21 @@ mod tests {
     }
 
     #[test]
-    fn streaming_read_has_no_budget_below_the_core_range() {
+    fn streaming_vector_read_is_budgeted_to_the_core_range() {
         // Two vectors of 3,999,999 bytes are 8 MB in all, over `MAX_VEC_SIZE`. Each length is
         // within `MAX_COMPACT_SIZE`, so the streaming decode reads them.
         let witness = vec![vec![0u8; 3_999_999]; 2];
         let ser = serialize(&witness);
         let mut reader = io::Cursor::new(ser);
         assert_eq!(Vec::<Vec<u8>>::consensus_decode(&mut reader).unwrap(), witness);
+
+        // Three vectors of 12 MiB each pass the length check but are 36 MiB in all, over the
+        // `MAX_COMPACT_SIZE` bytes a streaming decode takes. Only the finite reader decodes them.
+        let witness = vec![vec![0; 12 * 1024 * 1024]; 3];
+        let ser = serialize(&witness);
+        assert_eq!(deserialize::<Vec<Vec<u8>>>(&ser).unwrap(), witness);
+        let streamed = Vec::<Vec<u8>>::consensus_decode(&mut io::Cursor::new(ser));
+        assert!(matches!(streamed, Err(Error::Io(_))));
     }
 
     /// Decodes `bytes` through the finite-reader entry point and the streaming one.
