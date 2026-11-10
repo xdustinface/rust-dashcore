@@ -55,18 +55,11 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         // so they can read the tip from storage during construction.
         Self::initialize_genesis_block(&config, start_from_height, &mut storage).await?;
 
-        let masternode_engine = {
-            if config.enable_masternodes {
-                let loader = storage.masternodes();
-                let engine = loader.read().await.load_engine().await;
-                let engine = engine.unwrap_or_else(|e| {
-                    tracing::warn!("Could not replay masternode messages, rebuilding: {}", e);
-                    MasternodeListEngine::default_for_network(config.network)
-                });
-                Some(Arc::new(RwLock::new(engine)))
-            } else {
-                None
-            }
+        let masternode_engine = if config.enable_masternodes {
+            let engine = Self::load_masternode_engine(&config, &storage).await;
+            Some(Arc::new(RwLock::new(engine)))
+        } else {
+            None
         };
 
         // Report the progress of the data already in storage before the first run.
@@ -98,6 +91,17 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
         }
 
         Ok(client)
+    }
+
+    /// Rebuild the masternode list engine from the messages in `storage`, or
+    /// start an empty one if they cannot be replayed.
+    async fn load_masternode_engine(config: &ClientConfig, storage: &S) -> MasternodeListEngine {
+        let loader = storage.masternodes();
+        let engine = loader.read().await.load_engine().await;
+        engine.unwrap_or_else(|e| {
+            tracing::warn!("Could not replay masternode messages, rebuilding: {}", e);
+            MasternodeListEngine::default_for_network(config.network)
+        })
     }
 
     /// Resolve where to anchor the chain.
