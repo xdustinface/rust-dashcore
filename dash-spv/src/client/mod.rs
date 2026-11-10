@@ -47,8 +47,10 @@ mod tests {
     use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
     use key_wallet_manager::WalletManager;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
+    use tokio::time::{sleep, timeout};
 
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -116,7 +118,8 @@ mod tests {
     }
 
     /// `stop` returns only once the tasks the sync loop detached are done, so
-    /// none of them still holds a client clone, and with it the storage.
+    /// none of them still holds a client clone, and with it the storage. A
+    /// detached task can still detach another one while `stop` joins.
     #[tokio::test]
     async fn stop_waits_for_detached_tasks() {
         let temp_dir = TempDir::new().unwrap();
@@ -140,11 +143,15 @@ mod tests {
 
         let detached = client.clone();
         client.detached_tasks.lock().await.spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            drop(detached);
+            sleep(Duration::from_millis(100)).await;
+            let nested = detached.clone();
+            detached.detached_tasks.lock().await.spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                drop(nested);
+            });
         });
 
-        client.stop().await;
+        timeout(Duration::from_secs(5), client.stop()).await.expect("stop must not deadlock");
         assert_eq!(Arc::strong_count(&client.storage), 1);
     }
 

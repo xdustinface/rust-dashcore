@@ -30,6 +30,7 @@ use dashcore::TxMerkleNode;
 use dashcore_hashes::Hash;
 use key_wallet_manager::WalletInterface;
 use std::future::Future;
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -250,7 +251,7 @@ impl<W: WalletInterface, N: NetworkManager, S: StorageManager> DashSpvClient<W, 
     /// stopping meanwhile can still add to it.
     async fn join_detached_tasks(&self) {
         loop {
-            let mut tasks = self.detached_tasks.lock().await;
+            let mut tasks = mem::take(&mut *self.detached_tasks.lock().await);
 
             if tasks.is_empty() {
                 return;
