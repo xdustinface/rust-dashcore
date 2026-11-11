@@ -22,10 +22,6 @@ instructions: |
   - DIP (Dash Improvement Proposal) compliance for protocol changes
   - Memory safety in hash/crypto implementations
 
-# The judge reads the code a finding rests on itself, with up to 20 tool calls.
-judge:
-  tool_steps: 20
-
 # Read from the base branch only, so a PR cannot weaken its own review.
 review:
   classes:
