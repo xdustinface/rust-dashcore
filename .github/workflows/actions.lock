@@ -20,7 +20,7 @@ workflows:
         - 'taiki-e/install-action@v2.89.1'
     '.github/workflows/manki.yml':
         - 'actions/setup-node@v7.1.0'
-        - 'manki-review/manki@test/main-52f97b9-dist'
+        - 'manki-review/manki@test/main-03b72c4-dist'
     '.github/workflows/pr-review-policy.yml': []
     '.github/workflows/pr-title.yml':
         - 'amannn/action-semantic-pull-request@v6.1.1'
@@ -109,9 +109,9 @@ dependencies:
         commit: 'sha1-0273be72a0bbd58fcd71d0d6c02c209b50d1e5e1'
         owner_id: 12292047
         repo_id: 248206495
-    'manki-review/manki@test/main-52f97b9-dist':
-        ref: 'test/main-52f97b9-dist'
-        commit: 'sha1-71a7ba92fa17fcfab17095e13e4df2e4d553f733'
+    'manki-review/manki@test/main-03b72c4-dist':
+        ref: 'test/main-03b72c4-dist'
+        commit: 'sha1-9f0d001ae32b986a00ac26f97b514a73fadd8947'
         owner_id: 270828077
         repo_id: 1190216666
     'peter-evans/create-pull-request@v8.1.1':
