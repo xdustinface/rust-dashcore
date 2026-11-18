@@ -24,6 +24,10 @@ instructions: |
 
 # Read from the base branch only, so a PR cannot weaken its own review.
 review:
+  groups:
+    trivial: [claude-sonnet-5-5]
+    solo: [claude-opus-5-5]
+    full: [claude-opus-5-5, gpt-6.2-sol]
   classes:
     security:
       match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
@@ -34,8 +38,11 @@ review:
       rank: 85
       match: { paths_any: ["dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"] }
   routing:
-    wallet: pair
-    consensus: pair
+    internal: full
+    behavior: full
+    wallet: full
+    consensus: full
+  sweep: warnings
   critical_paths: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**", "dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"]
   outside_input: >-
     Anything a network peer sends: P2P messages, blocks, transactions, headers,
