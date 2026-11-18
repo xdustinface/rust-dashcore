@@ -598,7 +598,7 @@ impl Decodable for Headers2Message {
     fn consensus_decode<R: io::Read + ?Sized>(
         r: &mut R,
     ) -> Result<Self, crate::consensus::encode::Error> {
-        let count = VarInt::consensus_decode(r)?.0;
+        let count = crate::consensus::encode::read_compact_size_len(r)?;
         // Core never sends more and treats more as misbehaviour. Checking before reserving
         // also keeps a short frame with a huge count from triggering a large allocation.
         if count > MAX_HEADERS2_RESULTS as u64 {
@@ -975,6 +975,32 @@ mod tests {
     fn headers2_short_frame_with_huge_count_fails() {
         let payload = crate::consensus::encode::serialize(&VarInt(u64::MAX));
         assert!(Headers2Message::consensus_decode(&mut &payload[..]).is_err());
+    }
+
+    /// Core reads the headers2 count with `ReadCompactSize`, whose range check refuses above
+    /// `MAX_SIZE` (32 MiB) at the count itself, before the batch limit.
+    #[test]
+    fn headers2_count_is_read_with_the_core_range() {
+        use crate::consensus::encode::{self, Error, MAX_COMPACT_SIZE};
+
+        let with_count = |count: u64| encode::serialize(&VarInt(count));
+
+        // 32 MiB + 1 is refused at the count, with no header data needed.
+        let raw = with_count(MAX_COMPACT_SIZE + 1);
+        let err = Headers2Message::consensus_decode(&mut &raw[..]).unwrap_err();
+        assert!(matches!(err, Error::OversizedVectorAllocation { .. }), "{:?}", err);
+        let err = encode::deserialize::<Headers2Message>(&raw).unwrap_err();
+        assert!(matches!(err, Error::OversizedVectorAllocation { .. }), "{:?}", err);
+
+        // 32 MiB is a count `ReadCompactSize` accepts, but above the batch limit.
+        let raw = with_count(MAX_COMPACT_SIZE);
+        let err = Headers2Message::consensus_decode(&mut &raw[..]).unwrap_err();
+        assert!(matches!(err, Error::ParseFailed(_)), "{:?}", err);
+
+        // A full batch is a count Core accepts: the read goes on to the headers and finds none.
+        let raw = with_count(MAX_HEADERS2_RESULTS as u64);
+        let err = Headers2Message::consensus_decode(&mut &raw[..]).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{:?}", err);
     }
 
     #[test_case(MAX_HEADERS2_RESULTS, true; "full Core batch decodes")]
