@@ -27,7 +27,7 @@ review:
   groups:
     trivial: [claude-sonnet-5-5]
     solo: [claude-opus-5-5]
-    full: [claude-opus-5-5, gpt-6.2-sol]
+    full: [{ model: claude-opus-5-5, effort: high }, { model: gpt-6.2-sol, effort: medium }]
   classes:
     security:
       match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
