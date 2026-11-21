@@ -4,29 +4,68 @@
 auto_review: true
 auto_approve: true
 
-models:
-  # A second refuter on another model than the judge's Claude Opus. A blocker the
-  # base branch already had stops blocking only when both refuters prove it.
-  second_refuter: gpt-6.2-sol
-  # A call that a model refuses on safety grounds is sent to this model instead.
-  fallback: claude-sonnet-5-5
+# The list replaces the defaults, so it repeats them to keep the same files out of review.
+exclude_paths:
+  - "*.lock"
+  - "dist/**"
+  - "*.generated.*"
+  - "fuzz/**"
 
+# Bot PRs get no automatic review. Read from the base branch only.
+skip_authors: ["dependabot[bot]", "github-actions[bot]"]
+
+instructions: |
+  This is a Rust implementation of the Dash cryptocurrency protocol.
+  Pay special attention to:
+  - Consensus-critical code paths — changes here can cause chain splits
+  - Proper error handling — prefer Result over unwrap/expect in library code
+  - DIP (Dash Improvement Proposal) compliance for protocol changes
+  - Memory safety in hash/crypto implementations
+
+# A second refuter on another model than the judge's Claude Opus, as on the upstream repository.
+models:
+  second_refuter: gpt-6.2-sol
+
+# Read from the base branch only, so a PR cannot weaken its own review.
 review:
-  # Who reviews. A trivial change gets a quick check, a low-risk change one reader,
-  # and everything else Claude Opus and an OpenAI model side by side.
   groups:
     trivial: [claude-sonnet-5-5]
     solo: [claude-opus-5-5]
-    full: [claude-opus-5-5, gpt-6.2-sol]
-  # A blocker or proven warning the review keeps starts one search of the diff for
-  # other places with the same kind of mistake.
-  sweep: warnings
-  # A doubt that the PR is useful, or a proposed split into separate PRs, is posted
-  # as a warning that holds the approval until its thread is resolved.
+    full: [{ model: claude-opus-5-5, effort: high }, { model: gpt-6.2-sol, effort: medium }]
+  classes:
+    security:
+      match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
+    wallet:
+      rank: 86
+      match: { paths_any: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**"] }
+    consensus:
+      rank: 85
+      match: { paths_any: ["dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"] }
+  routing:
+    internal: full
+    behavior: full
+    wallet: full
+    consensus: full
+  sweep: blockers
   scope_blocks: true
+  critical_paths: ["key-wallet/**", "key-wallet-manager/**", "dash/src/crypto/**", "crypto/**", "dash/src/consensus/**", "dash/src/blockdata/**", "dash/src/sml/**", "dash/src/merkle_tree/**", "hashes/**"]
+  outside_input: >-
+    Anything a network peer sends: P2P messages, blocks, transactions, headers,
+    masternode list diffs and the length prefixes inside them. Responses from a
+    Dash Core RPC server. Files read from disk, such as stored headers, filters
+    and wallet data.
   examples:
     blocker:
+      - "Indexing `buf[len]` with a length read from a peer message panics on a short message."
+      - "`Vec::with_capacity` sized by a count a peer sends lets one message allocate gigabytes."
       - "Changing the field order in a `consensus_encode` implementation changes the bytes on the wire, even when every test passes."
+      - "A signature check whose failure is ignored accepts a forged message."
+      - "An inverted peer selection weight, such as `score + offset` where a lower score is better, picks misbehaving peers more often than well-behaved ones."
+    not_blocker:
+      - "A `todo!()` the PR states is intentional: `suggestion` at most."
+      - "An `expect` right after a bounds check that proves it cannot fail."
+      - "A missing test for new code: `suggestion`."
+      - "A missing `#[must_use]` or missing docs: `nitpick`."
 
 related_repos:
   - { repo: dashpay/dash, kind: reference, paths: [src/] }
