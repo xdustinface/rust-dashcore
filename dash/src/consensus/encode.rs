@@ -387,8 +387,26 @@ impl<R: Read + ?Sized> ReadExt for R {
     }
 }
 
-/// Maximum size, in bytes, of a vector we are allowed to decode.
+/// Default byte budget of [`Decodable::consensus_decode`], and the cap on a vector decode's
+/// initial reserve.
 pub const MAX_VEC_SIZE: usize = 4_000_000;
+
+/// The largest vector or string length a CompactSize may announce: Dash Core's `MAX_SIZE`
+/// (`src/serialize.h:43`, 7c7e91a4e40), 32 MiB.
+pub const MAX_COMPACT_SIZE: u64 = 0x0200_0000;
+
+/// Reads a length as Dash Core's `ReadCompactSize` does with its range check
+/// (`src/serialize.h:400`, 7c7e91a4e40): a value above [`MAX_COMPACT_SIZE`] is an error.
+pub(crate) fn read_compact_size_len<R: io::Read + ?Sized>(r: &mut R) -> Result<u64, Error> {
+    let len = VarInt::consensus_decode(r)?.0;
+    if len > MAX_COMPACT_SIZE {
+        return Err(Error::OversizedVectorAllocation {
+            requested: usize::try_from(len).unwrap_or(usize::MAX),
+            max: MAX_COMPACT_SIZE as usize,
+        });
+    }
+    Ok(len)
+}
 
 /// Data which can be encoded in a consensus-consistent way.
 pub trait Encodable {
@@ -423,6 +441,8 @@ pub trait Decodable: Sized {
     ///   * Make `consensus_decode` forward to `consensus_decode_bytes_from_finite_reader` with the
     ///     reader wrapped by `Take`. Failure to do so, without other forms of memory exhaustion
     ///     protection might lead to resource exhaustion vulnerability.
+    ///     `Vec<T>`, `Vec<u8>`, `Box<[u8]>`, `String` and `Cow<str>` read without `Take`: their
+    ///     length is range-checked and they grow with the data read.
     ///   * Put a max cap on things like `Vec::with_capacity` to avoid oversized allocations, and
     ///     rely on the reader running out of data, and collections reallocating on a legitimately
     ///     oversized input data, instead of trying to enforce arbitrary length limits.
@@ -600,11 +620,21 @@ impl Encodable for String {
     }
 }
 
+fn string_from_bytes(bytes: Vec<u8>) -> Result<String, Error> {
+    String::from_utf8(bytes).map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+}
+
 impl Decodable for String {
     #[inline]
+    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
+        r: &mut R,
+    ) -> Result<String, Error> {
+        string_from_bytes(Vec::<u8>::consensus_decode_from_finite_reader(r)?)
+    }
+
+    #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<String, Error> {
-        String::from_utf8(Decodable::consensus_decode(r)?)
-            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
+        string_from_bytes(Vec::<u8>::consensus_decode(r)?)
     }
 }
 
@@ -620,10 +650,15 @@ impl Encodable for Cow<'static, str> {
 
 impl Decodable for Cow<'static, str> {
     #[inline]
+    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
+        r: &mut R,
+    ) -> Result<Cow<'static, str>, Error> {
+        String::consensus_decode_from_finite_reader(r).map(Cow::Owned)
+    }
+
+    #[inline]
     fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Cow<'static, str>, Error> {
-        String::from_utf8(Decodable::consensus_decode(r)?)
-            .map_err(|_| self::Error::ParseFailed("String was not valid UTF8"))
-            .map(Cow::Owned)
+        String::consensus_decode(r).map(Cow::Owned)
     }
 }
 
@@ -704,11 +739,19 @@ macro_rules! impl_vec {
         }
 
         impl Decodable for Vec<$type> {
+            // Like Core's `UnserializeVectorContents` (`src/serialize.h:883`, 7c7e91a4e40), any
+            // length up to `MAX_COMPACT_SIZE` is read; the capped reserve below bounds the initial
+            // allocation, and the vector grows as elements are decoded.
+            #[inline]
+            fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+                Self::consensus_decode_from_finite_reader(r)
+            }
+
             #[inline]
             fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
                 r: &mut R,
             ) -> Result<Self, Error> {
-                let len = VarInt::consensus_decode_from_finite_reader(r)?.0;
+                let len = read_compact_size_len(r)?;
                 // Do not allocate upfront more items than if the sequence of type
                 // occupied roughly quarter a block. This should never be the case
                 // for normal data, but even if that's not true - `push` will just
@@ -802,9 +845,16 @@ impl Encodable for Vec<u8> {
 }
 
 impl Decodable for Vec<u8> {
+    // Like Core's byte vector `Unserialize` (`src/serialize.h:1217`, 7c7e91a4e40), any length up
+    // to `MAX_COMPACT_SIZE` is read in chunks, so the buffer grows only as chunks are read.
+    #[inline]
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+        Self::consensus_decode_from_finite_reader(r)
+    }
+
     #[inline]
     fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
-        let len = VarInt::consensus_decode(r)?.0 as usize;
+        let len = read_compact_size_len(r)? as usize;
         // most real-world vec of bytes data, wouldn't be larger than 128KiB
         let opts = ReadBytesFromFiniteReaderOpts {
             len,
@@ -822,6 +872,11 @@ impl Encodable for Box<[u8]> {
 }
 
 impl Decodable for Box<[u8]> {
+    #[inline]
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+        <Vec<u8>>::consensus_decode(r).map(From::from)
+    }
+
     #[inline]
     fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
         <Vec<u8>>::consensus_decode_from_finite_reader(r).map(From::from)
@@ -847,7 +902,24 @@ impl Encodable for CheckedData {
 impl Decodable for CheckedData {
     #[inline]
     fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
+        Self::decode_limited(r, usize::MAX)
+    }
+}
+
+impl CheckedData {
+    /// Decodes the length, checksum and payload, refusing a length above `max_len` before any
+    /// payload byte is read.
+    pub(crate) fn decode_limited<R: io::Read + ?Sized>(
+        r: &mut R,
+        max_len: usize,
+    ) -> Result<Self, Error> {
         let len = u32::consensus_decode_from_finite_reader(r)? as usize;
+        if len > max_len {
+            return Err(Error::OversizedVectorAllocation {
+                requested: len,
+                max: max_len,
+            });
+        }
 
         let checksum = <[u8; 4]>::consensus_decode_from_finite_reader(r)?;
         let opts = ReadBytesFromFiniteReaderOpts {
@@ -1470,12 +1542,108 @@ mod tests {
     }
 
     #[test]
-    fn limit_read_test() {
+    fn streaming_read_has_no_budget_below_the_core_range() {
+        // Two vectors of 3,999,999 bytes are 8 MB in all, over `MAX_VEC_SIZE`. Each length is
+        // within `MAX_COMPACT_SIZE`, so the streaming decode reads them.
         let witness = vec![vec![0u8; 3_999_999]; 2];
         let ser = serialize(&witness);
         let mut reader = io::Cursor::new(ser);
-        let err = Vec::<Vec<u8>>::consensus_decode(&mut reader);
-        assert!(err.is_err());
+        assert_eq!(Vec::<Vec<u8>>::consensus_decode(&mut reader).unwrap(), witness);
+    }
+
+    /// Decodes `bytes` through the finite-reader entry point and the streaming one.
+    fn both_entry_points<T: Decodable>(bytes: &[u8]) -> [Result<T, Error>; 2] {
+        [
+            deserialize_partial::<T>(bytes).map(|(value, _)| value),
+            T::consensus_decode(&mut io::Cursor::new(bytes)),
+        ]
+    }
+
+    fn oversized<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::OversizedVectorAllocation { .. }))
+    }
+
+    #[test]
+    fn a_length_above_max_size_is_refused_without_reading_data() {
+        // `ReadCompactSize`'s range check: a vector or string length above `MAX_SIZE` fails on
+        // the length alone; at `MAX_SIZE` it passes and the missing data is what fails.
+        let announce = |len: u64| serialize(&VarInt(len));
+        for len in [MAX_COMPACT_SIZE + 1, u64::from(u32::MAX) + 1, u64::MAX] {
+            let bytes = announce(len);
+            for r in both_entry_points::<Vec<u8>>(&bytes) {
+                assert!(oversized(&r), "Vec<u8> length {len}");
+            }
+            for r in both_entry_points::<Box<[u8]>>(&bytes) {
+                assert!(oversized(&r), "Box<[u8]> length {len}");
+            }
+            for r in both_entry_points::<Vec<Inventory>>(&bytes) {
+                assert!(oversized(&r), "Vec<Inventory> length {len}");
+            }
+            for r in both_entry_points::<String>(&bytes) {
+                assert!(oversized(&r), "String length {len}");
+            }
+        }
+        for r in both_entry_points::<Vec<u8>>(&announce(MAX_COMPACT_SIZE)) {
+            assert!(matches!(r, Err(Error::Io(_))));
+        }
+        for r in both_entry_points::<String>(&announce(MAX_COMPACT_SIZE)) {
+            assert!(matches!(r, Err(Error::Io(_))));
+        }
+    }
+
+    #[test]
+    fn byte_vectors_and_strings_are_read_to_the_core_range() {
+        // Core reads a byte vector or string of any length `ReadCompactSize` accepts, in chunks;
+        // `MAX_VEC_SIZE` is not a limit on the data read.
+        for len in [4_000_000usize, 4_000_001, MAX_COMPACT_SIZE as usize] {
+            let mut bytes = serialize(&VarInt(len as u64));
+            bytes.resize(bytes.len() + len, b'a');
+            bytes.extend_from_slice(b"next");
+
+            for r in both_entry_points::<Vec<u8>>(&bytes) {
+                assert_eq!(r.unwrap().len(), len, "Vec<u8> {len}");
+            }
+            for r in both_entry_points::<Box<[u8]>>(&bytes) {
+                assert_eq!(r.unwrap().len(), len, "Box<[u8]> {len}");
+            }
+            for r in both_entry_points::<String>(&bytes) {
+                let s = r.unwrap();
+                assert_eq!((s.len(), s.as_bytes()[len - 1]), (len, b'a'), "String {len}");
+            }
+            for r in both_entry_points::<Cow<'static, str>>(&bytes) {
+                assert_eq!(r.unwrap().len(), len, "Cow<str> {len}");
+            }
+
+            // The streaming read stops after the data: what follows stays in the stream.
+            let mut cursor = io::Cursor::new(&bytes);
+            String::consensus_decode(&mut cursor).unwrap();
+            assert_eq!(&bytes[cursor.position() as usize..], b"next");
+        }
+
+        // A length the data does not back is not read to its announced size: the data runs out.
+        let mut bytes = serialize(&VarInt(MAX_COMPACT_SIZE));
+        bytes.extend_from_slice(&[1, 2, 3]);
+        for r in both_entry_points::<Vec<u8>>(&bytes) {
+            assert!(matches!(r, Err(Error::Io(_))));
+        }
+    }
+
+    #[test]
+    fn other_vectors_are_read_to_the_core_range() {
+        // 1,000,001 u32s are 4,000,004 bytes, over `MAX_VEC_SIZE`.
+        let values: Vec<u32> = (0..1_000_001).collect();
+        let bytes = serialize(&values);
+        assert!(bytes.len() > MAX_VEC_SIZE);
+        for r in both_entry_points::<Vec<u32>>(&bytes) {
+            assert_eq!(r.unwrap(), values);
+        }
+        // Vectors of vectors go through the same macro.
+        let nested: Vec<Vec<u8>> = (0..200).map(|i| vec![i as u8; 20_000]).collect();
+        let bytes = serialize(&nested);
+        assert!(bytes.len() > MAX_VEC_SIZE);
+        for r in both_entry_points::<Vec<Vec<u8>>>(&bytes) {
+            assert_eq!(r.unwrap(), nested);
+        }
     }
 
     #[test]

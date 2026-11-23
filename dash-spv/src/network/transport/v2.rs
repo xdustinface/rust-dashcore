@@ -21,8 +21,8 @@ const COMMAND_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
 /// Largest packet (header + contents + tag) a peer may announce: a maximum-size
-/// payload in the extended format. Above bip324's `decrypt_to_vec` cap, so packets are
-/// decrypted with `decrypt` into a buffer sized here.
+/// payload in the extended format. Packets are decrypted with `decrypt` into a buffer sized
+/// here.
 const MAX_PACKET_LEN: usize = NUM_HEADER_BYTES + 1 + COMMAND_LEN + MAX_MSG_SIZE + TAG_LEN;
 
 /// Encrypt `message` into one complete V2 packet.
